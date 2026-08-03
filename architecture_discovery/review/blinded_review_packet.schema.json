@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://architecture-discovery.invalid/schemas/blinded-review-packet-1.0.json",
+  "title": "Blinded Novelty Review Packet",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_name",
+    "packet_version",
+    "packet_id",
+    "blinded_candidate_id",
+    "corpus_sha256",
+    "mechanism_evidence",
+    "mechanism_summary",
+    "causal_claim",
+    "falsifiable_prediction",
+    "nearest_reference_ids"
+  ],
+  "properties": {
+    "schema_name": {"const": "BlindedNoveltyReviewPacket"},
+    "packet_version": {"const": "1.0"},
+    "packet_id": {"type": "string", "minLength": 1},
+    "blinded_candidate_id": {"type": "string", "minLength": 1},
+    "corpus_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "mechanism_evidence": {"type": "object"},
+    "mechanism_summary": {"type": "string", "minLength": 1},
+    "causal_claim": {"type": "string", "minLength": 1},
+    "falsifiable_prediction": {"type": "string", "minLength": 1},
+    "nearest_reference_ids": {
+      "type": "array",
+      "items": {"type": "string"},
+      "uniqueItems": true
+    }
+  }
+}

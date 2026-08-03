@@ -1,0 +1,67 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://architecture-discovery.invalid/schemas/reference-corpus-1.0.json",
+  "title": "Frozen Reference Corpus",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_name",
+    "schema_version",
+    "corpus_id",
+    "cutoff_date",
+    "retrieval_date",
+    "inclusion_policy",
+    "duplicate_policy",
+    "population_complete",
+    "population_attested_by",
+    "population_attested_at_utc",
+    "synthetic_fixture",
+    "entries"
+  ],
+  "properties": {
+    "schema_name": {"const": "FrozenReferenceCorpus"},
+    "schema_version": {"const": "1.0"},
+    "corpus_id": {"type": "string", "minLength": 1},
+    "cutoff_date": {"type": "string", "format": "date"},
+    "retrieval_date": {"type": "string", "format": "date"},
+    "inclusion_policy": {"type": "string", "minLength": 1},
+    "duplicate_policy": {"type": "string", "minLength": 1},
+    "population_complete": {"type": "boolean"},
+    "population_attested_by": {"type": ["string", "null"]},
+    "population_attested_at_utc": {"type": ["string", "null"]},
+    "synthetic_fixture": {"type": "boolean"},
+    "entries": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "reference_id",
+          "source_id",
+          "source_locator",
+          "publication_date",
+          "source_sha256",
+          "mechanism_name",
+          "mechanism_summary",
+          "signature",
+          "independently_reviewed",
+          "duplicate_of",
+          "reviewer_notes"
+        ],
+        "properties": {
+          "reference_id": {"type": "string", "minLength": 1},
+          "source_id": {"type": "string", "minLength": 1},
+          "source_locator": {"type": "string", "minLength": 1},
+          "publication_date": {"type": "string", "format": "date"},
+          "source_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+          "mechanism_name": {"type": "string", "minLength": 1},
+          "mechanism_summary": {"type": "string", "minLength": 1},
+          "signature": {"type": "object"},
+          "independently_reviewed": {"type": "boolean"},
+          "duplicate_of": {"type": ["string", "null"]},
+          "reviewer_notes": {"type": "array", "items": {"type": "string"}}
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,14 @@
+{
+  "schema_name": "FrozenReferenceCorpus",
+  "schema_version": "1.0",
+  "corpus_id": "unpopulated-reference-corpus-v1",
+  "cutoff_date": "1970-01-01",
+  "retrieval_date": "1970-01-01",
+  "inclusion_policy": "PI_DECISION_REQUIRED",
+  "duplicate_policy": "PI_DECISION_REQUIRED",
+  "population_complete": false,
+  "population_attested_by": null,
+  "population_attested_at_utc": null,
+  "synthetic_fixture": false,
+  "entries": []
+}

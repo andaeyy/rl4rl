@@ -1,0 +1,25 @@
+[project]
+name = "adderboard-architecture-discovery"
+version = "0.1.0"
+description = "Reproducible controllers for valid architecture discovery on AdderBoard"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "numpy==2.3.2",
+    "openai==1.97.1",
+    "openevolve",
+    "pyyaml==6.0.2",
+    "torch==2.7.1",
+]
+
+[dependency-groups]
+dev = [
+    "pytest==8.4.1",
+]
+
+[tool.uv.sources]
+openevolve = { path = "vendor/openevolve", editable = false }
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+addopts = "-q"

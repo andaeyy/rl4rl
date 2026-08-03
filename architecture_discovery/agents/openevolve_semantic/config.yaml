@@ -1,0 +1,85 @@
+max_iterations: 5
+checkpoint_interval: 1
+log_level: INFO
+random_seed: 1
+diff_based_evolution: true
+max_code_length: 40000
+early_stopping_patience: null
+language: python
+file_suffix: .py
+
+training:
+  profile: full_train_v1
+  profile_version: "1"
+  task_adapter: fixed_addition_v1
+  seed_derivation: sha256-v1
+  device: mps
+  allow_cpu_for_tests: false
+
+llm:
+  models:
+    - name: gpt-5.6-sol
+      weight: 1.0
+  evaluator_models: []
+  api_base: https://api.openai.com/v1
+  api_key: null
+  temperature: null
+  top_p: null
+  max_tokens: 16384
+  timeout: 300
+  retries: 2
+  retry_delay: 3
+  reasoning_effort: high
+
+prompt:
+  template_dir: null
+  system_message: system_message
+  evaluator_system_message: evaluator_system_message
+  num_top_programs: 3
+  num_diverse_programs: 2
+  use_template_stochasticity: false
+  include_artifacts: true
+  max_artifact_bytes: 20480
+  artifact_security_filter: true
+  suggest_simplification_after_chars: 1000000
+
+database:
+  db_path: null
+  in_memory: true
+  log_prompts: true
+  population_size: 200
+  archive_size: 100
+  num_islands: 4
+  migration_interval: 25
+  migration_rate: 0.1
+  elite_selection_ratio: 0.1
+  exploration_ratio: 0.3
+  exploitation_ratio: 0.6
+  feature_dimensions:
+    - semantic_token_representation
+    - semantic_positional_integration
+    - semantic_attention_organization
+    - semantic_depth_topology
+  feature_bins:
+    semantic_token_representation: 5
+    semantic_positional_integration: 6
+    semantic_attention_organization: 5
+    semantic_depth_topology: 5
+  diversity_reference_size: 20
+  random_seed: 1
+
+evaluator:
+  timeout: 2160
+  max_retries: 0
+  cascade_evaluation: false
+  parallel_evaluations: 1
+  use_llm_feedback: false
+
+evolution_trace:
+  enabled: true
+  format: jsonl
+  include_code: true
+  include_prompts: true
+  output_path: null
+  buffer_size: 1
+  compress: false

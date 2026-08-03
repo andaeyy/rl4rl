@@ -1,0 +1,9 @@
+[submodule "architecture_discovery/vendor/AdderBoard"]
+	path = architecture_discovery/vendor/AdderBoard
+	url = https://github.com/anadim/AdderBoard.git
+[submodule "architecture_discovery/vendor/starting_model"]
+	path = architecture_discovery/vendor/starting_model
+	url = https://github.com/anadim/smallest-addition-transformer-claude-code.git
+[submodule "architecture_discovery/vendor/openevolve"]
+	path = architecture_discovery/vendor/openevolve
+	url = https://github.com/andaeyy/openevolve.git

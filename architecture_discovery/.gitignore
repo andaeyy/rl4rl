@@ -1,0 +1,20 @@
+.venv/
+.pytest_cache/
+**/__pycache__/
+*.py[cod]
+.env
+.env.*
+!.env.example
+
+# Raw experiment artifacts are append-only local data.
+outputs/raw/
+outputs/*_seed_*/
+outputs/candidate_training/
+outputs/development/
+outputs/.candidate_training.lock
+
+# Local controller state.
+checkpoints/*
+!checkpoints/.gitkeep
+logs/*
+!logs/.gitkeep

@@ -1,0 +1,2 @@
+"""Shared architecture-discovery components."""
+

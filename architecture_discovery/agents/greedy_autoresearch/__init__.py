@@ -1,0 +1,2 @@
+"""Greedy single-incumbent controller."""
+

@@ -1,0 +1,110 @@
+schema_name: scientific_decision_ledger
+schema_version: "1"
+status: unresolved
+note: >-
+  Null values are deliberate launch blockers. Toy tests may supply fixture
+  values, but no value in this ledger may be inferred from a smoke test.
+
+approval:
+  principal_investigator: null
+  approved_at_utc: null
+  decision_attestation: null
+
+launch_authorization:
+  pilot_authorized: false
+  main_authorized: false
+  authorized_by: null
+  authorized_at_utc: null
+
+treatment:
+  portfolio_size_k: null
+  portfolio_slot_ordering_rule: null
+  portfolio_sampling_rule: null
+  transition_schedule: null
+  transition_exposure_rule: null
+  retention_rule: null
+
+budgets:
+  primary_budget_unit: null
+  generator_token_ceiling: null
+  proposal_opportunity_ceiling: null
+  descendant_training_ceiling: null
+  repair_limit_per_opportunity: null
+  provider_attempt_limit_per_opportunity: null
+  invalid_output_charging_rule: null
+  ambiguous_provider_request_rule: null
+  candidate_maximum_wall_seconds: null
+
+evaluation:
+  layer_a_public_feedback_fields: null
+  layer_a_case_count: null
+  layer_b_case_count: null
+  layer_c_case_count: null
+  generator_disjointness_rule: null
+  layer_b_budget_checkpoints: null
+  layer_b_qualification_rule: null
+  layer_b_promotion_threshold: null
+  layer_c_release_scope: null
+  representative_selection_rule: null
+
+containment:
+  scientific_candidate_format: null
+  ir_primitive_governance: null
+  mps_resource_limits: null
+  unsupported_operation_classification: null
+  layer_b_custodian: null
+  layer_c_custodian: null
+  mps_evidence_custody_rule: null
+
+novelty:
+  reference_corpus_cutoff_date: null
+  corpus_sources_and_queries: null
+  corpus_inclusion_exclusion_rule: null
+  corpus_duplicate_rule: null
+  corpus_update_rule: null
+  novelty_rubric_version: null
+  canonicalization_rule: null
+  clustering_algorithm_and_threshold: null
+  clustering_manual_override_rule: null
+  review_sampling_rule: null
+  reviewer_qualification_rule: null
+  reviewer_count: null
+  adjudication_rule: null
+  unresolved_label_rule: null
+
+mechanism_and_replication:
+  required_ablation_arms: null
+  capacity_matching_rule: null
+  compute_matching_rule: null
+  replication_seed_list: null
+  replication_promotion_rule: null
+  replication_success_rule: null
+  seed_failure_and_replacement_rule: null
+  clean_room_blinding_rule: null
+  rescue_and_intervention_requirements: null
+  counterfactual_grid: null
+  scaling_grid: null
+  evidence_status_rule: null
+
+statistics:
+  smallest_effect_of_interest: null
+  target_power_or_precision: null
+  type_i_error: null
+  primary_contrasts: null
+  interaction_status: null
+  count_model_selection_rule: null
+  randomization_inference_statistic: null
+  multiplicity_family_and_adjustment: null
+  infrastructure_failure_sensitivity_rule: null
+  pilot_exclusion_and_amendment_rule: null
+  missing_review_rule: null
+
+scope_and_release:
+  paper_scope: null
+  external_validity_task_or_scaling_grid: null
+  raw_data_retention_duration: null
+  layer_c_release_timing: null
+  candidate_code_disclosure_rule: null
+  cost_energy_measurement_rule: null
+  artifact_anchor_provider_and_signature_scheme: null
+  pilot_evidence_custody_and_verification_rule: null

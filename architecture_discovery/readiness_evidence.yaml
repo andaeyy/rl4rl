@@ -1,0 +1,127 @@
+schema_name: scientific_readiness_evidence
+schema_version: "2"
+status: blocked
+updated_at_utc: "2026-08-01T00:26:11Z"
+note: >-
+  Passing engineering tests does not authorize a paid pilot or main study. A
+  gate is true only when its evidence identifies implemented, reproducible
+  behavior. Hardware, scientific-governance, and external-custody gates remain
+  deliberately false.
+
+levels:
+  infrastructure_implemented:
+    passed: true
+    evidence: common engine, evaluation firewall, scientific packages, immutable ledger, reconstruction, and reporting code
+  unit_tested:
+    passed: true
+    evidence: .venv/bin/python -m pytest -q completed successfully with all 285 collected tests passing on 2026-08-01 UTC
+  offline_smoke_tested:
+    passed: true
+    evidence: C0-C3 plus the feedback-free no-search control completed and exactly resumed at /private/tmp/architecture-discovery-final-offline-20260731-v3; provider calls 0 and torch training runs 0
+  mps_validated:
+    passed: false
+    evidence: full_train_v1 has not completed in an MPS-available process
+  pilot_ready:
+    passed: false
+    evidence: scripts/audit_scientific_readiness.py reports open launch gates
+  pilot_validated:
+    passed: false
+    evidence: no paid scientific pilot has run
+  main_study_ready:
+    passed: false
+    evidence: pilot, frozen final analysis plan, and all launch gates are incomplete
+
+gates:
+  evaluator_owned_from_scratch_training:
+    passed: true
+    evidence: common/trainer.py and deterministic training tests
+  common_c0_c3_engine:
+    passed: true
+    evidence: study/engine.py, study/contracts.py, and tests/test_study_engine.py
+  treatment_invariance:
+    passed: true
+    evidence: ConditionSpec exposes only parent_policy and proposal_policy as treatments
+  exact_typed_scientific_records:
+    passed: true
+    evidence: frozen configs, active run state, resource ledgers, claims, replication, outcomes, and receipts reject truthiness, fractional counts, and numeric-string coercion
+  manifest_security_invariants:
+    passed: true
+    evidence: readiness audit enforces Layer visibility/sealing, one-shot release, no CPU fallback, full_train_v1 identity, no size objective, and feedback-free no-search booleans
+  frozen_block_randomization:
+    passed: false
+    evidence: deterministic freeze tooling is implemented, but no scientific assignment table exists
+  sequential_mps_scheduler:
+    passed: true
+    evidence: study/scheduling.py and exclusive-lease adversarial tests
+  layer_a_b_c_firewall:
+    passed: true
+    evidence: evaluation dependency audit and sealed synthetic tests
+  sealed_post_search_execution_integrated:
+    passed: false
+    evidence: typed Layer B/C records exist, but no trusted production post-search orchestration entrypoint exists
+  scientific_evaluation_profiles:
+    passed: true
+    evidence: explicit A/B/C counts of at least 10000 are required; scientific values remain unresolved
+  strong_candidate_containment:
+    passed: false
+    evidence: actual candidate-bound macOS/MPS OS attestation or trusted IR execution is required
+  transformer_runtime_validity:
+    passed: false
+    evidence: runtime probe exists, but no trusted IR interpreter is integrated with scientific evaluation records
+  full_profile_mps_validation:
+    passed: false
+    evidence: full_train_v1 has not completed in an MPS-available process
+  mps_evidence_recorder_implemented:
+    passed: true
+    evidence: scripts/record_mps_validation.py hash-links and revalidates the full training summary, manifest, candidate source, device, fallback, containment, and exact step count
+  frozen_populated_reference_corpus:
+    passed: false
+    evidence: corpus population and independent review are external scientific work
+  mechanism_clustering_rule_frozen:
+    passed: false
+    evidence: deterministic machinery exists; the PI-approved scientific rule is unresolved
+  blinded_novelty_review_ready:
+    passed: false
+    evidence: independent reviewers, custody, and finalized codebook are required
+  mechanism_validation_policy_frozen:
+    passed: false
+    evidence: implementation exists; no scientific frozen plan exists
+  replication_policy_frozen:
+    passed: false
+    evidence: implementation exists; no scientific frozen policy exists
+  research_protocol_frozen_and_cross_linked:
+    passed: false
+    evidence: protocol implementation exists, but no scientific frozen protocol linked to StudySpec and the PI ledger exists
+  no_search_infrastructure_implemented:
+    passed: true
+    evidence: feedback-free baseline and matched-budget offline tests
+  no_search_baseline_scientifically_ready:
+    passed: false
+    evidence: real provider adapter and offline matched-budget path exist; the scientific scheduler does not yet assign the no-search control or emit its scientific artifacts
+  simulation_and_analysis_code_implemented:
+    passed: true
+    evidence: null/effect simulations, ITT, blocked count models, randomization inference, multiplicity, and timing tests
+  power_and_analysis_plan_frozen:
+    passed: false
+    evidence: pilot estimates and PI decisions are required
+  immutable_reconstructable_artifacts:
+    passed: true
+    evidence: artifacts/, reconstruction/, artifact study sink, CAS indexes, and tamper tests
+  artifact_external_anchor:
+    passed: false
+    evidence: no signed, WORM, or independently retained chain-head receipt or cryptographic custodian verifier exists
+  reproducibility_report_generation:
+    passed: true
+    evidence: research_ledger/, reporting/, and provider-free synthetic reconstruction tests
+  external_validity_plan_frozen:
+    passed: false
+    evidence: PI decision required; arithmetic-only testing is not external validity
+  principal_investigator_decisions_resolved:
+    passed: false
+    evidence: scientific_decisions.yaml contains deliberate null launch blockers, unresolved status, and no PI approval attestation
+  pilot_launch_authorized:
+    passed: false
+    evidence: PI pilot authorization and manifest/readiness kill switches remain false
+  main_launch_authorized:
+    passed: false
+    evidence: PI main authorization remains false and cannot precede validated pilot evidence

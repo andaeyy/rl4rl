@@ -1,0 +1,193 @@
+schema_name: architecture_discovery_experiment_manifest
+schema_version: "2"
+
+study:
+  name: valid_architecture_discovery_on_adderboard
+  objective: valid architecture-family and mechanism discovery
+  parameter_count_role: descriptive_metadata_only
+  protocol: ../RIGOROUS_EXPERIMENT_PLAN_V2.md
+  implementation_contract: IMPLEMENTATION_CONTRACT.md
+  scientific_decisions: scientific_decisions.yaml
+  readiness_evidence: readiness_evidence.yaml
+  launch_status: blocked
+  pilot_ready: false
+  pilot_validated: false
+  main_study_ready: false
+  independent_unit: complete_assigned_run
+  primary_outcome: unique_layer_b_qualified_mechanism_clusters_per_run
+
+primary_causal_design:
+  engine: study.engine.CommonStudyEngine
+  instrumented_engine: artifacts.study_sink.ArtifactEmittingStudyEngine
+  factors:
+    parent_policy: [single, portfolio]
+    proposal_policy: [ordinary, scheduled_transition]
+  conditions:
+    C0: {parent_policy: single, proposal_policy: ordinary}
+    C1: {parent_policy: single, proposal_policy: scheduled_transition}
+    C2: {parent_policy: portfolio, proposal_policy: ordinary}
+    C3: {parent_policy: portfolio, proposal_policy: scheduled_transition}
+  native_greedy_and_openevolve_role: secondary_system_replications
+  portfolio_size_k: null
+  transition_schedule: null
+  primary_budget: null
+  provider_attempt_limit_per_opportunity: null
+  repair_limit_per_opportunity: null
+
+secondary_controls:
+  no_search:
+    status: provider_adapter_implemented_not_scheduled_scientifically
+    model: gpt-5.6-sol
+    adaptive_feedback: false
+    matched_generator_budget_required: true
+  prompt_placebo:
+    status: separate_optional_control
+    adaptive_feedback: true
+
+machine:
+  model: MacBook Air Mac17,3
+  chip: Apple M5
+  memory_gb: 24
+  os: macOS 26.5.1
+  preferred_device: mps
+  scientific_fallback_device: none
+  engineering_test_device: cpu_with_explicit_flag_only
+
+runtime:
+  python: "3.12"
+  environment: .venv
+  package_manager: uv
+  setup_selected_device: mps
+  setup_device_reason: apple_m5_mps_verified_outside_sandbox
+
+sources:
+  adderboard:
+    url: https://github.com/anadim/AdderBoard.git
+    commit: 07061de8d833d04e9800a009721731586e102aef
+  starting_model:
+    url: https://github.com/anadim/smallest-addition-transformer-claude-code.git
+    commit: 85f7fb10277111df9ff746f1448eef243cbb51d5
+    role: conventional_validated_starting_architecture
+  openevolve:
+    url: https://github.com/andaeyy/openevolve.git
+    commit: 258c29b56fbff42da26bdf64cb42ba5b142e2903
+    upstream_url: https://github.com/algorithmicsuperintelligence/openevolve.git
+    upstream_commit: 411fb59c886c18704caaffb611e17cf9e7d824d2
+    patch: disable_implicit_openai_sdk_retries
+    patched_file_sha256: 4d775758e83b21678becf1759dd58bfe2b13976559caeae165a4b223de7446d7
+
+shared_generation:
+  target_model: gpt-5.6-sol
+  model_env: DISCOVERY_MODEL
+  api_base_env: DISCOVERY_API_BASE
+  api_key_env: DISCOVERY_API_KEY
+  api_mode: chat_completions
+  reasoning_effort: high
+  temperature: null
+  top_p: null
+  max_completion_tokens: 16384
+  request_timeout_seconds: 300
+  retries: 2
+  retry_delay_seconds: 3
+  request_seed: controller_seed_best_effort
+  mutation_format: search_replace_diff
+
+evaluation:
+  online_api: typed_search_evaluation_record_only
+  parameter_count_in_fitness: false
+  internet_access_during_runs: false
+  runtime_transformer_validity_status: probes_implemented_not_integrated_with_trusted_ir_interpreter
+  layer_a:
+    profile: scientific_layer_a_v1
+    controller_visible: true
+    case_count: null
+    source_id: public-addition-search-v1
+    source_hash: 9b619b112e552b3d1168ed10c38286e0e7fdd563f05d2c50eae7c4bd167c9e35
+    eligibility_threshold: null
+  layer_b:
+    profile: scientific_layer_b_v1
+    controller_visible: false
+    sealed: true
+    case_count: null
+    source_id: null
+    source_hash: null
+    qualification_rule: null
+  layer_c:
+    profile: scientific_layer_c_v1
+    controller_visible: false
+    sealed: true
+    one_shot_release: true
+    case_count: null
+    source_id: null
+    source_hash: null
+    confirmation_rule: null
+
+training:
+  candidate_initialization: from_scratch
+  owner: trusted_evaluator
+  profile: full_train_v1
+  profile_version: "1"
+  profile_hash: 046034a7949f3563fc13dcb38df4b34e997cb5a1ffe6b90e755e2f44bfd9f06e
+  scientific: true
+  task_adapter: fixed_addition_v1
+  task_adapter_hash: 0663e4cc7a57a98661e7317331f708b69d1d2ac213be335b91098e47e0a06880
+  seed_derivation: sha256-v1
+  device: mps
+  dtype: float32
+  max_optimizer_steps: 30000
+  global_batch_size: 512
+  microbatch_size: null
+  gradient_accumulation_steps: 1
+  optimizer: AdamW
+  learning_rate: 0.001
+  adamw_betas: [0.9, 0.98]
+  weight_decay: 0.1
+  warmup_steps: 300
+  scheduler: cosine_decay_to_zero
+  gradient_clip_norm: 1.0
+  validation_interval: 1000
+  validation_examples: 2000
+  checkpoint_interval: 1000
+  checkpoint_selection: higher_development_exact_match_then_lower_development_loss_then_earlier_step
+  maximum_wall_seconds: 1800
+  deterministic_algorithms: true
+  automatic_batch_size_reduction: false
+  cpu_fallback: false
+  parallel_candidate_training: false
+  candidate_format_current: arbitrary_python
+  scientific_containment_required: true
+  scientific_arbitrary_python_status: blocked_until_os_boundary_attested
+  architecture_ir_status: schema_and_runtime_evidence_only_no_trusted_interpreter
+  resume_checkpoint_loading: weights_only_true
+
+engineering_smoke:
+  profile: smoke_train_v1
+  profile_version: "1"
+  profile_hash: 1a2b04bcb966f4189f90d6b8f6ef3aa8f83fb537f0f031004d0e58d69192cb61
+  scientific: false
+  max_optimizer_steps: 10
+  global_batch_size: 16
+  validation_examples: 24
+  maximum_wall_seconds: 60
+
+artifacts_and_reconstruction:
+  event_ledger: append_only_hash_chained
+  candidate_and_response_storage: content_addressed
+  persistence_integration: enabled_for_primary_offline_and_gated_scientific_entrypoints
+  search_completion_index: frozen_content_addressed_reference
+  full_reconstruction: implemented_and_offline_tested
+  reproducibility_reporting: implemented_and_offline_tested
+  external_chain_anchor: null
+  external_signature_verifier_status: required_not_implemented
+
+scientific_evidence_status:
+  frozen_research_protocol: required
+  reference_corpus: population_required
+  reviewer_roster: required
+  mechanism_plan: required
+  replication_policy: required
+  full_mps_validation: required
+  pilot_evidence: required_before_main
+  final_power_analysis_plan: required_after_pilot
+  pi_pilot_launch_authorization: false
+  pi_main_launch_authorization: false
