@@ -1,0 +1,65 @@
+version = "0.1.0"
+
+# Values map a concrete technique to a representational family. Moving within a
+# family is provisionally preserving; moving between families is provisionally
+# changing. These are annotation suggestions, not final scientific labels.
+
+[components.positional_encoding]
+learned_absolute = "additive_position"
+sinusoidal = "additive_position"
+fixed_sinusoidal = "additive_position"
+rope = "attention_rotation"
+rotary = "attention_rotation"
+alibi = "attention_score_bias"
+relative_bias = "attention_score_bias"
+none = "no_position_mechanism"
+
+[components.token_embedding]
+learned_table = "lookup_table"
+tied_learned_table = "lookup_table"
+circular_arc = "parametric_function"
+quadratic = "parametric_function"
+factorized = "learned_factorization"
+fixed_algebraic = "deterministic_algebraic"
+
+[components.attention_projection]
+independent_learned = "learned_linear_map"
+tied_learned = "learned_linear_map"
+low_rank_learned = "learned_linear_map"
+sparse_learned = "learned_linear_map"
+rotation_of_q = "deterministic_algebraic_map"
+transpose_of_q = "deterministic_algebraic_map"
+fixed_algebraic = "deterministic_algebraic_map"
+
+[components.mlp]
+relu = "pointwise_nonlinear"
+gelu = "pointwise_nonlinear"
+silu = "pointwise_nonlinear"
+swiglu = "multiplicative_gate"
+geglu = "multiplicative_gate"
+fixed_carry_gate = "deterministic_task_circuit"
+
+[components.normalization]
+independent_rmsnorm = "learned_scale_norm"
+shared_rmsnorm = "learned_scale_norm"
+layernorm = "learned_center_scale_norm"
+parameterless_rmsnorm = "parameterless_norm"
+none = "no_norm"
+
+[components.tokenization]
+digitwise = "single_digit_symbols"
+pair_tokens = "paired_digit_symbols"
+character = "single_character_symbols"
+
+[components.depth]
+one_layer = "transformer_stack"
+two_layers = "transformer_stack"
+three_layers = "transformer_stack"
+
+[components.width]
+d2 = "dense_hidden_state"
+d3 = "dense_hidden_state"
+d4 = "dense_hidden_state"
+d8 = "dense_hidden_state"
+d11 = "dense_hidden_state"
+d16 = "dense_hidden_state"
