@@ -1,0 +1,88 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/goatoush/rl4rl/schemas/trajectory-event.schema.json",
+  "title": "RL4RL trajectory event",
+  "type": "object",
+  "required": ["event_id", "run_id", "paradigm", "step", "status"],
+  "properties": {
+    "event_id": {"type": "string", "minLength": 1},
+    "run_id": {"type": "string", "minLength": 1},
+    "paradigm": {
+      "enum": ["openevolve", "autoresearch", "ttt-discover", "human-frontier", "other"]
+    },
+    "step": {"type": "integer", "minimum": 0},
+    "status": {
+      "enum": ["proposed", "evaluated", "accepted", "rejected", "rolled_back", "invalid", "error", "stopped"]
+    },
+    "parent_ids": {
+      "type": "array",
+      "items": {"type": "string"},
+      "uniqueItems": true,
+      "default": []
+    },
+    "timestamp": {"type": ["string", "null"]},
+    "accepted": {"type": ["boolean", "null"]},
+    "valid": {"type": ["boolean", "null"]},
+    "proposal": {"type": ["string", "null"]},
+    "notes": {"type": ["string", "null"]},
+    "architecture": {"$ref": "#/$defs/architecture"},
+    "edits": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/edit"},
+      "default": []
+    },
+    "reward_hack": {"$ref": "#/$defs/rewardHack"},
+    "artifact_refs": {
+      "type": "array",
+      "items": {"type": "string"},
+      "default": []
+    },
+    "provenance": {"type": "object", "default": {}}
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "architecture": {
+      "type": "object",
+      "properties": {
+        "parameters": {"type": ["integer", "null"], "minimum": 0},
+        "accuracy": {"type": ["number", "null"], "minimum": 0, "maximum": 1},
+        "qualifies": {"type": ["boolean", "null"]},
+        "family": {"type": ["string", "null"]},
+        "fingerprint": {"type": ["string", "null"]},
+        "features": {"type": "object", "additionalProperties": true}
+      },
+      "additionalProperties": false
+    },
+    "edit": {
+      "type": "object",
+      "required": ["component", "operation"],
+      "properties": {
+        "component": {"type": "string", "minLength": 1},
+        "operation": {"type": "string", "minLength": 1},
+        "before": {"type": ["string", "null"]},
+        "after": {"type": ["string", "null"]},
+        "ontology_family_before": {"type": ["string", "null"]},
+        "ontology_family_after": {"type": ["string", "null"]},
+        "boundary_label": {
+          "enum": ["preserving", "changing", "ambiguous", "not_applicable"]
+        },
+        "rationale": {"type": ["string", "null"]},
+        "confidence": {"type": ["number", "null"], "minimum": 0, "maximum": 1},
+        "annotation_source": {"enum": ["human", "heuristic", "llm", "imported"]},
+        "annotator_id": {"type": ["string", "null"]},
+        "needs_review": {"type": "boolean"}
+      },
+      "additionalProperties": false
+    },
+    "rewardHack": {
+      "type": "object",
+      "properties": {
+        "suspected": {"type": "boolean"},
+        "verified": {"type": "boolean"},
+        "category": {"type": ["string", "null"]},
+        "notes": {"type": ["string", "null"]}
+      },
+      "additionalProperties": false
+    }
+  }
+}

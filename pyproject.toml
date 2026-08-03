@@ -1,0 +1,40 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "rl4rl"
+version = "0.1.0"
+description = "Trajectory analysis for autonomous discovery systems on AdderBoard"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { file = "LICENSE" }
+authors = [{ name = "RL4RL contributors" }]
+dependencies = []
+
+[project.optional-dependencies]
+analysis = [
+  "matplotlib>=3.9",
+]
+dev = [
+  "pytest>=8.3",
+  "ruff>=0.9",
+]
+
+[project.scripts]
+rl4rl = "rl4rl.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/rl4rl"]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
