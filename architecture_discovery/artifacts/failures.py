@@ -25,6 +25,12 @@ class FailureClass(StrEnum):
     PROVIDER_TRANSIENT = "provider_transient"
     WORKER_CRASH = "worker_crash"
     MPS_DRIVER_FAILURE = "mps_driver_failure"
+    CUDA_UNAVAILABLE = "cuda_unavailable"
+    CUDA_OOM = "cuda_oom"
+    CUDA_DRIVER_RUNTIME_FAILURE = "cuda_driver_runtime_failure"
+    UNSUPPORTED_DETERMINISTIC_CUDA_OPERATION = (
+        "unsupported_deterministic_cuda_operation"
+    )
     FILESYSTEM_IO = "filesystem_io"
     POWER_INTERRUPTION = "power_interruption"
     MPS_UNAVAILABLE = "mps_unavailable"
@@ -41,6 +47,10 @@ _DOMAIN_BY_CLASS = {
     FailureClass.PROVIDER_TRANSIENT: FailureDomain.INFRASTRUCTURE,
     FailureClass.WORKER_CRASH: FailureDomain.INFRASTRUCTURE,
     FailureClass.MPS_DRIVER_FAILURE: FailureDomain.INFRASTRUCTURE,
+    FailureClass.CUDA_UNAVAILABLE: FailureDomain.INFRASTRUCTURE,
+    FailureClass.CUDA_OOM: FailureDomain.CANDIDATE,
+    FailureClass.CUDA_DRIVER_RUNTIME_FAILURE: FailureDomain.INFRASTRUCTURE,
+    FailureClass.UNSUPPORTED_DETERMINISTIC_CUDA_OPERATION: FailureDomain.CANDIDATE,
     FailureClass.FILESYSTEM_IO: FailureDomain.INFRASTRUCTURE,
     FailureClass.POWER_INTERRUPTION: FailureDomain.INFRASTRUCTURE,
     FailureClass.MPS_UNAVAILABLE: FailureDomain.INFRASTRUCTURE,
@@ -53,6 +63,7 @@ DEFAULT_RERUNNABLE_INFRASTRUCTURE_CLASSES: FrozenSet[FailureClass] = frozenset(
         FailureClass.PROVIDER_TRANSIENT,
         FailureClass.WORKER_CRASH,
         FailureClass.MPS_DRIVER_FAILURE,
+        FailureClass.CUDA_DRIVER_RUNTIME_FAILURE,
         FailureClass.FILESYSTEM_IO,
         FailureClass.POWER_INTERRUPTION,
     }

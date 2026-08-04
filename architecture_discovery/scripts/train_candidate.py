@@ -12,26 +12,39 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from common.training_client import WorkerError, run_worker_job
-from common.training_config import TrainingSeedBundle, get_training_profile
+from common.training_client import (
+    SUPPORTED_REQUESTED_DEVICES,
+    WorkerError,
+    run_worker_job,
+)
+from common.training_config import PROFILES, TrainingSeedBundle, get_training_profile
 from common.trainer import validate_training_request
 
 
-def main() -> None:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument("--candidate", required=True)
     parser.add_argument(
         "--profile",
-        choices=("full_train_v1", "smoke_train_v1"),
+        choices=tuple(sorted(PROFILES)),
         required=True,
     )
-    parser.add_argument("--device", choices=("mps", "cpu"), required=True)
+    parser.add_argument(
+        "--device",
+        choices=SUPPORTED_REQUESTED_DEVICES,
+        required=True,
+        help="strict requested backend; CUDA never falls back to CPU",
+    )
     parser.add_argument("--seed", type=int, required=True)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--resume")
     parser.add_argument("--allow-cpu-for-tests", action="store_true")
-    args = parser.parse_args()
+    return parser
+
+
+def main() -> None:
+    args = build_parser().parse_args()
 
     profile = get_training_profile(args.profile)
     seeds = TrainingSeedBundle.from_run_seed(args.seed)

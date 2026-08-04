@@ -21,6 +21,12 @@ and no explicit PI launch authorization.
 credentials or constructing an API client. It cannot presently start a paid
 run.
 
+CUDA support is additive and does not change those MPS gates. Apptainer 1.4.1
+is available through the cluster module system, but there is no authenticated,
+candidate-bound adversarial containment receipt. Therefore a trusted
+non-scientific CUDA smoke is permitted on an allocated GPU, while arbitrary
+generated Python remains blocked from formal scientific CUDA execution.
+
 ## Primary causal design
 
 All primary conditions execute through the same `CommonStudyEngine`:
@@ -84,6 +90,22 @@ has no CPU fallback.
 `smoke_train_v1` is a ten-step engineering check only. It is not valid for
 ranking architectures or making scientific claims.
 
+Two separately hashed CUDA profiles are also available:
+
+- `full_train_cuda_a40_v1` retains the complete 30,000-step algorithmic budget,
+  batch 512, AdamW/schedule/validation/checkpoint rules, float32, and all
+  no-fallback constraints of `full_train_v1`. It is a separate hardware
+  condition and is not presently authorized for formal arbitrary-Python runs.
+- `smoke_train_cuda_v1` is exactly ten optimizer steps and explicitly
+  non-scientific. It may be used only with `common/initial_candidate.py` for
+  machinery validation; that path is additionally bound to the reviewed
+  candidate SHA-256 so modified or alternate Python fails before import.
+
+CUDA and MPS trajectories must never be pooled merely because their profiles
+share seeds or algorithmic settings. Cross-backend analysis requires an
+explicit analysis plan. Parameter count remains descriptive metadata only on
+both backends and is never an optimization objective.
+
 ## Containment and transformer validity
 
 Generated Python runs in a credential-scrubbed worker and is statically scanned
@@ -106,6 +128,11 @@ parse failures, repairs, training attempts/steps/examples, MPS seconds,
 evaluation cases, infrastructure retries, and terminal outcomes. Provider
 retries and format repairs stay inside the original opportunity. Repairs have
 both total and per-opportunity ceilings.
+
+The v1 `mps_seconds` budget and ledger records retain their original schema and
+round-trip behavior. New accelerator resource records use a v2 backend-neutral
+schema keyed by backend and hardware condition; it rejects accidental MPS/CUDA
+pooling.
 
 Every integrated C0–C3 persistence transition is mirrored into an append-only,
 hash-linked event ledger. Candidate source, provider responses, and indexes use
@@ -171,6 +198,10 @@ Exit status 2 is currently expected: it means the fail-closed audit found open
 gates. Read `scientific_decisions.yaml`, `readiness_evidence.yaml`, and the JSON
 audit output; do not bypass the missing evidence.
 
+The audit also validates an optional `CudaA40ValidationReceipt` v1.0 as a
+separate engineering readiness level. Even a passing CUDA smoke receipt does
+not set `pilot_ready`, `main_study_ready`, or formal scientific authorization.
+
 ## MPS checks
 
 Check what the current process can see:
@@ -220,6 +251,52 @@ process, create the hash-linked evidence receipt without retraining:
 The recorder rejects CPU execution, partial step counts, fallback-enabled runs,
 unmatched candidate/profile hashes, weak-containment manifests, and modified
 training artifacts. It creates the receipt once and will not overwrite it.
+
+## NVIDIA A40 CUDA smoke
+
+Never run candidate training on `login1`. The inspected cluster uses Slurm and
+advertises A40 resources on partition `gpu` with `--gres=gpu:a40:1`. If account
+or QOS flags are required, use only values authorized for the project; none are
+invented in the template.
+
+Interactive allocation:
+
+```bash
+salloc --partition=gpu --gres=gpu:a40:1 --nodes=1 --ntasks=1 --time=00:20:00
+srun --ntasks=1 --gres=gpu:a40:1 scripts/slurm_cuda_smoke.sh
+```
+
+Parameterized batch submission:
+
+```bash
+sbatch scripts/slurm_cuda_smoke.sbatch
+# If required by the scheduler:
+sbatch --account=<approved-account> --qos=<approved-qos> \
+  scripts/slurm_cuda_smoke.sbatch
+```
+
+The launcher refuses the login host and missing/non-single-GPU allocations,
+uses the pinned Python 3.12/PyTorch 2.7.1 environment, clears provider
+credential variables, sets `CUBLAS_WORKSPACE_CONFIG=:4096:8`, and writes only
+to `/scratch/maandrew-rl4rl-runs`. It does not make API calls or generate a
+candidate.
+
+After a successful run, validate the hash-linked receipt without retraining:
+
+```bash
+/scratch/maandrew-rl4rl/env/architecture-discovery-py312-torch271/bin/python \
+  scripts/record_cuda_a40_validation.py \
+  --training-output-dir /scratch/maandrew-rl4rl-runs/<run>/training \
+  --output /scratch/maandrew-rl4rl-runs/<run>/cuda_a40_validation_receipt.json \
+  --expected-seed 1
+```
+
+The recorder requires an A40, Slurm allocation evidence, exactly ten completed
+steps, validation, changed parameters, synchronized timing, non-null CUDA
+memory telemetry, strict deterministic settings, the trusted checked-in source,
+and matching checkpoint/artifact hashes. It also rejects credential marker
+names in retained text artifacts. See `CUDA_A40_MIGRATION_RUNBOOK.md` for the
+server evidence and reproducibility procedure.
 
 ## Scientific launch sequence
 

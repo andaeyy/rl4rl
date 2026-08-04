@@ -24,10 +24,34 @@ from common.evaluator import SearchEvaluationContext, evaluate_candidate, file_h
 from common.gpt56_sol import GPT56SolProfile
 from common.lineage_schema import CandidateRecord, append_record, text_hash, utc_now
 from common.task_adapter import DEFAULT_TASK
-from common.training_config import TrainingSeedBundle, get_training_profile
+from common.training_client import resolve_harness_training_selection
+from common.training_config import TrainingSeedBundle
 
 
 AGENT_DIR = Path(__file__).resolve().parent
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--iterations", type=int, default=5)
+    parser.add_argument("--seed", type=int, default=1)
+    parser.add_argument("--output-dir")
+    parser.add_argument(
+        "--profile",
+        help=(
+            "training profile override; defaults to DISCOVERY_TRAINING_PROFILE "
+            "or the unchanged harness configuration"
+        ),
+    )
+    parser.add_argument(
+        "--device",
+        choices=("mps", "cuda"),
+        help=(
+            "training accelerator override; defaults to DISCOVERY_TRAIN_DEVICE "
+            "or the unchanged harness configuration"
+        ),
+    )
+    return parser
 
 
 def _provider_values() -> tuple[str, str, str]:
@@ -82,21 +106,21 @@ def _request_completion(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--iterations", type=int, default=5)
-    parser.add_argument("--seed", type=int, default=1)
-    parser.add_argument("--output-dir")
-    args = parser.parse_args()
+    args = build_parser().parse_args()
 
     config = yaml.safe_load((AGENT_DIR / "config.yaml").read_text())
     training_config = config["training"]
-    training_profile = get_training_profile(training_config["profile"])
-    if training_profile.version != str(training_config["profile_version"]):
-        raise SystemExit("greedy training profile version mismatch")
-    training_device = os.environ.get(
-        "DISCOVERY_TRAIN_DEVICE", training_config["device"]
-    )
-    allow_cpu_for_tests = bool(training_config["allow_cpu_for_tests"])
+    try:
+        training_selection = resolve_harness_training_selection(
+            training_config,
+            profile_override=args.profile,
+            device_override=args.device,
+        )
+    except ValueError as exc:
+        raise SystemExit(f"invalid greedy training selection: {exc}") from exc
+    training_profile = training_selection.profile
+    training_device = training_selection.requested_device
+    allow_cpu_for_tests = training_selection.allow_cpu_for_tests
     training_seeds = TrainingSeedBundle.from_run_seed(args.seed)
     api_key, api_base, model_name = _provider_values()
     try:
@@ -152,15 +176,11 @@ def main() -> None:
         "evaluator_hash": file_hash(ROOT / "common" / "evaluator.py"),
         "config_hash": file_hash(AGENT_DIR / "config.yaml"),
         "training": {
-            "profile": training_profile.name,
-            "profile_version": training_profile.version,
-            "profile_hash": training_profile.profile_hash,
+            **training_selection.manifest_fields(),
             "task_adapter": DEFAULT_TASK.version,
             "task_adapter_hash": DEFAULT_TASK.config_hash,
             "seed_bundle": training_seeds.__dict__,
             "seed_bundle_hash": training_seeds.bundle_hash,
-            "device": training_device,
-            "allow_cpu_for_tests": allow_cpu_for_tests,
         },
     }
     (output_dir / "run_manifest.json").write_text(

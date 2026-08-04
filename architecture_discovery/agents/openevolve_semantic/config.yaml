@@ -11,9 +11,17 @@ file_suffix: .py
 training:
   profile: full_train_v1
   profile_version: "1"
+  selectable_profiles:
+    - full_train_v1
+    - smoke_train_v1
+    - full_train_cuda_a40_v1
+    - smoke_train_cuda_v1
   task_adapter: fixed_addition_v1
   seed_derivation: sha256-v1
   device: mps
+  selectable_devices:
+    - mps
+    - cuda
   allow_cpu_for_tests: false
 
 llm:

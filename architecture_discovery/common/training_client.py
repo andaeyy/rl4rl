@@ -4,26 +4,206 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
-from dataclasses import asdict
+from collections.abc import Mapping
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
+from common.device import (
+    CUDA_ALLOCATION_ENVIRONMENT_KEYS,
+    CUDA_CUBLAS_WORKSPACE_CONFIG,
+)
 from common.task_adapter import DEFAULT_TASK
 from common.trainer import sha256_file
-from common.training_config import TrainingProfile, TrainingSeedBundle
+from common.training_config import (
+    TrainingProfile,
+    TrainingSeedBundle,
+    get_training_profile,
+)
+from common.trusted_candidate import validate_trusted_initial_candidate
 
 
 ROOT = Path(__file__).resolve().parents[1]
 BOOTSTRAP = ROOT / "scripts" / "training_worker_bootstrap.py"
 _INHERITED_ENV_ALLOWLIST = ("LANG", "LC_ALL", "TMPDIR", "SYSTEM_VERSION_COMPAT")
+_CUDA_ASSIGNMENT_ENV_ALLOWLIST = (
+    "CUDA_VISIBLE_DEVICES",
+    "SLURM_JOB_ID",
+    *CUDA_ALLOCATION_ENVIRONMENT_KEYS,
+)
+_CUDA_VISIBLE_DEVICE_PATTERN = re.compile(r"[A-Za-z0-9_.:/-]+")
 _TRUTHY = {"1", "true", "yes", "on"}
+SUPPORTED_REQUESTED_DEVICES = ("mps", "cuda", "cpu")
 
 
 class WorkerError(RuntimeError):
     pass
+
+
+@dataclass(frozen=True)
+class HarnessTrainingSelection:
+    """Resolved native-harness training settings and their provenance."""
+
+    profile: TrainingProfile
+    requested_device: str
+    allow_cpu_for_tests: bool
+    profile_source: str
+    device_source: str
+
+    def manifest_fields(self) -> dict[str, Any]:
+        return {
+            "profile": self.profile.name,
+            "profile_version": self.profile.version,
+            "profile_hash": self.profile.profile_hash,
+            "requested_device": self.requested_device,
+            # Retain the original field for backward-compatible readers.
+            "device": self.requested_device,
+            "allow_cpu_for_tests": self.allow_cpu_for_tests,
+            "selection": {
+                "profile_source": self.profile_source,
+                "device_source": self.device_source,
+            },
+            "actual_selection_evidence": {
+                "scope": "per_candidate_worker_manifest",
+                "record": "training_manifest.json",
+                "required_fields": [
+                    "profile_hash",
+                    "requested_device",
+                    "selected_device",
+                ],
+            },
+        }
+
+
+def _selection_value(
+    *,
+    command_line: str | None,
+    environment: Mapping[str, str],
+    environment_name: str,
+    configured: str,
+) -> tuple[str, str]:
+    if command_line:
+        return command_line, "command_line"
+    if environment.get(environment_name):
+        return str(environment[environment_name]), "environment"
+    return configured, "configuration"
+
+
+def resolve_harness_training_selection(
+    training_config: Mapping[str, Any],
+    *,
+    profile_override: str | None,
+    device_override: str | None,
+    environment: Mapping[str, str] | None = None,
+) -> HarnessTrainingSelection:
+    """Resolve profile/device overrides without changing frozen config defaults."""
+
+    parent = os.environ if environment is None else environment
+    profile_name, profile_source = _selection_value(
+        command_line=profile_override,
+        environment=parent,
+        environment_name="DISCOVERY_TRAINING_PROFILE",
+        configured=str(training_config["profile"]),
+    )
+    requested_device, device_source = _selection_value(
+        command_line=device_override,
+        environment=parent,
+        environment_name="DISCOVERY_TRAIN_DEVICE",
+        configured=str(training_config["device"]),
+    )
+    requested_device = requested_device.strip().lower()
+
+    selectable_profiles = tuple(
+        str(value) for value in training_config.get("selectable_profiles", ())
+    )
+    if selectable_profiles and profile_name not in selectable_profiles:
+        raise ValueError(
+            f"training profile {profile_name!r} is not selectable by this harness"
+        )
+    selectable_devices = tuple(
+        str(value).lower()
+        for value in training_config.get("selectable_devices", ())
+    )
+    if selectable_devices and requested_device not in selectable_devices:
+        raise ValueError(
+            f"training device {requested_device!r} is not selectable by this harness"
+        )
+    if requested_device not in SUPPORTED_REQUESTED_DEVICES:
+        raise ValueError(
+            f"unsupported training device {requested_device!r}; choose one of "
+            f"{SUPPORTED_REQUESTED_DEVICES}"
+        )
+
+    profile = get_training_profile(profile_name)
+    if profile_source == "configuration" and profile.version != str(
+        training_config["profile_version"]
+    ):
+        raise ValueError("configured training profile version mismatch")
+
+    allow_cpu_for_tests = bool(training_config["allow_cpu_for_tests"])
+    if requested_device == "cpu":
+        if profile.scientific:
+            raise ValueError("scientific training cannot select CPU")
+        if not allow_cpu_for_tests:
+            raise ValueError(
+                "CPU training is disabled; no accelerator fallback is permitted"
+            )
+    elif profile.device_requirement != requested_device:
+        raise ValueError(
+            f"profile {profile.name} requires {profile.device_requirement}; "
+            f"requested {requested_device} cannot substitute for that backend"
+        )
+    return HarnessTrainingSelection(
+        profile=profile,
+        requested_device=requested_device,
+        allow_cpu_for_tests=allow_cpu_for_tests,
+        profile_source=profile_source,
+        device_source=device_source,
+    )
+
+
+def _normalize_requested_device(
+    requested_device: str,
+    *,
+    allow_cpu_for_tests: bool,
+) -> str:
+    normalized = requested_device.strip().lower()
+    if normalized not in SUPPORTED_REQUESTED_DEVICES:
+        raise WorkerError(
+            f"unsupported worker device {normalized!r}; choose one of "
+            f"{SUPPORTED_REQUESTED_DEVICES}"
+        )
+    if normalized == "cpu" and not allow_cpu_for_tests:
+        raise WorkerError("CPU worker launch requires explicit test-only permission")
+    return normalized
+
+
+def _validated_cuda_assignment(
+    parent: Mapping[str, str],
+) -> dict[str, str]:
+    assignment = {
+        key: str(parent[key])
+        for key in _CUDA_ASSIGNMENT_ENV_ALLOWLIST
+        if key in parent and str(parent[key])
+    }
+    visible = assignment.get("CUDA_VISIBLE_DEVICES")
+    if visible is not None and (
+        len(visible) > 128
+        or _CUDA_VISIBLE_DEVICE_PATTERN.fullmatch(visible) is None
+    ):
+        raise WorkerError(
+            "CUDA_VISIBLE_DEVICES is not a safe single-device assignment"
+        )
+    for key, value in assignment.items():
+        if key == "CUDA_VISIBLE_DEVICES":
+            continue
+        if len(value) > 4_096 or "\n" in value or "\r" in value:
+            raise WorkerError(f"unsafe scheduler assignment value for {key}")
+    return assignment
 
 
 def build_worker_environment(
@@ -34,6 +214,10 @@ def build_worker_environment(
     parent_environment: dict[str, str] | None = None,
 ) -> dict[str, str]:
     parent = os.environ if parent_environment is None else parent_environment
+    requested_device = _normalize_requested_device(
+        requested_device,
+        allow_cpu_for_tests=allow_cpu_for_tests,
+    )
     inherited_fallback = str(
         parent.get("PYTORCH_ENABLE_MPS_FALLBACK", "")
     ).strip().lower()
@@ -47,6 +231,9 @@ def build_worker_environment(
         for key in _INHERITED_ENV_ALLOWLIST
         if key in parent and parent[key]
     }
+    if requested_device == "cuda":
+        environment.update(_validated_cuda_assignment(parent))
+        environment["CUBLAS_WORKSPACE_CONFIG"] = CUDA_CUBLAS_WORKSPACE_CONFIG
     environment.update(
         {
             "PYTHONHASHSEED": str(model_seed % (2**32)),
@@ -79,6 +266,20 @@ def run_worker_job(
 ) -> dict[str, Any]:
     candidate = Path(candidate_path).resolve()
     destination = Path(output_dir).resolve()
+    requested_device = _normalize_requested_device(
+        requested_device,
+        allow_cpu_for_tests=allow_cpu_for_tests,
+    )
+    if requested_device != "cpu" and profile.device_requirement != requested_device:
+        raise WorkerError(
+            f"profile {profile.name} requires {profile.device_requirement}; "
+            f"refusing worker request for {requested_device}"
+        )
+    if profile.name == "smoke_train_cuda_v1":
+        try:
+            validate_trusted_initial_candidate(candidate)
+        except (OSError, ValueError) as error:
+            raise WorkerError(str(error)) from error
     if mode not in {"train", "evaluate"}:
         raise ValueError(f"unsupported worker mode: {mode}")
     if mode == "evaluate" and (

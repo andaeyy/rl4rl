@@ -32,8 +32,13 @@ from containment.policy import (
 from common.candidate_contract import inspect_candidate_path, validate_candidate
 from common.candidate_loader import load_candidate
 from common.device import (
+    ACCELERATOR_TELEMETRY_SCHEMA_VERSION,
     DeviceUnavailableError,
-    mps_memory,
+    accelerator_memory,
+    accelerator_runtime_metadata,
+    accelerator_telemetry,
+    cleanup_accelerator,
+    reset_accelerator_peak_memory,
     resolve_training_device,
     synchronized_time,
     synchronize,
@@ -45,6 +50,10 @@ from common.training_config import (
     TrainingSeedBundle,
 )
 from common.training_data import public_development_cases, training_batch
+from common.trusted_candidate import (
+    sha256_bytes,
+    validate_trusted_initial_candidate,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -124,22 +133,35 @@ def _append_event(path: Path, payload: dict[str, Any]) -> None:
         handle.write(json.dumps(payload, sort_keys=True) + "\n")
 
 
-def _atomic_source_copy(source: Path, destination: Path) -> None:
+def _atomic_source_copy(
+    source: Path,
+    destination: Path,
+    *,
+    expected_sha256: str,
+    private: bool,
+) -> str:
+    payload = source.read_bytes()
+    observed_sha256 = sha256_bytes(payload)
+    if observed_sha256 != expected_sha256:
+        raise ResumeMismatchError(
+            "candidate source changed while creating the immutable worker copy"
+        )
     with tempfile.NamedTemporaryFile(
         dir=destination.parent,
         prefix=f".{destination.name}.",
         suffix=".tmp",
         delete=False,
     ) as handle:
-        handle.write(source.read_bytes())
+        handle.write(payload)
         handle.flush()
         os.fsync(handle.fileno())
         temporary = Path(handle.name)
     try:
         os.replace(temporary, destination)
-        destination.chmod(0o444)
+        destination.chmod(0o400 if private else 0o444)
     finally:
         temporary.unlink(missing_ok=True)
+    return observed_sha256
 
 
 def _cpu_copy(value: Any) -> Any:
@@ -154,12 +176,35 @@ def _cpu_copy(value: Any) -> Any:
     return value
 
 
-def _prepare_output_directory(output_dir: Path, resume: Path | None) -> None:
+def _parameter_state_sha256(model: torch.nn.Module) -> str:
+    """Hash parameter values without retaining a second model-sized copy."""
+
+    digest = hashlib.sha256()
+    for name, parameter in sorted(model.named_parameters()):
+        value = parameter.detach().to(device="cpu").contiguous()
+        digest.update(name.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(str(value.dtype).encode("ascii"))
+        digest.update(b"\0")
+        digest.update(json.dumps(list(value.shape)).encode("ascii"))
+        digest.update(b"\0")
+        digest.update(value.view(torch.uint8).numpy().tobytes())
+    return digest.hexdigest()
+
+
+def _prepare_output_directory(
+    output_dir: Path,
+    resume: Path | None,
+    *,
+    private: bool,
+) -> None:
     if output_dir.exists() and any(output_dir.iterdir()) and resume is None:
         raise OutputDirectoryError(
             f"output directory is non-empty: {output_dir}; pass --resume explicitly"
         )
-    output_dir.mkdir(parents=True, exist_ok=True)
+    output_dir.mkdir(parents=True, exist_ok=True, mode=0o700 if private else 0o777)
+    if private:
+        output_dir.chmod(0o700)
 
 
 def _dependency_lock_hash() -> str:
@@ -171,14 +216,55 @@ def _controller_source_hash() -> str:
     paths = [
         Path(__file__),
         ROOT / "common" / "evaluator.py",
+        ROOT / "common" / "device.py",
+        ROOT / "common" / "cuda_contract.py",
         ROOT / "common" / "task_adapter.py",
         ROOT / "common" / "training_data.py",
+        ROOT / "common" / "training_config.py",
+        ROOT / "common" / "training_worker.py",
+        ROOT / "common" / "trusted_candidate.py",
     ]
     digest = hashlib.sha256()
     for path in paths:
         if path.exists():
             digest.update(path.read_bytes())
     return digest.hexdigest()
+
+
+def cuda_determinism_state() -> dict[str, Any]:
+    """Capture every CUDA determinism control used by the frozen profiles."""
+
+    return {
+        "cublas_workspace_config": os.environ.get("CUBLAS_WORKSPACE_CONFIG", ""),
+        "deterministic_algorithms": bool(
+            torch.are_deterministic_algorithms_enabled()
+        ),
+        "cudnn_benchmark": bool(torch.backends.cudnn.benchmark),
+        "cudnn_deterministic": bool(torch.backends.cudnn.deterministic),
+        "matmul_tf32": bool(torch.backends.cuda.matmul.allow_tf32),
+        "cudnn_tf32": bool(torch.backends.cudnn.allow_tf32),
+        "float32_matmul_precision": torch.get_float32_matmul_precision(),
+    }
+
+
+def assert_cuda_deterministic_runtime(device: torch.device) -> None:
+    if device.type != "cuda":
+        return
+    expected = {
+        "cublas_workspace_config": ":4096:8",
+        "deterministic_algorithms": True,
+        "cudnn_benchmark": False,
+        "cudnn_deterministic": True,
+        "matmul_tf32": False,
+        "cudnn_tf32": False,
+        "float32_matmul_precision": "highest",
+    }
+    observed = cuda_determinism_state()
+    if observed != expected:
+        raise RuntimeError(
+            "deterministic CUDA runtime controls changed during candidate execution: "
+            + json.dumps({"expected": expected, "observed": observed}, sort_keys=True)
+        )
 
 
 def training_manifest(
@@ -206,6 +292,24 @@ def training_manifest(
         declared_machine = (
             yaml.safe_load(experiment_manifest_path.read_text()).get("machine", {})
         )
+    selected_backend = (
+        torch.device(selected_device).type if selected_device is not None else None
+    )
+    accelerator = (
+        accelerator_runtime_metadata(torch.device(selected_device))
+        if selected_device is not None
+        else {
+            "schema_version": ACCELERATOR_TELEMETRY_SCHEMA_VERSION,
+            "backend": None,
+            "device": None,
+            "identity": {},
+            "runtime": {},
+            "allocation": {},
+        }
+    )
+    cuda_determinism = (
+        cuda_determinism_state() if selected_backend == "cuda" else None
+    )
     return {
         "created_at": _utc_now(),
         "candidate_path": str(candidate_path),
@@ -221,7 +325,7 @@ def training_manifest(
         "selected_device": selected_device,
         "allow_cpu_for_tests": allow_cpu_for_tests,
         "hardware_matched_scientific_run": bool(
-            profile.scientific and selected_device == "mps"
+            profile.scientific and selected_backend == profile.device_requirement
         ),
         "runtime": {
             "platform": platform.platform(),
@@ -237,6 +341,8 @@ def training_manifest(
             ),
             "mps_memory_fraction": profile.mps_memory_fraction,
             "declared_machine": declared_machine,
+            "accelerator": accelerator,
+            "cuda_determinism": cuda_determinism,
         },
         "dependency_lock_hash": _dependency_lock_hash(),
         "controller_source_hash": _controller_source_hash(),
@@ -262,22 +368,56 @@ def training_manifest(
             "PyTorch does not guarantee bitwise-identical results across releases, "
             "platforms, or devices even when all recorded seeds are fixed."
         ),
+        "hardware_condition_note": (
+            "CUDA and MPS are separate hardware conditions. Identical seeds do not "
+            "imply identical cross-backend trajectories, and results must not be "
+            "pooled without an explicit analysis plan."
+        ),
     }
 
 
-def seed_everything(seed: int, *, deterministic: bool) -> torch.Generator:
+def configure_deterministic_runtime(
+    device: torch.device,
+    *,
+    deterministic: bool,
+) -> None:
+    torch.use_deterministic_algorithms(deterministic)
+    if device.type != "cuda":
+        return
+    if not deterministic:
+        raise ValueError("CUDA candidate training may not disable determinism")
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+    if hasattr(torch, "set_float32_matmul_precision"):
+        torch.set_float32_matmul_precision("highest")
+    assert_cuda_deterministic_runtime(device)
+
+
+def seed_everything(
+    seed: int,
+    *,
+    deterministic: bool,
+    device: torch.device | None = None,
+) -> torch.Generator:
     random.seed(seed)
     np.random.seed(seed % (2**32))
     torch.manual_seed(seed)
     if hasattr(torch, "mps") and hasattr(torch.mps, "manual_seed"):
         torch.mps.manual_seed(seed)
-    torch.use_deterministic_algorithms(deterministic)
+    if device is not None and device.type == "cuda":
+        torch.cuda.manual_seed_all(seed)
+    configure_deterministic_runtime(
+        device or torch.device("cpu"),
+        deterministic=deterministic,
+    )
     generator = torch.Generator(device="cpu")
     generator.manual_seed(seed)
     return generator
 
 
-def _rng_state() -> dict[str, Any]:
+def _rng_state(device: torch.device | None = None) -> dict[str, Any]:
     numpy_state = np.random.get_state()
     state: dict[str, Any] = {
         "python": random.getstate(),
@@ -295,6 +435,10 @@ def _rng_state() -> dict[str, Any]:
             state["torch_mps"] = torch.mps.get_rng_state()
         except RuntimeError:
             state["torch_mps"] = None
+    if device is not None and device.type == "cuda":
+        state["torch_cuda"] = [
+            value.detach().cpu().clone() for value in torch.cuda.get_rng_state_all()
+        ]
     return state
 
 
@@ -316,6 +460,20 @@ def _restore_rng_state(state: dict[str, Any]) -> None:
     mps_state = state.get("torch_mps")
     if mps_state is not None and hasattr(torch.mps, "set_rng_state"):
         torch.mps.set_rng_state(mps_state)
+    cuda_state = state.get("torch_cuda")
+    if cuda_state is not None:
+        if (
+            not isinstance(cuda_state, list)
+            or len(cuda_state) != 1
+            or not all(
+                isinstance(value, torch.Tensor)
+                and value.dtype == torch.uint8
+                and value.numel() > 0
+                for value in cuda_state
+            )
+        ):
+            raise ResumeMismatchError("resume checkpoint has invalid CUDA RNG state")
+        torch.cuda.set_rng_state_all(cuda_state)
 
 
 def _learning_rate_factor(step: int, profile: TrainingProfile) -> float:
@@ -365,6 +523,7 @@ def evaluate_development(
         input_ids = input_ids.to(device)
         labels = labels.to(device)
         loss = task.teacher_forced_loss(model, input_ids, labels)
+        assert_cuda_deterministic_runtime(device)
         total_loss += float(loss.detach().cpu()) * len(batch)
         total_examples += len(batch)
     exact_match, _ = task.exact_match(
@@ -374,6 +533,7 @@ def evaluate_development(
         batch_size=batch_size,
         failure_limit=0,
     )
+    assert_cuda_deterministic_runtime(device)
     model.train(was_training)
     return total_loss / max(1, total_examples), exact_match
 
@@ -394,6 +554,7 @@ def _checkpoint_payload(
     best_accuracy: float,
     best_loss: float,
     final_training_loss: float,
+    device: torch.device | None = None,
 ) -> dict[str, Any]:
     return {
         "checkpoint_kind": "trusted_resume_state_v1",
@@ -414,7 +575,7 @@ def _checkpoint_payload(
         "task_adapter_hash": task.config_hash,
         "seed_bundle": asdict(seeds),
         "seed_bundle_hash": seeds.bundle_hash,
-        "rng_state": _rng_state(),
+        "rng_state": _rng_state(device),
     }
 
 
@@ -532,6 +693,19 @@ def _validate_resume(
         raise ResumeMismatchError("resume elapsed time cannot be negative")
     if checkpoint["seed_bundle"] != asdict(seeds):
         raise ResumeMismatchError("resume seed bundle differs from its frozen hash")
+    if profile.device_requirement == "cuda":
+        rng_state = checkpoint.get("rng_state")
+        cuda_state = rng_state.get("torch_cuda") if isinstance(rng_state, dict) else None
+        if (
+            not isinstance(cuda_state, list)
+            or len(cuda_state) != 1
+            or not isinstance(cuda_state[0], torch.Tensor)
+            or cuda_state[0].dtype != torch.uint8
+            or cuda_state[0].numel() == 0
+        ):
+            raise ResumeMismatchError(
+                "CUDA resume checkpoint requires exactly one non-empty CUDA RNG state"
+            )
 
 
 @contextmanager
@@ -561,6 +735,8 @@ def validate_training_request(
     candidate = Path(candidate_path).resolve()
     if not candidate.is_file():
         raise FileNotFoundError(f"candidate does not exist: {candidate}")
+    if profile.name == "smoke_train_cuda_v1":
+        validate_trusted_initial_candidate(candidate)
     source_contract = inspect_candidate_path(candidate)
     if not source_contract.valid:
         raise ValueError(
@@ -641,11 +817,13 @@ def validate_training_request(
     }
 
 
-def _failure_stage(error: BaseException) -> str:
+def _failure_stage(error: BaseException, *, requested_device: str) -> str:
+    cuda_requested = requested_device.strip().lower() in {"cuda", "cuda:0"}
+    error_text = str(error).lower()
     if isinstance(error, ContainmentGateError):
         return "containment_unproven"
     if isinstance(error, DeviceUnavailableError):
-        return "device_unavailable"
+        return "cuda_unavailable" if cuda_requested else "device_unavailable"
     if isinstance(error, ResumeMismatchError):
         return "checkpoint_resume_mismatch"
     if isinstance(error, OutputDirectoryError):
@@ -655,16 +833,23 @@ def _failure_stage(error: BaseException) -> str:
     if isinstance(error, TrainingNonfiniteError):
         return "training_nonfinite"
     if isinstance(error, MemoryError) or (
-        isinstance(error, RuntimeError)
-        and "out of memory" in str(error).lower()
+        isinstance(error, RuntimeError) and "out of memory" in error_text
     ):
-        return "training_oom"
+        return "cuda_oom" if cuda_requested else "training_oom"
     if isinstance(error, OSError):
         return "checkpoint_write"
-    if isinstance(error, RuntimeError) and (
-        "deterministic" in str(error).lower()
-        or "not implemented for" in str(error).lower()
+    if isinstance(error, RuntimeError) and "deterministic" in error_text:
+        return (
+            "unsupported_deterministic_cuda_operation"
+            if cuda_requested
+            else "unsupported_operation"
+        )
+    if cuda_requested and isinstance(error, (AssertionError, RuntimeError)) and any(
+        marker in error_text
+        for marker in ("cuda", "cudnn", "cublas", "nvidia", "driver")
     ):
+        return "cuda_driver_runtime_failure"
+    if isinstance(error, RuntimeError) and "not implemented for" in error_text:
         return "unsupported_operation"
     return "model_initialization"
 
@@ -708,8 +893,14 @@ def train_candidate_in_process(
     checkpoint_hash = ""
     cleanup_completed = False
     output_prepared = False
+    device: torch.device | None = None
     model: torch.nn.Module | None = None
     optimizer: torch.optim.Optimizer | None = None
+    accelerator_snapshot: dict[str, Any] = {}
+    timing_synchronized = False
+    initial_parameter_hash = ""
+    final_parameter_hash = ""
+    parameters_changed = False
     result: TrainingResult | None = None
     failure_error: BaseException | None = None
     current_stage = "candidate_contract"
@@ -719,7 +910,17 @@ def train_candidate_in_process(
             raise OutputDirectoryError(
                 f"output directory may not be a symlink: {raw_destination}"
             )
-        _prepare_output_directory(destination, resume_path)
+        if profile.name == "smoke_train_cuda_v1":
+            pinned_hash = validate_trusted_initial_candidate(candidate)
+            if candidate_hash != pinned_hash:
+                raise ResumeMismatchError(
+                    "trusted CUDA smoke candidate changed before training"
+                )
+        _prepare_output_directory(
+            destination,
+            resume_path,
+            private=profile.device_requirement == "cuda",
+        )
         output_prepared = True
         source_contract = inspect_candidate_path(candidate)
         if not source_contract.valid:
@@ -786,7 +987,21 @@ def train_candidate_in_process(
                     "stored candidate source differs from requested candidate"
                 )
         else:
-            _atomic_source_copy(candidate, candidate_copy)
+            copied_hash = _atomic_source_copy(
+                candidate,
+                candidate_copy,
+                expected_sha256=candidate_hash,
+                private=profile.device_requirement == "cuda",
+            )
+            if copied_hash != candidate_hash:
+                raise ResumeMismatchError("candidate copy hash does not reconstruct")
+
+        copied_source_contract = inspect_candidate_path(candidate_copy)
+        if not copied_source_contract.valid:
+            raise ValueError(
+                "candidate copy contract failed: "
+                + "; ".join(copied_source_contract.reasons)
+            )
 
         selection = resolve_training_device(
             profile,
@@ -795,6 +1010,13 @@ def train_candidate_in_process(
         )
         device = selection.device
         selected_device = str(device)
+        dataloader_generator = seed_everything(
+            seeds.model_initialization_seed,
+            deterministic=profile.deterministic_algorithms,
+            device=device,
+        )
+        dataloader_generator.manual_seed(seeds.dataloader_seed)
+        reset_accelerator_peak_memory(device)
         manifest = training_manifest(
             candidate_path=candidate,
             candidate_hash=candidate_hash,
@@ -808,13 +1030,11 @@ def train_candidate_in_process(
             containment_decision=containment_decision.to_dict(),
         )
         _atomic_json(destination / "training_manifest.json", manifest)
-
-        dataloader_generator = seed_everything(
-            seeds.model_initialization_seed,
-            deterministic=profile.deterministic_algorithms,
-        )
-        dataloader_generator.manual_seed(seeds.dataloader_seed)
         current_stage = "model_initialization"
+        if sha256_file(candidate_copy) != candidate_hash:
+            raise ResumeMismatchError(
+                "immutable candidate copy changed immediately before import"
+            )
         module = load_candidate(candidate_copy)
         built = module.build_untrained_model(seeds.model_initialization_seed)
         if not isinstance(built, tuple) or len(built) != 2:
@@ -827,8 +1047,16 @@ def train_candidate_in_process(
             raise ValueError(
                 "candidate runtime contract failed: " + "; ".join(contract.reasons)
             )
+        # Candidate import, construction, and contract probes are arbitrary
+        # Python. Reapply the frozen process-global controls before accepting
+        # any training evidence.
+        configure_deterministic_runtime(
+            device,
+            deterministic=profile.deterministic_algorithms,
+        )
         parameter_count = sum(parameter.numel() for parameter in model.parameters())
         model = model.to(device=device, dtype=torch.float32)
+        initial_parameter_hash = _parameter_state_sha256(model)
 
         optimizer = torch.optim.AdamW(
             model.parameters(),
@@ -867,10 +1095,13 @@ def train_candidate_in_process(
         development_set = set(development_cases)
         microbatch = profile.microbatch_size or profile.global_batch_size
         trajectory_started = synchronized_time(device)
+        timing_synchronized = device.type in {"mps", "cuda"}
         current_stage = "training_execution"
 
         while steps_completed < profile.max_steps:
-            elapsed = prior_elapsed + (time.perf_counter() - trajectory_started)
+            elapsed = prior_elapsed + (
+                synchronized_time(device) - trajectory_started
+            )
             if elapsed >= profile.maximum_wall_seconds:
                 raise TrainingTimeoutError(
                     f"candidate exceeded {profile.maximum_wall_seconds}s wall-time cap"
@@ -891,7 +1122,12 @@ def train_candidate_in_process(
                 )
                 input_ids = input_ids.to(device)
                 labels = labels.to(device)
+                configure_deterministic_runtime(
+                    device,
+                    deterministic=profile.deterministic_algorithms,
+                )
                 loss = task.teacher_forced_loss(model, input_ids, labels)
+                assert_cuda_deterministic_runtime(device)
                 if not torch.isfinite(loss):
                     raise TrainingNonfiniteError(
                         f"non-finite loss at optimizer step {steps_completed}"
@@ -913,7 +1149,9 @@ def train_candidate_in_process(
             steps_completed += 1
             examples_processed += profile.global_batch_size
             final_loss = accumulated_loss / profile.gradient_accumulation_steps
-            elapsed = prior_elapsed + (time.perf_counter() - trajectory_started)
+            elapsed = prior_elapsed + (
+                synchronized_time(device) - trajectory_started
+            )
             if elapsed >= profile.maximum_wall_seconds:
                 raise TrainingTimeoutError(
                     f"candidate exceeded {profile.maximum_wall_seconds}s wall-time cap"
@@ -928,6 +1166,10 @@ def train_candidate_in_process(
             )
             if should_validate:
                 synchronize(device)
+                configure_deterministic_runtime(
+                    device,
+                    deterministic=profile.deterministic_algorithms,
+                )
                 current_stage = "development_evaluation"
                 validation_loss, validation_accuracy = evaluate_development(
                     model=model,
@@ -952,7 +1194,7 @@ def train_candidate_in_process(
                     best_accuracy = validation_accuracy
                     best_loss = validation_loss
                     elapsed = prior_elapsed + (
-                        time.perf_counter() - trajectory_started
+                        synchronized_time(device) - trajectory_started
                     )
                     best_payload = _best_evaluation_checkpoint_payload(
                         model=model,
@@ -969,13 +1211,33 @@ def train_candidate_in_process(
                     checkpoint_decision = "best_development"
                 current_stage = "training_execution"
 
-            memory = mps_memory(device)
-            current_mps = memory["current"]
-            driver_mps = memory["driver"]
-            recommended_mps = memory["recommended"]
+            memory = accelerator_memory(device)
+            backend_specific = memory["backend_specific"]
+            current_mps = (
+                memory["allocated_bytes"] if device.type == "mps" else None
+            )
+            driver_mps = (
+                backend_specific.get("driver_allocated_bytes")
+                if device.type == "mps"
+                else None
+            )
+            recommended_mps = (
+                backend_specific.get("recommended_max_memory_bytes")
+                if device.type == "mps"
+                else None
+            )
             if current_mps is not None:
                 peak_mps = max(peak_mps, current_mps)
-            elapsed = prior_elapsed + (time.perf_counter() - trajectory_started)
+                memory["peak_allocated_bytes"] = peak_mps
+            accelerator_snapshot = {
+                "schema_version": ACCELERATOR_TELEMETRY_SCHEMA_VERSION,
+                "backend": device.type,
+                "device": str(device),
+                "memory": memory,
+            }
+            elapsed = prior_elapsed + (
+                synchronized_time(device) - trajectory_started
+            )
             _append_event(
                 event_path,
                 {
@@ -990,6 +1252,11 @@ def train_candidate_in_process(
                     "elapsed_seconds": elapsed,
                     "current_mps_allocated_bytes": current_mps,
                     "driver_mps_allocated_bytes": driver_mps,
+                    "accelerator_telemetry_schema_version": (
+                        ACCELERATOR_TELEMETRY_SCHEMA_VERSION
+                    ),
+                    "accelerator_telemetry": accelerator_snapshot,
+                    "timing_synchronized": timing_synchronized,
                     "checkpoint_decision": checkpoint_decision,
                 },
             )
@@ -1015,12 +1282,22 @@ def train_candidate_in_process(
                     best_accuracy=best_accuracy,
                     best_loss=best_loss,
                     final_training_loss=final_loss,
+                    device=device,
                 )
                 _atomic_torch_save(latest_path, resume_payload)
                 current_stage = "training_execution"
 
         train_seconds = prior_elapsed + (
             synchronized_time(device) - trajectory_started
+        )
+        assert_cuda_deterministic_runtime(device)
+        final_parameter_hash = _parameter_state_sha256(model)
+        parameters_changed = bool(initial_parameter_hash) and (
+            final_parameter_hash != initial_parameter_hash
+        )
+        accelerator_snapshot = accelerator_telemetry(
+            device,
+            peak_mps_allocated_bytes=peak_mps or None,
         )
         if not best_path.exists():
             raise OSError("training completed without a best development checkpoint")
@@ -1066,15 +1343,37 @@ def train_candidate_in_process(
             scientific=profile.scientific,
             hardware_matched=selection.hardware_matched,
             cleanup_completed=False,
+            accelerator_telemetry_schema_version=(
+                ACCELERATOR_TELEMETRY_SCHEMA_VERSION
+            ),
+            accelerator_telemetry=accelerator_snapshot,
+            timing_synchronized=timing_synchronized,
+            initial_parameter_sha256=initial_parameter_hash,
+            final_parameter_sha256=final_parameter_hash,
+            parameters_changed=parameters_changed,
         )
     except BaseException as error:
         failure_error = error
         train_seconds = max(0.0, time.perf_counter() - started)
+        if device is not None:
+            try:
+                accelerator_snapshot = accelerator_telemetry(
+                    device,
+                    peak_mps_allocated_bytes=peak_mps or None,
+                )
+            except (AssertionError, RuntimeError):
+                pass
+        if model is not None and initial_parameter_hash:
+            try:
+                final_parameter_hash = _parameter_state_sha256(model)
+                parameters_changed = final_parameter_hash != initial_parameter_hash
+            except (AssertionError, RuntimeError):
+                pass
         stage = (
             "candidate_contract"
             if isinstance(error, ValueError)
             and "contract failed" in str(error)
-            else _failure_stage(error)
+            else _failure_stage(error, requested_device=requested_device)
         )
         if stage == "model_initialization" and current_stage != "model_initialization":
             stage = current_stage
@@ -1126,17 +1425,25 @@ def train_candidate_in_process(
             scientific=profile.scientific,
             hardware_matched=False,
             cleanup_completed=False,
+            accelerator_telemetry_schema_version=(
+                ACCELERATOR_TELEMETRY_SCHEMA_VERSION
+            ),
+            accelerator_telemetry=accelerator_snapshot,
+            timing_synchronized=timing_synchronized,
+            initial_parameter_sha256=initial_parameter_hash,
+            final_parameter_sha256=final_parameter_hash,
+            parameters_changed=parameters_changed,
         )
     finally:
         del optimizer
         del model
         gc.collect()
-        if selected_device == "mps" and hasattr(torch, "mps"):
-            try:
-                torch.mps.empty_cache()
-            except RuntimeError:
-                pass
         cleanup_completed = True
+        if device is not None:
+            try:
+                cleanup_accelerator(device)
+            except (AssertionError, RuntimeError):
+                cleanup_completed = False
 
     assert result is not None
     result = TrainingResult(

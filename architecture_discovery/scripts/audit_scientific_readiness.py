@@ -33,6 +33,7 @@ from research_ledger.protocol import load_frozen_protocol
 from study.contracts import ConditionSpec, StudySpec
 from study.randomization import RandomizationPlan
 from study.serialization import read_json
+from scripts.record_cuda_a40_validation import validate_cuda_a40_receipt
 
 
 @dataclass(frozen=True)
@@ -290,6 +291,7 @@ def audit_readiness(
     replication_policy: Path | None = None,
     research_protocol: Path | None = None,
     mps_evidence: Path | None = None,
+    cuda_a40_evidence: Path | None = None,
     study_spec: Path | None = None,
 ) -> dict[str, Any]:
     results: list[GateResult] = []
@@ -946,6 +948,31 @@ def audit_readiness(
         return f"{evidence_path} summary={payload['training_summary_hash']}"
 
     results.append(_gate("full_profile_mps_validation", mps_validation))
+
+    cuda_evidence_path = (
+        cuda_a40_evidence
+        or root
+        / "outputs"
+        / "readiness"
+        / "smoke_train_cuda_v1_a40_evidence.json"
+    )
+
+    def cuda_a40_validation() -> str:
+        receipt = validate_cuda_a40_receipt(cuda_evidence_path)
+        if receipt.get("scientific_readiness") is not False:
+            raise ValueError("CUDA smoke receipt must not claim scientific readiness")
+        if receipt.get("formal_scientific_execution_authorized") is not False:
+            raise ValueError("CUDA smoke receipt must not authorize formal execution")
+        if receipt.get("cross_backend_pooling_authorized") is not False:
+            raise ValueError("CUDA smoke receipt must not authorize MPS/CUDA pooling")
+        return (
+            f"{cuda_evidence_path} "
+            f"receipt={receipt['receipt_payload_sha256']} (engineering-only)"
+        )
+
+    results.append(
+        _gate("cuda_a40_engineering_validation_receipt", cuda_a40_validation)
+    )
     results.append(
         GateResult(
             "artifact_reconstruction_implementation",
@@ -1209,12 +1236,22 @@ def audit_readiness(
         "scientific_pilot_completed",
         "main_launch_authorization",
     }
+    # A ten-step CUDA smoke is separately audited engineering evidence.  The
+    # frozen scientific manifest remains the MPS condition, and smoke evidence
+    # must neither authorize science nor become a launch prerequisite for MPS.
+    informational_engineering_gates = {
+        "cuda_a40_engineering_validation_receipt",
+    }
     pilot_ready = all(
         result.passed
         for result in results
-        if result.gate not in main_only_gates
+        if result.gate not in main_only_gates | informational_engineering_gates
     )
-    main_ready = all(result.passed for result in results)
+    main_ready = all(
+        result.passed
+        for result in results
+        if result.gate not in informational_engineering_gates
+    )
     recorded_levels = evidence_ledger.get("levels", {})
     passed_count = sum(result.passed for result in results)
     payload = {
@@ -1248,6 +1285,9 @@ def audit_readiness(
                 ) is bool
             ),
             "mps_validated": by_name["full_profile_mps_validation"].passed,
+            "cuda_a40_smoke_validated": by_name[
+                "cuda_a40_engineering_validation_receipt"
+            ].passed,
             "pilot_ready": pilot_ready,
             "pilot_validated": by_name["scientific_pilot_completed"].passed,
             "main_study_ready": main_ready,
@@ -1273,6 +1313,7 @@ def main() -> int:
     parser.add_argument("--replication-policy", type=Path)
     parser.add_argument("--research-protocol", type=Path)
     parser.add_argument("--mps-evidence", type=Path)
+    parser.add_argument("--cuda-a40-evidence", type=Path)
     parser.add_argument("--study-spec", type=Path)
     parser.add_argument("--json-output", type=Path)
     arguments = parser.parse_args()
@@ -1284,6 +1325,7 @@ def main() -> int:
         replication_policy=arguments.replication_policy,
         research_protocol=arguments.research_protocol,
         mps_evidence=arguments.mps_evidence,
+        cuda_a40_evidence=arguments.cuda_a40_evidence,
         study_spec=arguments.study_spec,
     )
     rendered = json.dumps(report, indent=2, sort_keys=True) + "\n"

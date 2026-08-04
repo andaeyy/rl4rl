@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from typing import Any
 
 
@@ -80,6 +80,12 @@ class TrainingProfile:
             raise ValueError("Phase-1 profiles require uncompiled float32 training")
         if self.automatic_batch_size_reduction or self.cpu_fallback:
             raise ValueError("automatic batch reduction and CPU fallback are forbidden")
+        if self.device_requirement not in {"mps", "cuda"}:
+            raise ValueError(
+                "training profiles require an explicit accelerator backend"
+            )
+        if self.device_requirement == "cuda" and not self.deterministic_algorithms:
+            raise ValueError("CUDA profiles require deterministic algorithms")
 
 
 @dataclass(frozen=True)
@@ -137,6 +143,12 @@ class TrainingResult:
     scientific: bool
     hardware_matched: bool
     cleanup_completed: bool
+    accelerator_telemetry_schema_version: str = ""
+    accelerator_telemetry: dict[str, Any] = field(default_factory=dict)
+    timing_synchronized: bool = False
+    initial_parameter_sha256: str = ""
+    final_parameter_sha256: str = ""
+    parameters_changed: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -190,9 +202,59 @@ SMOKE_TRAIN_V1 = TrainingProfile(
     scientific=False,
 )
 
+FULL_TRAIN_CUDA_A40_V1 = TrainingProfile(
+    name="full_train_cuda_a40_v1",
+    version="1",
+    max_steps=30_000,
+    global_batch_size=512,
+    microbatch_size=None,
+    gradient_accumulation_steps=1,
+    peak_learning_rate=0.001,
+    adamw_betas=(0.9, 0.98),
+    weight_decay=0.1,
+    warmup_steps=300,
+    scheduler="cosine_decay_to_zero",
+    gradient_clip_norm=1.0,
+    validation_interval=1_000,
+    validation_examples=2_000,
+    checkpoint_interval=1_000,
+    maximum_wall_seconds=1_800,
+    dtype="float32",
+    deterministic_algorithms=True,
+    device_requirement="cuda",
+    mps_memory_fraction=None,
+    scientific=True,
+)
+
+SMOKE_TRAIN_CUDA_V1 = TrainingProfile(
+    name="smoke_train_cuda_v1",
+    version="1",
+    max_steps=10,
+    global_batch_size=16,
+    microbatch_size=None,
+    gradient_accumulation_steps=1,
+    peak_learning_rate=0.001,
+    adamw_betas=(0.9, 0.98),
+    weight_decay=0.1,
+    warmup_steps=2,
+    scheduler="cosine_decay_to_zero",
+    gradient_clip_norm=1.0,
+    validation_interval=10,
+    validation_examples=24,
+    checkpoint_interval=10,
+    maximum_wall_seconds=60,
+    dtype="float32",
+    deterministic_algorithms=True,
+    device_requirement="cuda",
+    mps_memory_fraction=None,
+    scientific=False,
+)
+
 PROFILES = {
     FULL_TRAIN_V1.name: FULL_TRAIN_V1,
     SMOKE_TRAIN_V1.name: SMOKE_TRAIN_V1,
+    FULL_TRAIN_CUDA_A40_V1.name: FULL_TRAIN_CUDA_A40_V1,
+    SMOKE_TRAIN_CUDA_V1.name: SMOKE_TRAIN_CUDA_V1,
 }
 
 

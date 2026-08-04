@@ -29,6 +29,8 @@ class ScientificExecutionRequest:
     trusted_ir_interpreter: bool = False
     runtime_validity_passed: bool = False
     candidate_artifact_hash: str | None = None
+    cpu_fallback_allowed: bool = False
+    required_cuda_device_name: str | None = None
 
 
 @dataclass(frozen=True)
@@ -75,14 +77,53 @@ def assess_scientific_execution(
             audit_hash=audit.audit_hash,
         )
 
-    if request.requested_device.lower() != "mps":
-        blockers.append("scientific candidate training requires requested_device='mps'")
-    if not audit.mps_built or not audit.mps_available:
-        blockers.append(
-            "MPS is not both built and available in the audited execution environment"
-        )
+    requested_device = request.requested_device.lower()
+    requested_backend = requested_device.split(":", maxsplit=1)[0]
+    if request.cpu_fallback_allowed:
+        blockers.append("scientific candidate training forbids CPU fallback")
     if audit.mps_fallback_requested:
-        blockers.append("PYTORCH_ENABLE_MPS_FALLBACK requests an untracked CPU fallback")
+        blockers.append(
+            "PYTORCH_ENABLE_MPS_FALLBACK requests an untracked CPU fallback"
+        )
+    if requested_backend == "mps":
+        if requested_device != "mps":
+            blockers.append("MPS scientific execution must request exactly 'mps'")
+        if not audit.mps_built or not audit.mps_available:
+            blockers.append(
+                "MPS is not both built and available in the audited execution environment"
+            )
+    elif requested_backend == "cuda":
+        if requested_device != "cuda":
+            blockers.append(
+                "CUDA scientific execution must request logical device 'cuda'; "
+                "the worker resolves cuda:0 inside its allocation"
+            )
+        if not audit.cuda_available or audit.cuda_device_count < 1:
+            blockers.append("CUDA is unavailable in the audited execution environment")
+        if not audit.cuda_allocation_validated:
+            blockers.append(
+                "CUDA scientific execution requires a validated scheduler GPU allocation"
+            )
+        if request.required_cuda_device_name is not None:
+            observed_names = {
+                str(device.get("name", "")) for device in audit.cuda_devices
+            }
+            if not any(
+                request.required_cuda_device_name.lower() in name.lower()
+                for name in observed_names
+            ):
+                blockers.append(
+                    "allocated CUDA device does not match required device name "
+                    f"{request.required_cuda_device_name!r}"
+                )
+        warnings.append(
+            "CUDA and MPS are distinct hardware conditions and require an explicit "
+            "analysis plan before any cross-backend comparison"
+        )
+    else:
+        blockers.append(
+            "scientific candidate training requires requested_device='mps' or 'cuda'"
+        )
 
     if request.candidate_format is CandidateFormat.ARBITRARY_PYTHON:
         unproven = [

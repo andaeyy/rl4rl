@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import socket
 import uuid
 from pathlib import Path
 from types import TracebackType
-from typing import Any
+from typing import Any, Mapping
 
 from study.contracts import RunSpec, utc_now
 from study.randomization import RandomizationPlan
@@ -19,12 +20,192 @@ class MPSLeaseBusy(RuntimeError):
     """A different process owns the study-wide MPS execution lease."""
 
 
+class AcceleratorLeaseBusy(RuntimeError):
+    """A different process owns the lease for an accelerator allocation."""
+
+
 class ScheduleStateError(RuntimeError):
     """The persisted sequential schedule is inconsistent or requires review."""
 
 
 class NoPendingRuns(RuntimeError):
     """The frozen schedule has no pending run available to claim."""
+
+
+def cuda_accelerator_identity(
+    *,
+    gpu_uuid: str | None = None,
+    environment: Mapping[str, str] | None = None,
+    hostname: str | None = None,
+) -> str:
+    """Resolve a stable allocated-GPU key, preferring the physical GPU UUID.
+
+    ``CUDA_VISIBLE_DEVICES=0`` by itself is intentionally insufficient: index zero
+    is process-relative and can refer to different GPUs.  Slurm's physical GPU
+    assignment is namespaced by hostname when a UUID is unavailable.
+    """
+
+    if gpu_uuid:
+        return f"cuda:uuid:{gpu_uuid}"
+    values = os.environ if environment is None else environment
+    visible = values.get("CUDA_VISIBLE_DEVICES", "")
+    visible_tokens = tuple(item.strip() for item in visible.split(",") if item.strip())
+    visible_uuids = tuple(item for item in visible_tokens if item.startswith("GPU-"))
+    if len(visible_uuids) == 1:
+        return f"cuda:uuid:{visible_uuids[0]}"
+    assignment = next(
+        (
+            values[name]
+            for name in ("SLURM_STEP_GPUS", "SLURM_JOB_GPUS")
+            if values.get(name)
+        ),
+        None,
+    )
+    if not assignment and values.get("SLURM_GPUS_ON_NODE"):
+        assignment = f"visible:{visible}"
+    job_id = values.get("SLURM_JOB_ID") or values.get("SLURM_JOBID")
+    if not assignment or not job_id:
+        raise ScheduleStateError(
+            "CUDA accelerator lease requires a GPU UUID or scheduler GPU assignment"
+        )
+    resolved_hostname = hostname or socket.gethostname()
+    return f"cuda:slurm:{resolved_hostname}:{assignment}"
+
+
+class AcceleratorLease:
+    """Exclusive, allocation-keyed accelerator lock for CUDA and future backends."""
+
+    schema_name = "AcceleratorLease"
+    schema_version = "2.0"
+
+    def __init__(
+        self,
+        path: str | Path,
+        *,
+        run_id: str,
+        accelerator_key: str,
+        backend: str,
+    ) -> None:
+        normalized_backend = backend.strip().lower()
+        if not normalized_backend:
+            raise ValueError("accelerator backend cannot be empty")
+        if not accelerator_key.strip():
+            raise ValueError("accelerator key cannot be empty")
+        self.path = Path(path)
+        self.run_id = run_id
+        self.accelerator_key = accelerator_key
+        self.backend = normalized_backend
+        self.token = uuid.uuid4().hex
+        self.acquired = False
+
+    @classmethod
+    def for_allocation(
+        cls,
+        lease_directory: str | Path,
+        *,
+        run_id: str,
+        accelerator_key: str,
+        backend: str,
+    ) -> AcceleratorLease:
+        """Build a lease path whose identity is bound to the allocated accelerator."""
+
+        digest = hashlib.sha256(accelerator_key.encode("utf-8")).hexdigest()[:24]
+        normalized_backend = backend.strip().lower()
+        path = Path(lease_directory) / f"{normalized_backend}-{digest}.lock"
+        return cls(
+            path,
+            run_id=run_id,
+            accelerator_key=accelerator_key,
+            backend=normalized_backend,
+        )
+
+    @classmethod
+    def for_cuda_allocation(
+        cls,
+        lease_directory: str | Path,
+        *,
+        run_id: str,
+        gpu_uuid: str | None = None,
+        environment: Mapping[str, str] | None = None,
+    ) -> AcceleratorLease:
+        key = cuda_accelerator_identity(
+            gpu_uuid=gpu_uuid,
+            environment=environment,
+        )
+        return cls.for_allocation(
+            lease_directory,
+            run_id=run_id,
+            accelerator_key=key,
+            backend="cuda",
+        )
+
+    def acquire(self) -> AcceleratorLease:
+        self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        try:
+            descriptor = os.open(
+                self.path,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+            )
+        except FileExistsError as error:
+            try:
+                owner = read_json(self.path)
+            except Exception:
+                owner = {"error": "lease metadata unreadable"}
+            raise AcceleratorLeaseBusy(
+                f"accelerator lease {self.path} is already held: {owner}"
+            ) from error
+        try:
+            payload = {
+                "schema_name": self.schema_name,
+                "schema_version": self.schema_version,
+                "backend": self.backend,
+                "accelerator_key": self.accelerator_key,
+                "run_id": self.run_id,
+                "token": self.token,
+                "pid": os.getpid(),
+                "hostname": socket.gethostname(),
+                "acquired_at": utc_now(),
+            }
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, sort_keys=True)
+                handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            self.acquired = True
+            return self
+        except BaseException:
+            self.path.unlink(missing_ok=True)
+            raise
+
+    def release(self) -> None:
+        if not self.acquired:
+            return
+        try:
+            owner = read_json(self.path)
+        except Exception as error:
+            raise ScheduleStateError(
+                "refusing to remove unreadable accelerator lease metadata"
+            ) from error
+        if owner.get("token") != self.token:
+            raise ScheduleStateError(
+                "refusing to remove an accelerator lease owned elsewhere"
+            )
+        if owner.get("accelerator_key") != self.accelerator_key:
+            raise ScheduleStateError("accelerator lease identity changed while held")
+        self.path.unlink()
+        self.acquired = False
+
+    def __enter__(self) -> AcceleratorLease:
+        return self.acquire()
+
+    def __exit__(
+        self,
+        exception_type: type[BaseException] | None,
+        exception: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        self.release()
 
 
 class MPSLease:

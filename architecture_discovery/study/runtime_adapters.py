@@ -20,6 +20,7 @@ from openevolve.utils.code_utils import apply_diff, extract_diffs
 from common.evaluation_profiles import EvaluationLayer
 from common.evaluator import SearchEvaluationContext, evaluate_candidate
 from common.gpt56_sol import GPT56SolProfile
+from common.training_config import get_training_profile
 from evaluation.artifacts import EvaluationArtifactRoots, JsonEvaluationArtifactStore
 from evaluation.records import SearchEvaluationRecord
 from study.budget import OpportunityOutcome
@@ -218,6 +219,13 @@ class LayerACandidateEvaluator:
 
     def __post_init__(self) -> None:
         require_bool(self.allow_cpu_for_tests, "allow_cpu_for_tests")
+        profile = get_training_profile(self.training_profile)
+        if profile.device_requirement == "cuda" or self.device.lower() == "cuda":
+            raise ScientificReadinessBlocked(
+                "CommonStudyEngine v1 accounting is the frozen MPS condition; "
+                "refusing to serialize CUDA time as mps_seconds without a separately "
+                "authorized v2 CUDA study specification"
+            )
         self.output_root = Path(self.output_root).resolve()
         self.output_root.mkdir(parents=True, exist_ok=True)
         roots = EvaluationArtifactRoots.under(self.output_root / "evaluations")
@@ -303,6 +311,7 @@ class LayerACandidateEvaluator:
         )
         if record.failure_stage in {
             "containment_unproven",
+            "cuda_unavailable",
             "device_unavailable",
         }:
             raise ScientificReadinessBlocked(

@@ -31,3 +31,18 @@ def build_untrained_model(seed):
     assert "forbidden candidate import" in joined
     assert "candidate-controlled optimizer" in joined
     assert "forbidden candidate call" in joined
+
+
+def test_static_contract_rejects_determinism_control_mutation():
+    source = """
+import torch
+
+def build_untrained_model(seed):
+    torch.use_deterministic_algorithms(False)
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cuda.matmul.allow_tf32 = True
+    return torch.nn.Linear(1, 1), {}
+"""
+    result = inspect_candidate_source(source)
+    assert not result.valid
+    assert "candidate-controlled deterministic runtime" in " ".join(result.reasons)

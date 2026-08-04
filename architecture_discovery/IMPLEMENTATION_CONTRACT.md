@@ -160,3 +160,27 @@ pilot, protocol, mechanism, replication, and analysis receipts must cross-link
 to the same decision, manifest, study, candidate, and artifact hashes. Local
 hash syntax is not an external integrity proof; the signed/WORM custodian
 verification path remains a launch blocker until implemented and tested.
+
+## Additive CUDA/A40 condition
+
+The original `full_train_v1` and `smoke_train_v1` objects, hashes, serialized
+fields, MPS telemetry, and v1 `mps_seconds` study state remain the frozen MPS
+condition. They are not reinterpreted as CUDA records.
+
+`full_train_cuda_a40_v1` is a separate, hash-distinct NVIDIA A40 condition with
+the same algorithmic budget as `full_train_v1`. `smoke_train_cuda_v1` is an
+exactly ten-step, non-scientific machinery check. CUDA execution requires one
+Slurm-allocated A40, deterministic cuBLAS/cuDNN settings, float32 with TF32
+disabled, and no CPU fallback. CUDA and MPS results may not be pooled without
+an explicit analysis plan.
+
+Backend-neutral accelerator accounting uses the versioned v2 resource schema
+keyed by backend and hardware condition. The primary C0-C3 engine and its v1
+event serializer remain explicitly MPS until a separately frozen CUDA study
+specification and analysis plan authorize a new engine-state schema. A CUDA
+engineering receipt cannot satisfy or weaken MPS pilot/main readiness.
+
+Generated arbitrary Python remains blocked from formal scientific CUDA runs
+without authenticated candidate-bound strong-containment evidence. Availability
+of a container executable is not an attestation. Only the trusted checked-in
+`common/initial_candidate.py` is used for the CUDA engineering validation.

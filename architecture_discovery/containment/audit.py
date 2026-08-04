@@ -23,9 +23,11 @@ from typing import Any, Mapping
 
 import torch
 
+from common.cuda_contract import cuda_allocation_proves_exactly_one
+
 
 SCHEMA_NAME = "candidate_containment_capability_audit"
-SCHEMA_VERSION = "1.0"
+SCHEMA_VERSION = "2.0"
 
 
 class CapabilityState(StrEnum):
@@ -142,6 +144,15 @@ class CapabilityAudit:
     mps_built: bool
     mps_available: bool
     mps_fallback_requested: bool
+    cuda_compiled_runtime: str | None
+    cuda_available: bool
+    cuda_device_count: int
+    cuda_visible_devices: str | None
+    cuda_scheduler_job_id: str | None
+    cuda_scheduler_gpu_assignment: str | None
+    cuda_allocation_validated: bool
+    cuda_devices: tuple[Mapping[str, Any], ...]
+    detected_container_runtimes: tuple[str, ...]
     visible_credential_names: tuple[str, ...]
     controls: Mapping[str, ControlEvidence]
     attested_candidate_artifact_hash: str | None = None
@@ -152,6 +163,16 @@ class CapabilityAudit:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "visible_credential_names", tuple(self.visible_credential_names))
+        object.__setattr__(
+            self,
+            "cuda_devices",
+            tuple(MappingProxyType(dict(device)) for device in self.cuda_devices),
+        )
+        object.__setattr__(
+            self,
+            "detected_container_runtimes",
+            tuple(self.detected_container_runtimes),
+        )
         object.__setattr__(self, "controls", MappingProxyType(dict(self.controls)))
         object.__setattr__(self, "notes", tuple(self.notes))
 
@@ -179,6 +200,17 @@ class CapabilityAudit:
                 "available": self.mps_available,
                 "fallback_requested": self.mps_fallback_requested,
             },
+            "cuda": {
+                "compiled_runtime": self.cuda_compiled_runtime,
+                "available": self.cuda_available,
+                "device_count": self.cuda_device_count,
+                "cuda_visible_devices": self.cuda_visible_devices,
+                "scheduler_job_id": self.cuda_scheduler_job_id,
+                "scheduler_gpu_assignment": self.cuda_scheduler_gpu_assignment,
+                "allocation_validated": self.cuda_allocation_validated,
+                "devices": [dict(device) for device in self.cuda_devices],
+            },
+            "detected_container_runtimes": list(self.detected_container_runtimes),
             "visible_credential_names": list(self.visible_credential_names),
             "attested_candidate_artifact_hash": self.attested_candidate_artifact_hash,
             "attestation_report_artifact_hash": self.attestation_report_artifact_hash,
@@ -220,6 +252,19 @@ def _visible_credential_names(environment: Mapping[str, str]) -> tuple[str, ...]
 
 def _base_controls() -> dict[str, ControlEvidence]:
     sandbox_exec = shutil.which("sandbox-exec")
+    container_runtimes = {
+        name: shutil.which(name)
+        for name in ("apptainer", "singularity", "podman")
+    }
+    detected_sandboxes = {
+        name: path for name, path in container_runtimes.items() if path is not None
+    }
+    sandbox_details = []
+    if sandbox_exec:
+        sandbox_details.append(f"sandbox-exec={sandbox_exec}")
+    sandbox_details.extend(
+        f"{name}={path}" for name, path in sorted(detected_sandboxes.items())
+    )
     try:
         import resource  # noqa: PLC0415 - capability probe is platform-dependent
 
@@ -276,15 +321,82 @@ def _base_controls() -> dict[str, ControlEvidence]:
         ),
         "platform_sandbox": ControlEvidence(
             "platform_sandbox",
-            CapabilityState.DETECTED if sandbox_exec else CapabilityState.ABSENT,
+            (
+                CapabilityState.DETECTED
+                if sandbox_exec or detected_sandboxes
+                else CapabilityState.ABSENT
+            ),
             "executable discovery",
             (
-                f"sandbox tool detected at {sandbox_exec}; enforcement not attested"
-                if sandbox_exec
-                else "no supported platform sandbox executable detected"
+                "sandbox/container tools detected: " + ", ".join(sandbox_details)
+                + "; candidate-bound enforcement not attested"
+                if sandbox_details
+                else "no supported platform sandbox or container executable detected"
             ),
         ),
     }
+
+
+def _detected_container_runtimes() -> tuple[str, ...]:
+    """Return executable names only; discovery is never containment proof."""
+
+    return tuple(
+        name
+        for name in ("apptainer", "singularity", "podman")
+        if shutil.which(name) is not None
+    )
+
+
+def _cuda_allocation_evidence(
+    environment: Mapping[str, str],
+) -> tuple[str | None, str | None, str | None]:
+    """Read scheduler allocation markers without treating visibility as a GPU test."""
+
+    job_id = environment.get("SLURM_JOB_ID") or environment.get("SLURM_JOBID")
+    assignment = next(
+        (
+            environment[name]
+            for name in (
+                "SLURM_STEP_GPUS",
+                "SLURM_JOB_GPUS",
+                "SLURM_GPUS_ON_NODE",
+            )
+            if environment.get(name)
+        ),
+        None,
+    )
+    visible = environment.get("CUDA_VISIBLE_DEVICES")
+    return job_id, assignment, visible
+
+
+def _cuda_devices(cuda_available: bool, device_count: int) -> tuple[dict[str, Any], ...]:
+    """Collect non-secret CUDA identity metadata when PyTorch can access devices."""
+
+    if not cuda_available:
+        return ()
+    devices: list[dict[str, Any]] = []
+    for index in range(device_count):
+        try:
+            properties = torch.cuda.get_device_properties(index)
+            capability = torch.cuda.get_device_capability(index)
+            uuid_value = getattr(properties, "uuid", None)
+            devices.append(
+                {
+                    "index": index,
+                    "name": properties.name,
+                    "uuid": str(uuid_value) if uuid_value else None,
+                    "total_memory_bytes": int(properties.total_memory),
+                    "compute_capability": [int(capability[0]), int(capability[1])],
+                }
+            )
+        except (AssertionError, RuntimeError) as error:
+            devices.append(
+                {
+                    "index": index,
+                    "metadata_error": f"{type(error).__name__}: {error}",
+                }
+            )
+    return tuple(devices)
 
 
 def _apply_attestation(
@@ -340,6 +452,30 @@ def audit_runtime(
     mps_built = bool(mps_backend and mps_backend.is_built())
     mps_available = bool(mps_backend and mps_backend.is_available())
     fallback = str(environment.get("PYTORCH_ENABLE_MPS_FALLBACK", "")).lower()
+    cuda_available = bool(torch.cuda.is_available())
+    cuda_device_count = int(torch.cuda.device_count()) if cuda_available else 0
+    scheduler_job_id, scheduler_assignment, cuda_visible_devices = (
+        _cuda_allocation_evidence(environment)
+    )
+    cuda_allocation_validated = bool(
+        cuda_available
+        and cuda_device_count == 1
+        and scheduler_job_id
+        and cuda_allocation_proves_exactly_one(
+            {
+                "SLURM_JOB_GPUS": environment.get("SLURM_JOB_GPUS", ""),
+                "SLURM_STEP_GPUS": environment.get("SLURM_STEP_GPUS", ""),
+                "SLURM_GPUS_ON_NODE": environment.get("SLURM_GPUS_ON_NODE", ""),
+            }
+        )
+        and cuda_visible_devices not in {None, "", "-1"}
+    )
+    cuda_devices = _cuda_devices(cuda_available, cuda_device_count)
+    if cuda_available and not cuda_allocation_validated:
+        notes.append(
+            "CUDA visibility is not proof of a scheduler GPU allocation; "
+            "scientific CUDA execution remains blocked"
+        )
     return CapabilityAudit(
         created_at_utc=datetime.now(timezone.utc).isoformat(),
         platform_system=platform.system(),
@@ -349,6 +485,15 @@ def audit_runtime(
         mps_built=mps_built,
         mps_available=mps_available,
         mps_fallback_requested=fallback in {"1", "true", "yes", "on"},
+        cuda_compiled_runtime=torch.version.cuda,
+        cuda_available=cuda_available,
+        cuda_device_count=cuda_device_count,
+        cuda_visible_devices=cuda_visible_devices,
+        cuda_scheduler_job_id=scheduler_job_id,
+        cuda_scheduler_gpu_assignment=scheduler_assignment,
+        cuda_allocation_validated=cuda_allocation_validated,
+        cuda_devices=cuda_devices,
+        detected_container_runtimes=_detected_container_runtimes(),
         visible_credential_names=_visible_credential_names(environment),
         controls=controls,
         attested_candidate_artifact_hash=attested_candidate_hash,

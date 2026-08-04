@@ -26,6 +26,13 @@ class OpportunityOutcome(StrEnum):
     INFRASTRUCTURE_FAILURE = "infrastructure_failure"
 
 
+class AcceleratorBackend(StrEnum):
+    """Hardware backends whose usage must remain separate study conditions."""
+
+    MPS = "mps"
+    CUDA = "cuda"
+
+
 @dataclass(frozen=True)
 class BudgetSpec:
     """Preregistered hard ceilings. No field is a model-size objective."""
@@ -491,3 +498,193 @@ class BudgetLedger:
             for count in self._repairs_by_opportunity.values()
         ):
             raise ValueError("stored repairs exceed an opportunity ceiling")
+
+
+@dataclass(frozen=True)
+class AcceleratorResourceSpec:
+    """Versioned, backend-neutral ceiling for exactly one hardware condition.
+
+    This schema is additive.  The frozen ``BudgetSpec`` v1 schema and its
+    ``mps_seconds`` field remain unchanged and can be adapted with
+    :meth:`from_legacy_budget_spec`.
+    """
+
+    backend: AcceleratorBackend
+    hardware_condition: str
+    accelerator_seconds: float
+    schema_name: str = field(default="AcceleratorResourceSpec", init=False)
+    schema_version: str = field(default="2.0", init=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "backend", AcceleratorBackend(self.backend))
+        if not isinstance(
+            self.hardware_condition, str
+        ) or not self.hardware_condition.strip():
+            raise ValueError("hardware_condition must be non-empty text")
+        object.__setattr__(self, "hardware_condition", self.hardware_condition.strip())
+        if isinstance(self.accelerator_seconds, bool) or not isinstance(
+            self.accelerator_seconds, (int, float)
+        ):
+            raise ValueError("accelerator_seconds must be numeric")
+        if not math.isfinite(self.accelerator_seconds):
+            raise ValueError("accelerator_seconds must be finite")
+        if self.accelerator_seconds < 0:
+            raise ValueError("accelerator_seconds must be non-negative")
+
+    @property
+    def resource_key(self) -> str:
+        return f"{self.backend.value}:{self.hardware_condition}"
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema_name": self.schema_name,
+            "schema_version": self.schema_version,
+            "backend": self.backend.value,
+            "hardware_condition": self.hardware_condition,
+            "resource_key": self.resource_key,
+            "accelerator_seconds": self.accelerator_seconds,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> AcceleratorResourceSpec:
+        if payload.get("schema_name") == "BudgetSpec":
+            if payload.get("schema_version") != "1.0":
+                raise ValueError("unsupported legacy BudgetSpec schema version")
+            return cls.from_legacy_budget_spec(BudgetSpec.from_dict(payload))
+        if payload.get("schema_name") != "AcceleratorResourceSpec":
+            raise ValueError("expected AcceleratorResourceSpec schema")
+        if payload.get("schema_version") != "2.0":
+            raise ValueError("unsupported AcceleratorResourceSpec schema version")
+        expected_fields = {
+            "schema_name",
+            "schema_version",
+            "backend",
+            "hardware_condition",
+            "resource_key",
+            "accelerator_seconds",
+        }
+        if set(payload) != expected_fields:
+            raise ValueError("AcceleratorResourceSpec fields differ from v2.0")
+        result = cls(
+            backend=AcceleratorBackend(payload["backend"]),
+            hardware_condition=payload["hardware_condition"],
+            accelerator_seconds=payload["accelerator_seconds"],
+        )
+        if payload["resource_key"] != result.resource_key:
+            raise ValueError("accelerator resource key does not reconstruct")
+        return result
+
+    @classmethod
+    def from_legacy_budget_spec(
+        cls,
+        spec: BudgetSpec,
+        *,
+        hardware_condition: str = "mps_legacy_v1",
+    ) -> AcceleratorResourceSpec:
+        if not isinstance(spec, BudgetSpec):
+            raise TypeError("legacy spec must be a BudgetSpec")
+        return cls(
+            backend=AcceleratorBackend.MPS,
+            hardware_condition=hardware_condition,
+            accelerator_seconds=spec.mps_seconds,
+        )
+
+
+@dataclass
+class AcceleratorResourceLedger:
+    """Actual accelerator time for one non-poolable hardware condition."""
+
+    spec: AcceleratorResourceSpec
+    accelerator_seconds: float = 0.0
+
+    def record(
+        self,
+        seconds: float,
+        *,
+        backend: AcceleratorBackend | str,
+        hardware_condition: str,
+    ) -> None:
+        resolved_backend = AcceleratorBackend(backend)
+        if (
+            resolved_backend is not self.spec.backend
+            or hardware_condition != self.spec.hardware_condition
+        ):
+            raise ValueError(
+                "accelerator usage cannot be pooled across backend/hardware conditions"
+            )
+        if isinstance(seconds, bool) or not isinstance(seconds, (int, float)):
+            raise ValueError("accelerator seconds must be numeric")
+        if not math.isfinite(seconds) or seconds < 0:
+            raise ValueError("accelerator seconds must be finite and non-negative")
+        updated = self.accelerator_seconds + seconds
+        if updated > self.spec.accelerator_seconds:
+            raise BudgetExceeded(
+                "accelerator_seconds ceiling exceeded: "
+                f"requested {updated}, frozen {self.spec.accelerator_seconds}"
+            )
+        self.accelerator_seconds = updated
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema_name": "AcceleratorResourceLedger",
+            "schema_version": "2.0",
+            "spec": self.spec.to_dict(),
+            "resource_key": self.spec.resource_key,
+            "accelerator_seconds": self.accelerator_seconds,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> AcceleratorResourceLedger:
+        if payload.get("schema_name") == "BudgetLedger":
+            if payload.get("schema_version") != "1.0":
+                raise ValueError("unsupported legacy BudgetLedger schema version")
+            return cls.from_legacy_budget_ledger(BudgetLedger.from_dict(payload))
+        if payload.get("schema_name") != "AcceleratorResourceLedger":
+            raise ValueError("expected AcceleratorResourceLedger schema")
+        if payload.get("schema_version") != "2.0":
+            raise ValueError("unsupported AcceleratorResourceLedger schema version")
+        expected_fields = {
+            "schema_name",
+            "schema_version",
+            "spec",
+            "resource_key",
+            "accelerator_seconds",
+        }
+        if set(payload) != expected_fields:
+            raise ValueError("AcceleratorResourceLedger fields differ from v2.0")
+        spec = AcceleratorResourceSpec.from_dict(payload["spec"])
+        if payload["resource_key"] != spec.resource_key:
+            raise ValueError("accelerator ledger resource key does not reconstruct")
+        ledger = cls(spec=spec, accelerator_seconds=payload["accelerator_seconds"])
+        ledger.validate()
+        return ledger
+
+    @classmethod
+    def from_legacy_budget_ledger(
+        cls,
+        ledger: BudgetLedger,
+        *,
+        hardware_condition: str = "mps_legacy_v1",
+    ) -> AcceleratorResourceLedger:
+        if not isinstance(ledger, BudgetLedger):
+            raise TypeError("legacy ledger must be a BudgetLedger")
+        ledger.validate()
+        return cls(
+            spec=AcceleratorResourceSpec.from_legacy_budget_spec(
+                ledger.spec,
+                hardware_condition=hardware_condition,
+            ),
+            accelerator_seconds=ledger.mps_seconds,
+        )
+
+    def validate(self) -> None:
+        if isinstance(self.accelerator_seconds, bool) or not isinstance(
+            self.accelerator_seconds, (int, float)
+        ):
+            raise ValueError("stored accelerator_seconds must be numeric")
+        if not math.isfinite(self.accelerator_seconds):
+            raise ValueError("stored accelerator_seconds must be finite")
+        if not 0 <= self.accelerator_seconds <= self.spec.accelerator_seconds:
+            raise ValueError(
+                "stored accelerator_seconds lies outside its frozen ceiling"
+            )

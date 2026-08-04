@@ -77,11 +77,33 @@ _OPTIMIZER_NAMES = {
     "SGD",
     "SparseAdam",
 }
+_FORBIDDEN_RUNTIME_CONTROL_CALLS = {
+    ("torch", "set_deterministic_debug_mode"),
+    ("torch", "set_float32_matmul_precision"),
+    ("torch", "use_deterministic_algorithms"),
+}
+_FORBIDDEN_RUNTIME_CONTROL_TARGETS = {
+    ("torch", "backends", "cuda", "matmul", "allow_tf32"),
+    ("torch", "backends", "cudnn", "allow_tf32"),
+    ("torch", "backends", "cudnn", "benchmark"),
+    ("torch", "backends", "cudnn", "deterministic"),
+}
 
 
 def _call_name(node: ast.Call) -> tuple[str, ...]:
     parts: list[str] = []
     current: ast.expr = node.func
+    while isinstance(current, ast.Attribute):
+        parts.append(current.attr)
+        current = current.value
+    if isinstance(current, ast.Name):
+        parts.append(current.id)
+    return tuple(reversed(parts))
+
+
+def _attribute_name(node: ast.expr) -> tuple[str, ...]:
+    parts: list[str] = []
+    current = node
     while isinstance(current, ast.Attribute):
         parts.append(current.attr)
         current = current.value
@@ -134,6 +156,22 @@ def inspect_candidate_source(source: str) -> ContractResult:
                 reasons.append(f"forbidden candidate operation: {'.'.join(name)}")
             if "optim" in name or name[-1] in _OPTIMIZER_NAMES:
                 reasons.append(f"candidate-controlled optimizer: {'.'.join(name)}")
+            if name in _FORBIDDEN_RUNTIME_CONTROL_CALLS:
+                reasons.append(
+                    "candidate-controlled deterministic runtime: " + ".".join(name)
+                )
+        elif isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+            if isinstance(node, ast.Assign):
+                targets = node.targets
+            else:
+                targets = [node.target]
+            for target in targets:
+                name = _attribute_name(target)
+                if name in _FORBIDDEN_RUNTIME_CONTROL_TARGETS:
+                    reasons.append(
+                        "candidate-controlled deterministic runtime: "
+                        + ".".join(name)
+                    )
 
     for builder in builders:
         if any(isinstance(node, (ast.For, ast.While)) for node in ast.walk(builder)):

@@ -190,6 +190,16 @@ class ImmutableStudyEventSink:
     @staticmethod
     def _failure_class(outcome: str, stage: str) -> FailureClass:
         normalized = stage.lower()
+        cuda_stages = {
+            "cuda_unavailable": FailureClass.CUDA_UNAVAILABLE,
+            "cuda_oom": FailureClass.CUDA_OOM,
+            "cuda_driver_runtime_failure": FailureClass.CUDA_DRIVER_RUNTIME_FAILURE,
+            "unsupported_deterministic_cuda_operation": (
+                FailureClass.UNSUPPORTED_DETERMINISTIC_CUDA_OPERATION
+            ),
+        }
+        if normalized in cuda_stages:
+            return cuda_stages[normalized]
         if outcome == "invalid":
             return FailureClass.PROPOSAL_PARSE
         if outcome == "infrastructure_failure":

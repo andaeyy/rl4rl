@@ -20,7 +20,7 @@ import torch
 from common.candidate_contract import inspect_candidate_path, validate_candidate
 from common.candidate_loader import load_candidate
 from common.descriptor_extractor import extract_descriptors
-from common.device import resolve_training_device, synchronize
+from common.device import cleanup_accelerator, resolve_training_device
 from common.evaluation_profiles import (
     EvaluationLayer,
     EvaluationPlan,
@@ -47,6 +47,8 @@ INFRASTRUCTURE_FAILURE_STAGES = {
     "checkpoint_write",
     "checkpoint_resume_mismatch",
     "containment_unproven",
+    "cuda_driver_runtime_failure",
+    "cuda_unavailable",
     "device_unavailable",
     "training_oom",
     "training_timeout",
@@ -191,6 +193,7 @@ def evaluate_trained_candidate_in_process(
     descriptor_codes: tuple[tuple[str, float], ...] = ()
     verification_started = time.perf_counter()
     model: torch.nn.Module | None = None
+    evaluation_device: torch.device | None = None
     try:
         profile = get_training_profile(training.profile_name)
         selection = resolve_training_device(
@@ -199,6 +202,7 @@ def evaluate_trained_candidate_in_process(
             allow_cpu_for_tests=allow_cpu_for_tests,
         )
         device = selection.device
+        evaluation_device = device
         module = load_candidate(candidate_path)
         built = module.build_untrained_model(seeds.model_initialization_seed)
         if not isinstance(built, tuple) or len(built) != 2:
@@ -256,11 +260,10 @@ def evaluate_trained_candidate_in_process(
         if model is not None:
             del model
         gc.collect()
-        if requested_device == "mps" and hasattr(torch, "mps"):
+        if evaluation_device is not None:
             try:
-                synchronize(torch.device("mps"))
-                torch.mps.empty_cache()
-            except RuntimeError:
+                cleanup_accelerator(evaluation_device)
+            except (AssertionError, RuntimeError):
                 pass
         _ = time.perf_counter() - verification_started
 

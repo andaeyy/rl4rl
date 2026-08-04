@@ -170,6 +170,40 @@ engineering_smoke:
   validation_examples: 24
   maximum_wall_seconds: 60
 
+cuda_training_condition:
+  status: additive_condition_not_formally_authorized
+  profile: full_train_cuda_a40_v1
+  profile_version: "1"
+  profile_hash: 21d2406108443d48d964c7d216a1b912ebe9a758868027b9f7ccbe3a72df6dc8
+  scientific: true
+  target_gpu: NVIDIA A40
+  device: cuda
+  dtype: float32
+  max_optimizer_steps: 30000
+  global_batch_size: 512
+  optimizer: AdamW
+  mixed_precision: false
+  torch_compile: false
+  automatic_batch_size_reduction: false
+  cpu_fallback: false
+  cross_backend_pooling_authorized: false
+  scientific_containment_required: true
+  scientific_arbitrary_python_status: blocked_until_os_boundary_attested
+
+cuda_engineering_smoke:
+  profile: smoke_train_cuda_v1
+  profile_version: "1"
+  profile_hash: 87c1fd454cd0141687b4bf5ffc2cc84835f7a7af532024d1f7fa37f13cd2f948
+  scientific: false
+  trusted_candidate_only: common/initial_candidate.py
+  trusted_candidate_sha256: fee5f0784fbc3bf2c51d450e24064a4a6a988b92658043ce19b40101db294007
+  target_gpu: NVIDIA A40
+  device: cuda
+  max_optimizer_steps: 10
+  cpu_fallback: false
+  provider_calls: forbidden
+  formal_scientific_execution_authorized: false
+
 artifacts_and_reconstruction:
   event_ledger: append_only_hash_chained
   candidate_and_response_storage: content_addressed
