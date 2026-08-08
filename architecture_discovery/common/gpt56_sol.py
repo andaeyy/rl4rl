@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 
 TARGET_MODEL = "gpt-5.6-sol"
 API_MODE = "chat_completions"
+OFFICIAL_OPENAI_API_BASE = "https://api.openai.com/v1"
 SUPPORTED_REASONING_EFFORTS = frozenset(
     {"none", "low", "medium", "high", "xhigh", "max"}
 )
@@ -23,6 +26,51 @@ def _optional_value(environ: Mapping[str, str], name: str) -> str | None:
 
 
 @dataclass(frozen=True)
+class ProviderEndpoint:
+    """Normalized, non-secret provider identity suitable for run manifests."""
+
+    base_url: str
+    provider_identity: str
+
+    def manifest_fields(self) -> dict[str, str]:
+        return {
+            "provider_identity": self.provider_identity,
+            "api_endpoint": self.base_url,
+        }
+
+
+def resolve_provider_endpoint(
+    api_base: str,
+    *,
+    scientific: bool,
+) -> ProviderEndpoint:
+    value = api_base.strip()
+    parsed = urlsplit(value)
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
+        raise ValueError("DISCOVERY_API_BASE must be an absolute HTTP(S) endpoint")
+    if parsed.username or parsed.password or parsed.query or parsed.fragment:
+        raise ValueError(
+            "DISCOVERY_API_BASE may not contain credentials, query parameters, or fragments"
+        )
+    netloc = parsed.hostname.lower()
+    if parsed.port is not None:
+        netloc += f":{parsed.port}"
+    path = parsed.path.rstrip("/")
+    normalized = urlunsplit((parsed.scheme.lower(), netloc, path, "", ""))
+    if scientific and normalized != OFFICIAL_OPENAI_API_BASE:
+        raise ValueError(
+            "scientific controller runs are pinned to the official OpenAI API "
+            f"endpoint {OFFICIAL_OPENAI_API_BASE!r}"
+        )
+    identity = (
+        "openai_official"
+        if normalized == OFFICIAL_OPENAI_API_BASE
+        else "openai_compatible_" + hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
+    )
+    return ProviderEndpoint(base_url=normalized, provider_identity=identity)
+
+
+@dataclass(frozen=True)
 class GPT56SolProfile:
     """Resolved request settings shared by greedy and OpenEvolve runs."""
 
@@ -33,6 +81,7 @@ class GPT56SolProfile:
     retries: int
     retry_delay_seconds: int
     seed: int
+    environment_overrides_allowed: bool = True
 
     @classmethod
     def resolve(
@@ -46,6 +95,7 @@ class GPT56SolProfile:
         default_retries: int,
         default_retry_delay_seconds: int,
         environ: Mapping[str, str] | None = None,
+        allow_environment_overrides: bool = True,
     ) -> GPT56SolProfile:
         env = os.environ if environ is None else environ
         if model != TARGET_MODEL:
@@ -108,6 +158,23 @@ class GPT56SolProfile:
             raise ValueError("request retries cannot be negative")
         if retry_delay_seconds < 0:
             raise ValueError("retry delay cannot be negative")
+        if not allow_environment_overrides:
+            frozen_mismatches = []
+            if reasoning_effort != default_reasoning_effort.lower():
+                frozen_mismatches.append("DISCOVERY_REASONING_EFFORT")
+            if max_completion_tokens != default_max_completion_tokens:
+                frozen_mismatches.append("DISCOVERY_MAX_COMPLETION_TOKENS")
+            if timeout_seconds != default_timeout_seconds:
+                frozen_mismatches.append("DISCOVERY_REQUEST_TIMEOUT_SECONDS")
+            if retries != default_retries:
+                frozen_mismatches.append("DISCOVERY_REQUEST_RETRIES")
+            if retry_delay_seconds != default_retry_delay_seconds:
+                frozen_mismatches.append("DISCOVERY_RETRY_DELAY_SECONDS")
+            if frozen_mismatches:
+                raise ValueError(
+                    "scientific generation settings are frozen; conflicting "
+                    "environment values: " + ", ".join(frozen_mismatches)
+                )
 
         return cls(
             model=model,
@@ -117,6 +184,7 @@ class GPT56SolProfile:
             retries=retries,
             retry_delay_seconds=retry_delay_seconds,
             seed=seed,
+            environment_overrides_allowed=allow_environment_overrides,
         )
 
     def chat_completion_request(
@@ -147,4 +215,9 @@ class GPT56SolProfile:
             "top_p": None,
             "request_seed": self.seed,
             "generation_seed_support": "best_effort_api_seed",
+            "request_settings_source": (
+                "environment_overrides_permitted"
+                if self.environment_overrides_allowed
+                else "frozen_controller_configuration"
+            ),
         }

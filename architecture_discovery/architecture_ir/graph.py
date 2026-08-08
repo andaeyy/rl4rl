@@ -12,6 +12,7 @@ import hashlib
 import json
 import math
 import re
+import struct
 from dataclasses import dataclass, field
 from enum import StrEnum
 from types import MappingProxyType
@@ -20,6 +21,8 @@ from typing import Any, Iterable, Mapping, TypeAlias
 
 SCHEMA_NAME = "architecture_tensor_graph"
 SCHEMA_VERSION = "1.0"
+LEGACY_ARCHITECTURE_HASH_SCHEMA = "architecture_executable_v1"
+ARCHITECTURE_HASH_SCHEMA = "architecture_executable_v2"
 NodeAttribute: TypeAlias = str | int | float | bool | None | tuple["NodeAttribute", ...]
 _IDENTIFIER = re.compile(r"^[A-Za-z][A-Za-z0-9_.:-]*$")
 _FORBIDDEN_ATTRIBUTE_KEYS = {
@@ -131,6 +134,105 @@ def _attribute_json(value: NodeAttribute) -> Any:
     if isinstance(value, tuple):
         return [_attribute_json(item) for item in value]
     return value
+
+
+def _canonical_executable_shape(shape: list[int | str]) -> list[int | str]:
+    """Normalize evaluator-dynamic axes that do not affect v1 execution."""
+
+    normalized = list(shape)
+    if len(normalized) in {2, 3}:
+        normalized[0] = "Batch"
+        normalized[1] = "Time"
+    return normalized
+
+
+def _as_finite_float32(value: Any) -> float | None:
+    """Match the interpreter's IEEE-float32 conversion without torch."""
+
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        converted = struct.unpack("!f", struct.pack("!f", float(value)))[0]
+    except (OverflowError, struct.error, ValueError):
+        return None
+    return converted if math.isfinite(converted) else None
+
+
+def _canonical_fixed_mix_weights(weights: Any) -> list[float] | None:
+    """Return the exact float32 weights stored by interpreter ``_FixedMix``."""
+
+    if not isinstance(weights, (list, tuple)):
+        return None
+    converted: list[float] = []
+    originals: list[float] = []
+    for value in weights:
+        rounded = _as_finite_float32(value)
+        if rounded is None:
+            return None
+        original = float(value)
+        if original != 0.0 and rounded == 0.0:
+            return None
+        originals.append(original)
+        converted.append(rounded)
+
+    denominator = _as_finite_float32(math.fsum(abs(value) for value in converted))
+    if denominator is None or denominator <= 0.0:
+        return None
+
+    normalized: list[float] = []
+    for original, value in zip(originals, converted, strict=True):
+        rounded = _as_finite_float32(value / denominator)
+        if rounded is None or (original != 0.0 and rounded == 0.0):
+            return None
+        normalized.append(rounded)
+    if not any(value != 0.0 for value in normalized):
+        return None
+    return normalized
+
+
+def _canonical_executor_float(value: Any) -> Any:
+    """Collapse JSON integer/float aliases only when validation sees a number."""
+
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return value
+    converted = float(value)
+    return converted if math.isfinite(converted) else value
+
+
+def _canonical_executable_attributes(
+    kind: PrimitiveKind,
+    attributes: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Materialize interpreter defaults before computing executable identity."""
+
+    normalized = dict(attributes)
+    if kind is PrimitiveKind.ATTENTION:
+        normalized.setdefault("bias", False)
+    elif kind is PrimitiveKind.NORMALIZATION:
+        normalized.setdefault("epsilon", 1e-5)
+        normalized.setdefault("affine", True)
+        normalized["epsilon"] = _canonical_executor_float(normalized["epsilon"])
+    elif kind is PrimitiveKind.FEED_FORWARD:
+        normalized.setdefault("bias", False)
+        if normalized.get("mechanism") == "gated":
+            normalized.setdefault("activation", "gelu")
+    elif kind is PrimitiveKind.ROUTING:
+        if normalized.get("mechanism") == "softmax_mix":
+            normalized.setdefault("temperature", 1.0)
+            normalized["temperature"] = _canonical_executor_float(
+                normalized["temperature"]
+            )
+        elif normalized.get("mechanism") == "fixed_mix":
+            weights = _canonical_fixed_mix_weights(normalized.get("weights"))
+            if weights is not None:
+                normalized["weights"] = weights
+    elif kind is PrimitiveKind.COMPOSITION:
+        if normalized.get("mechanism") == "concat_project":
+            normalized.setdefault("bias", False)
+    elif kind is PrimitiveKind.READOUT:
+        normalized.setdefault("bias", False)
+        normalized.setdefault("tie_embedding", None)
+    return normalized
 
 
 @dataclass(frozen=True)
@@ -288,6 +390,154 @@ class ArchitectureGraph:
         return json.dumps(
             self.to_dict(), sort_keys=True, separators=(",", ":"), allow_nan=False
         )
+
+    def _architecture_dict(self, *, hash_schema: str) -> dict[str, Any]:
+        """Return executable structure, excluding descriptive document identity.
+
+        ``graph_id`` and descriptive metadata cannot alter model construction.
+        The one execution-affecting v1 metadata field, ``max_sequence_length``,
+        is retained explicitly.  The trusted v1 interpreter also routes inputs
+        by source and target port without assigning distinct behavior to the
+        allowed ``data``, ``residual``, and ``routing`` edge labels, so those
+        labels are excluded too.  Node identifiers and evaluator-dynamic
+        batch/time labels are normalized, and omitted primitive defaults are
+        materialized.  Keeping a separate hash prevents prose, labels,
+        ordering, identifier-only edits, and equivalent default spellings from
+        masquerading as architectural changes.
+        """
+
+        if hash_schema not in {
+            LEGACY_ARCHITECTURE_HASH_SCHEMA,
+            ARCHITECTURE_HASH_SCHEMA,
+        }:
+            raise ValueError(f"unsupported architecture hash schema {hash_schema!r}")
+        normalize_execution_identity = hash_schema == ARCHITECTURE_HASH_SCHEMA
+
+        nodes_by_id = {node.node_id: node for node in self.nodes}
+        incoming: dict[str, list[IREdge]] = {}
+        for edge in self.edges:
+            incoming.setdefault(edge.target, []).append(edge)
+        for edges in incoming.values():
+            edges.sort(key=lambda edge: (edge.target_port, edge.source))
+
+        canonical_ids: dict[str, str] = {}
+
+        def visit(node_id: str) -> None:
+            if node_id in canonical_ids or node_id not in nodes_by_id:
+                return
+            canonical_ids[node_id] = f"n{len(canonical_ids)}"
+            for edge in incoming.get(node_id, ()):
+                visit(edge.source)
+            tied = nodes_by_id[node_id].attributes.get("tie_embedding")
+            if isinstance(tied, str):
+                visit(tied)
+
+        visit(self.output_node_id)
+        visit(self.input_node_id)
+        # Valid graphs have no nodes outside the input-to-output computation.
+        # Retain deterministic fail-closed behavior for malformed graphs too.
+        for node in sorted(
+            self.nodes,
+            key=lambda item: (
+                item.kind.value,
+                json.dumps(item.to_dict(), sort_keys=True, separators=(",", ":")),
+            ),
+        ):
+            visit(node.node_id)
+
+        canonical_nodes: list[dict[str, Any]] = []
+        for original_id, canonical_id in sorted(
+            canonical_ids.items(), key=lambda item: int(item[1][1:])
+        ):
+            node_payload = nodes_by_id[original_id].to_dict()
+            node_payload["node_id"] = canonical_id
+            if normalize_execution_identity:
+                node_payload["input_shapes"] = [
+                    _canonical_executable_shape(shape)
+                    for shape in node_payload["input_shapes"]
+                ]
+                node_payload["output_shape"] = _canonical_executable_shape(
+                    node_payload["output_shape"]
+                )
+                node_payload["attributes"] = _canonical_executable_attributes(
+                    nodes_by_id[original_id].kind,
+                    node_payload["attributes"],
+                )
+            tied = node_payload["attributes"].get("tie_embedding")
+            if isinstance(tied, str) and tied in canonical_ids:
+                node_payload["attributes"]["tie_embedding"] = canonical_ids[tied]
+            canonical_nodes.append(node_payload)
+
+        canonical_edges = [
+            {
+                "source": canonical_ids[edge.source],
+                "target": canonical_ids[edge.target],
+                "target_port": edge.target_port,
+            }
+            for edge in self.edges
+            if edge.source in canonical_ids and edge.target in canonical_ids
+        ]
+        canonical_edges.sort(
+            key=lambda edge: (
+                int(edge["target"][1:]),
+                edge["target_port"],
+                int(edge["source"][1:]),
+            )
+        )
+        payload: dict[str, Any] = {
+            "schema_name": self.schema_name,
+            "schema_version": self.schema_version,
+            "input_node_id": canonical_ids.get(self.input_node_id, "missing_input"),
+            "output_node_id": canonical_ids.get(self.output_node_id, "missing_output"),
+            "nodes": canonical_nodes,
+            "edges": canonical_edges,
+        }
+        if normalize_execution_identity:
+            payload["architecture_hash_schema"] = ARCHITECTURE_HASH_SCHEMA
+            payload["execution_metadata"] = {
+                "max_sequence_length": _attribute_json(
+                    self.metadata.get("max_sequence_length")
+                )
+            }
+        return payload
+
+    @property
+    def architecture_dict(self) -> dict[str, Any]:
+        """Return the current, schema-tagged executable-identity payload."""
+
+        return self._architecture_dict(hash_schema=ARCHITECTURE_HASH_SCHEMA)
+
+    @property
+    def legacy_architecture_dict(self) -> dict[str, Any]:
+        """Return the exact v1 payload used by historical pilot artifacts."""
+
+        return self._architecture_dict(hash_schema=LEGACY_ARCHITECTURE_HASH_SCHEMA)
+
+    @property
+    def architecture_hash_schema(self) -> str:
+        return ARCHITECTURE_HASH_SCHEMA
+
+    @property
+    def legacy_architecture_hash(self) -> str:
+        """Recompute architecture hashes stored before executable-identity v2."""
+
+        canonical = json.dumps(
+            self.legacy_architecture_dict,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+    @property
+    def architecture_hash(self) -> str:
+        canonical = json.dumps(
+            self.architecture_dict,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
     @property
     def graph_hash(self) -> str:

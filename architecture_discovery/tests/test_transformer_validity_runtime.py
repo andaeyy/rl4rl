@@ -28,6 +28,7 @@ def _load_fixture(name: str):
 
 def test_trusted_attention_bindings_collect_runtime_causal_and_intervention_evidence():
     model, _ = build_untrained_model(17)
+    model.graph_hash = GRAPH_HASH
     evidence = probe_runtime_validity(
         model,
         bindings=RuntimeBindings(

@@ -2,11 +2,11 @@ max_iterations: 5
 checkpoint_interval: 1
 log_level: INFO
 random_seed: 1
-diff_based_evolution: true
+diff_based_evolution: false
 max_code_length: 40000
 early_stopping_patience: null
-language: python
-file_suffix: .py
+language: json
+file_suffix: .json
 
 training:
   profile: full_train_v1

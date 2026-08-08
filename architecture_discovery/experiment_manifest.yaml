@@ -90,13 +90,13 @@ shared_generation:
   retries: 2
   retry_delay_seconds: 3
   request_seed: controller_seed_best_effort
-  mutation_format: search_replace_diff
+  mutation_format: complete_architecture_ir_json
 
 evaluation:
   online_api: typed_search_evaluation_record_only
   parameter_count_in_fitness: false
   internet_access_during_runs: false
-  runtime_transformer_validity_status: probes_implemented_not_integrated_with_trusted_ir_interpreter
+  runtime_transformer_validity_status: trusted_ir_interpreter_and_layer_a_evidence_integrated
   layer_a:
     profile: scientific_layer_a_v1
     controller_visible: true
@@ -154,10 +154,13 @@ training:
   automatic_batch_size_reduction: false
   cpu_fallback: false
   parallel_candidate_training: false
-  candidate_format_current: arbitrary_python
+  candidate_format_current: architecture_ir
+  native_four_harness_candidate_format: architecture_ir
+  primary_causal_engine_candidate_format_status: legacy_python_generation_blocked_pending_ir_migration
   scientific_containment_required: true
+  scientific_execution_boundary: trusted_ir_or_candidate_bound_os_boundary
   scientific_arbitrary_python_status: blocked_until_os_boundary_attested
-  architecture_ir_status: schema_and_runtime_evidence_only_no_trusted_interpreter
+  architecture_ir_status: trusted_interpreter_integrated_with_training_and_layer_a_runtime_evidence
   resume_checkpoint_loading: weights_only_true
 
 engineering_smoke:

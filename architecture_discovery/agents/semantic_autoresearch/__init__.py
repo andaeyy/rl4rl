@@ -1,0 +1,1 @@
+"""Semantic-coverage Autoresearch controller."""

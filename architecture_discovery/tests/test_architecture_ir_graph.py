@@ -3,6 +3,7 @@ from dataclasses import replace
 import pytest
 
 from architecture_ir.graph import (
+    ARCHITECTURE_HASH_SCHEMA,
     ArchitectureGraph,
     CustomPrimitiveSpec,
     EdgeKind,
@@ -67,6 +68,123 @@ def test_valid_typed_transformer_graph_has_stable_canonical_hash():
     assert result.attention_node_ids == ("attention",)
     assert len(graph.graph_hash) == 64
     assert graph.graph_hash == replace(graph, nodes=tuple(reversed(graph.nodes))).graph_hash
+
+
+def test_architecture_hash_ignores_graph_id_and_metadata_but_not_structure():
+    graph = valid_graph()
+    relabeled_document = replace(
+        graph,
+        graph_id="different.document.id",
+        metadata={"mechanism_hypothesis": "different prose"},
+    )
+    assert relabeled_document.graph_hash != graph.graph_hash
+    assert relabeled_document.architecture_hash == graph.architecture_hash
+
+    renamed = {node.node_id: f"renamed_{index}" for index, node in enumerate(graph.nodes)}
+    renamed_nodes = tuple(
+        replace(node, node_id=renamed[node.node_id]) for node in reversed(graph.nodes)
+    )
+    renamed_edges = tuple(
+        replace(edge, source=renamed[edge.source], target=renamed[edge.target])
+        for edge in reversed(graph.edges)
+    )
+    identifier_only = replace(
+        graph,
+        input_node_id=renamed[graph.input_node_id],
+        output_node_id=renamed[graph.output_node_id],
+        nodes=renamed_nodes,
+        edges=renamed_edges,
+    )
+    assert identifier_only.graph_hash != graph.graph_hash
+    assert identifier_only.architecture_hash == graph.architecture_hash
+
+    changed_node = replace(graph.nodes[1], attributes={"vocab": 16})
+    changed_structure = replace(
+        graph,
+        nodes=(graph.nodes[0], changed_node, *graph.nodes[2:]),
+    )
+    assert changed_structure.architecture_hash != graph.architecture_hash
+
+    relabeled_edge = replace(graph.edges[0], kind=EdgeKind.RESIDUAL)
+    edge_label_only = replace(graph, edges=(relabeled_edge, *graph.edges[1:]))
+    assert edge_label_only.graph_hash != graph.graph_hash
+    assert edge_label_only.architecture_hash == graph.architecture_hash
+
+
+def test_architecture_hash_tracks_execution_metadata_but_not_axis_spelling():
+    graph = valid_graph(metadata={"max_sequence_length": 35})
+    longer_context = replace(graph, metadata={"max_sequence_length": 36})
+    assert longer_context.architecture_hash != graph.architecture_hash
+
+    def relabel(shape: TensorShape) -> TensorShape:
+        dimensions = list(shape.dimensions)
+        if shape.rank in {2, 3}:
+            dimensions[:2] = ["B", "T"]
+        return TensorShape(tuple(dimensions))
+
+    relabeled_axes = replace(
+        graph,
+        nodes=tuple(
+            replace(
+                node,
+                input_shapes=tuple(relabel(shape) for shape in node.input_shapes),
+                output_shape=relabel(node.output_shape),
+            )
+            for node in graph.nodes
+        ),
+    )
+    assert relabeled_axes.graph_hash != graph.graph_hash
+    assert relabeled_axes.architecture_hash == graph.architecture_hash
+    assert graph.architecture_hash_schema == ARCHITECTURE_HASH_SCHEMA
+
+
+def test_architecture_hash_materializes_interpreter_defaults():
+    graph = valid_graph(metadata={"max_sequence_length": 35})
+    explicit_defaults = replace(
+        graph,
+        nodes=tuple(
+            replace(node, attributes={**node.attributes, "bias": False})
+            if node.kind is PrimitiveKind.ATTENTION
+            else replace(
+                node,
+                attributes={**node.attributes, "bias": False, "tie_embedding": None},
+            )
+            if node.kind is PrimitiveKind.READOUT
+            else node
+            for node in graph.nodes
+        ),
+    )
+    assert explicit_defaults.graph_hash != graph.graph_hash
+    assert explicit_defaults.architecture_hash == graph.architecture_hash
+
+
+def test_architecture_hash_canonicalizes_executor_float_aliases():
+    graph = valid_graph(metadata={"max_sequence_length": 35})
+
+    def with_numeric_alias(value: int | float) -> ArchitectureGraph:
+        return replace(
+            graph,
+            nodes=tuple(
+                replace(
+                    node,
+                    attributes={**node.attributes, "epsilon": value},
+                )
+                if node.kind is PrimitiveKind.NORMALIZATION
+                else replace(
+                    node,
+                    kind=PrimitiveKind.ROUTING,
+                    attributes={"mechanism": "softmax_mix", "temperature": value},
+                )
+                if node.kind is PrimitiveKind.FEED_FORWARD
+                else node
+                for node in graph.nodes
+            ),
+        )
+
+    integer_spelling = with_numeric_alias(1)
+    float_spelling = with_numeric_alias(1.0)
+    assert integer_spelling.graph_hash != float_spelling.graph_hash
+    assert integer_spelling.architecture_hash == float_spelling.architecture_hash
 
 
 def test_parameter_count_is_metadata_not_a_validation_or_selection_objective():

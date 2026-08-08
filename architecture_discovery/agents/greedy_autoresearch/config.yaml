@@ -9,7 +9,7 @@ max_tokens: 16384
 timeout_seconds: 300
 retries: 2
 retry_delay_seconds: 3
-candidate_path: common/initial_candidate.py
+candidate_path: common/initial_candidate.ir.json
 ledger_path: outputs/raw/greedy_autoresearch.jsonl
 artifact_dir: outputs/raw/greedy_artifacts
 training:

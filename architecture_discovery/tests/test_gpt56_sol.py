@@ -4,7 +4,12 @@ from types import SimpleNamespace
 import pytest
 from openevolve.llm.openai import OpenAILLM
 
-from common.gpt56_sol import GPT56SolProfile, TARGET_MODEL
+from common.gpt56_sol import (
+    GPT56SolProfile,
+    OFFICIAL_OPENAI_API_BASE,
+    TARGET_MODEL,
+    resolve_provider_endpoint,
+)
 from common.openevolve_runner import _build_model_config
 
 
@@ -72,6 +77,62 @@ def test_profile_applies_explicit_gpt56_overrides():
     assert profile.timeout_seconds == 600
     assert profile.retries == 4
     assert profile.retry_delay_seconds == 5
+
+
+def test_scientific_profile_rejects_conflicting_environment_overrides():
+    with pytest.raises(ValueError, match="scientific generation settings are frozen"):
+        GPT56SolProfile.resolve(
+            model=TARGET_MODEL,
+            seed=17,
+            default_reasoning_effort="high",
+            default_max_completion_tokens=16384,
+            default_timeout_seconds=300,
+            default_retries=2,
+            default_retry_delay_seconds=3,
+            environ={"DISCOVERY_REQUEST_RETRIES": "4"},
+            allow_environment_overrides=False,
+        )
+
+
+def test_scientific_profile_accepts_matching_bound_environment_values():
+    profile = GPT56SolProfile.resolve(
+        model=TARGET_MODEL,
+        seed=17,
+        default_reasoning_effort="high",
+        default_max_completion_tokens=16384,
+        default_timeout_seconds=300,
+        default_retries=2,
+        default_retry_delay_seconds=3,
+        environ={"DISCOVERY_REQUEST_RETRIES": "2"},
+        allow_environment_overrides=False,
+    )
+
+    assert profile.retries == 2
+    assert profile.manifest_fields()["request_settings_source"] == (
+        "frozen_controller_configuration"
+    )
+
+
+def test_provider_endpoint_is_normalized_and_scientific_endpoint_is_frozen():
+    endpoint = resolve_provider_endpoint(
+        "HTTPS://API.OPENAI.COM/v1/",
+        scientific=True,
+    )
+
+    assert endpoint.base_url == OFFICIAL_OPENAI_API_BASE
+    assert endpoint.provider_identity == "openai_official"
+    assert "key" not in endpoint.manifest_fields()
+
+    with pytest.raises(ValueError, match="pinned to the official OpenAI API"):
+        resolve_provider_endpoint("https://proxy.example/v1", scientific=True)
+
+
+def test_provider_endpoint_rejects_embedded_secrets():
+    with pytest.raises(ValueError, match="may not contain credentials"):
+        resolve_provider_endpoint(
+            "https://user:secret@api.openai.com/v1",
+            scientific=False,
+        )
 
 
 def test_openevolve_adapter_sends_the_same_effective_gpt56_fields():

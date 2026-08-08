@@ -17,6 +17,11 @@ class CandidateRecord:
     seed: int
     candidate_id: str
     parent_id: str | None
+    # Candidate IDs may intentionally repeat for identical source. These IDs
+    # identify the unique lineage event and proposal opportunity instead.
+    lineage_record_id: str = ""
+    proposal_id: str = ""
+    parent_lineage_record_id: str | None = None
     inspiration_ids: list[str] = field(default_factory=list)
     proposal_text: str = ""
     mechanism_hypothesis: str = ""

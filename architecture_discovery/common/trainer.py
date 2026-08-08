@@ -29,8 +29,10 @@ from containment.policy import (
     assess_scientific_execution,
 )
 
-from common.candidate_contract import inspect_candidate_path, validate_candidate
-from common.candidate_loader import load_candidate
+from common.candidate_artifact import (
+    build_candidate_artifact,
+    inspect_candidate_artifact,
+)
 from common.device import (
     DeviceUnavailableError,
     mps_memory,
@@ -69,6 +71,63 @@ class TrainingNonfiniteError(RuntimeError):
 
 class ContainmentGateError(RuntimeError):
     pass
+
+
+class ReproducibilityBindingError(RuntimeError):
+    """Trusted code or an immutable run artifact no longer matches its identity."""
+
+
+def _enforce_training_wall_time(
+    elapsed_seconds: float,
+    profile: TrainingProfile,
+    *,
+    stage: str,
+) -> None:
+    """Fail closed whenever any evaluator-owned training work crosses its cap."""
+
+    if elapsed_seconds >= profile.maximum_wall_seconds:
+        raise TrainingTimeoutError(
+            f"candidate exceeded {profile.maximum_wall_seconds}s wall-time cap "
+            f"during {stage}"
+        )
+
+
+# Logical names, rather than absolute paths, are part of the stable component-set
+# identity.  Keep this list explicit: adding executable code to any trusted model,
+# training, or Layer-A evaluation path must be an intentional provenance change.
+TRUSTED_EXECUTABLE_COMPONENT_PATHS: tuple[tuple[str, Path], ...] = (
+    ("architecture_ir.__init__", ROOT / "architecture_ir" / "__init__.py"),
+    ("architecture_ir.codec", ROOT / "architecture_ir" / "codec.py"),
+    ("architecture_ir.graph", ROOT / "architecture_ir" / "graph.py"),
+    ("architecture_ir.interpreter", ROOT / "architecture_ir" / "interpreter.py"),
+    (
+        "architecture_ir.runtime_evidence",
+        ROOT / "architecture_ir" / "runtime_evidence.py",
+    ),
+    ("common.candidate_artifact", ROOT / "common" / "candidate_artifact.py"),
+    ("common.candidate_contract", ROOT / "common" / "candidate_contract.py"),
+    ("common.candidate_loader", ROOT / "common" / "candidate_loader.py"),
+    ("common.descriptor_extractor", ROOT / "common" / "descriptor_extractor.py"),
+    ("common.descriptor_schema", ROOT / "common" / "descriptor_schema.py"),
+    ("common.device", ROOT / "common" / "device.py"),
+    ("common.evaluation_profiles", ROOT / "common" / "evaluation_profiles.py"),
+    ("common.evaluator", ROOT / "common" / "evaluator.py"),
+    ("common.public_evaluation", ROOT / "common" / "public_evaluation.py"),
+    ("common.task_adapter", ROOT / "common" / "task_adapter.py"),
+    ("common.trainer", ROOT / "common" / "trainer.py"),
+    ("common.training_client", ROOT / "common" / "training_client.py"),
+    ("common.training_config", ROOT / "common" / "training_config.py"),
+    ("common.training_data", ROOT / "common" / "training_data.py"),
+    ("common.training_worker", ROOT / "common" / "training_worker.py"),
+    ("containment.audit", ROOT / "containment" / "audit.py"),
+    ("containment.policy", ROOT / "containment" / "policy.py"),
+    ("containment.source_scan", ROOT / "containment" / "source_scan.py"),
+    ("evaluation.records", ROOT / "evaluation" / "records.py"),
+    (
+        "scripts.training_worker_bootstrap",
+        ROOT / "scripts" / "training_worker_bootstrap.py",
+    ),
+)
 
 
 def sha256_file(path: str | Path) -> str:
@@ -167,18 +226,49 @@ def _dependency_lock_hash() -> str:
     return sha256_file(lock) if lock.exists() else ""
 
 
-def _controller_source_hash() -> str:
-    paths = [
-        Path(__file__),
-        ROOT / "common" / "evaluator.py",
-        ROOT / "common" / "task_adapter.py",
-        ROOT / "common" / "training_data.py",
-    ]
-    digest = hashlib.sha256()
-    for path in paths:
-        if path.exists():
-            digest.update(path.read_bytes())
-    return digest.hexdigest()
+def trusted_component_hashes() -> dict[str, str]:
+    """Return deterministic, reviewable hashes for the trusted execution path."""
+
+    components: dict[str, str] = {}
+    for logical_name, path in TRUSTED_EXECUTABLE_COMPONENT_PATHS:
+        if logical_name in components:  # pragma: no cover - source invariant
+            raise RuntimeError(f"duplicate trusted component name: {logical_name}")
+        if not path.is_file():
+            raise FileNotFoundError(f"trusted executable component is missing: {path}")
+        components[logical_name] = sha256_file(path)
+    return dict(sorted(components.items()))
+
+
+def trusted_component_set_sha256(
+    component_hashes: dict[str, str] | None = None,
+) -> str:
+    """Hash a named component set without depending on mapping insertion order."""
+
+    components = (
+        trusted_component_hashes()
+        if component_hashes is None
+        else dict(component_hashes)
+    )
+    normalized: dict[str, str] = {}
+    for name, digest in sorted(components.items()):
+        if not isinstance(name, str) or not name:
+            raise ValueError("trusted component names must be non-empty strings")
+        if (
+            not isinstance(digest, str)
+            or len(digest) != 64
+            or any(character not in "0123456789abcdef" for character in digest)
+        ):
+            raise ValueError(f"invalid SHA-256 for trusted component {name!r}")
+        normalized[name] = digest
+    encoded = json.dumps(
+        {
+            "schema": "trusted_executable_component_set_v1",
+            "components": normalized,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def training_manifest(
@@ -193,6 +283,9 @@ def training_manifest(
     allow_cpu_for_tests: bool,
     containment_audit: dict[str, Any],
     containment_decision: dict[str, Any],
+    candidate_format: CandidateFormat,
+    candidate_graph_hash: str | None,
+    component_hashes: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     mps_built = bool(
         hasattr(torch.backends, "mps") and torch.backends.mps.is_built()
@@ -206,10 +299,25 @@ def training_manifest(
         declared_machine = (
             yaml.safe_load(experiment_manifest_path.read_text()).get("machine", {})
         )
+    trusted_hashes = (
+        trusted_component_hashes()
+        if component_hashes is None
+        else dict(sorted(component_hashes.items()))
+    )
+    trusted_set_hash = trusted_component_set_sha256(trusted_hashes)
+    candidate_copy_name = (
+        "candidate_graph.json"
+        if candidate_format is CandidateFormat.ARCHITECTURE_IR
+        else "candidate_source.py"
+    )
     return {
         "created_at": _utc_now(),
         "candidate_path": str(candidate_path),
         "candidate_source_hash": candidate_hash,
+        "candidate_artifact_hash": candidate_hash,
+        "candidate_format": candidate_format.value,
+        "candidate_graph_hash": candidate_graph_hash,
+        "immutable_candidate_relative_path": candidate_copy_name,
         "candidate_initialization": "from_scratch",
         "profile": asdict(profile),
         "profile_hash": profile.profile_hash,
@@ -239,7 +347,11 @@ def training_manifest(
             "declared_machine": declared_machine,
         },
         "dependency_lock_hash": _dependency_lock_hash(),
-        "controller_source_hash": _controller_source_hash(),
+        "trusted_executable_component_hashes": trusted_hashes,
+        "trusted_component_set_sha256": trusted_set_hash,
+        # Backward-compatible name retained for existing evidence readers.  It
+        # now identifies the complete named set above, not an opaque file concat.
+        "controller_source_hash": trusted_set_hash,
         "parameter_count_role": "descriptive_metadata_only",
         "development_only_checkpoint_selection": profile.checkpoint_selection_rule,
         "scientific_limitations": (
@@ -394,7 +506,13 @@ def _checkpoint_payload(
     best_accuracy: float,
     best_loss: float,
     final_training_loss: float,
+    trusted_component_set_hash: str | None = None,
 ) -> dict[str, Any]:
+    component_set_hash = (
+        trusted_component_set_sha256()
+        if trusted_component_set_hash is None
+        else trusted_component_set_hash
+    )
     return {
         "checkpoint_kind": "trusted_resume_state_v1",
         "model_state": _cpu_copy(model.state_dict()),
@@ -414,6 +532,7 @@ def _checkpoint_payload(
         "task_adapter_hash": task.config_hash,
         "seed_bundle": asdict(seeds),
         "seed_bundle_hash": seeds.bundle_hash,
+        "trusted_component_set_sha256": component_set_hash,
         "rng_state": _rng_state(),
     }
 
@@ -429,9 +548,15 @@ def _best_evaluation_checkpoint_payload(
     examples_processed: int,
     best_accuracy: float,
     best_loss: float,
+    trusted_component_set_hash: str | None = None,
 ) -> dict[str, Any]:
     """Plain tensor/primitives-only checkpoint safe for ``weights_only=True``."""
 
+    component_set_hash = (
+        trusted_component_set_sha256()
+        if trusted_component_set_hash is None
+        else trusted_component_set_hash
+    )
     return {
         "checkpoint_kind": "best_evaluation_weights_v1",
         "model_state": _cpu_copy(model.state_dict()),
@@ -445,6 +570,7 @@ def _best_evaluation_checkpoint_payload(
         "task_adapter_hash": task.config_hash,
         "seed_bundle": asdict(seeds),
         "seed_bundle_hash": seeds.bundle_hash,
+        "trusted_component_set_sha256": component_set_hash,
     }
 
 
@@ -455,7 +581,13 @@ def _validate_resume(
     profile: TrainingProfile,
     task: FixedAdditionTask,
     seeds: TrainingSeedBundle,
+    trusted_component_set_hash: str | None = None,
 ) -> None:
+    expected_component_set_hash = (
+        trusted_component_set_sha256()
+        if trusted_component_set_hash is None
+        else trusted_component_set_hash
+    )
     expected = {
         "checkpoint_kind": "trusted_resume_state_v1",
         "candidate_source_hash": candidate_hash,
@@ -463,6 +595,7 @@ def _validate_resume(
         "task_adapter_version": task.version,
         "task_adapter_hash": task.config_hash,
         "seed_bundle_hash": seeds.bundle_hash,
+        "trusted_component_set_sha256": expected_component_set_hash,
     }
     mismatches = {
         key: {"expected": value, "observed": checkpoint.get(key)}
@@ -493,6 +626,7 @@ def _validate_resume(
         "task_adapter_hash",
         "seed_bundle",
         "seed_bundle_hash",
+        "trusted_component_set_sha256",
         "rng_state",
     }
     if set(checkpoint) != required_fields:
@@ -561,10 +695,10 @@ def validate_training_request(
     candidate = Path(candidate_path).resolve()
     if not candidate.is_file():
         raise FileNotFoundError(f"candidate does not exist: {candidate}")
-    source_contract = inspect_candidate_path(candidate)
-    if not source_contract.valid:
+    inspection = inspect_candidate_artifact(candidate)
+    if not inspection.valid:
         raise ValueError(
-            "candidate contract failed: " + "; ".join(source_contract.reasons)
+            "candidate contract failed: " + "; ".join(inspection.reasons)
         )
     profile.validate()
     selection = resolve_training_device(
@@ -576,9 +710,15 @@ def validate_training_request(
     containment_decision = assess_scientific_execution(
         containment_audit,
         ScientificExecutionRequest(
-            candidate_format=CandidateFormat.ARBITRARY_PYTHON,
+            candidate_format=inspection.candidate_format,
             requested_device=requested_device,
             scientific=profile.scientific,
+            ir_validated=(
+                inspection.candidate_format is CandidateFormat.ARCHITECTURE_IR
+            ),
+            trusted_ir_interpreter=(
+                inspection.candidate_format is CandidateFormat.ARCHITECTURE_IR
+            ),
             candidate_artifact_hash=sha256_file(candidate),
         ),
     )
@@ -621,9 +761,13 @@ def validate_training_request(
                 task=task,
                 seeds=seeds,
             )
+    component_hashes = trusted_component_hashes()
     return {
         "candidate": str(candidate),
         "candidate_source_hash": sha256_file(candidate),
+        "candidate_artifact_hash": sha256_file(candidate),
+        "candidate_format": inspection.candidate_format.value,
+        "candidate_graph_hash": inspection.graph_hash,
         "profile_name": profile.name,
         "profile_version": profile.version,
         "profile_hash": profile.profile_hash,
@@ -636,12 +780,18 @@ def validate_training_request(
         "hardware_matched": selection.hardware_matched,
         "containment_audit_hash": containment_audit.audit_hash,
         "containment_decision": containment_decision.to_dict(),
+        "trusted_executable_component_hashes": component_hashes,
+        "trusted_component_set_sha256": trusted_component_set_sha256(
+            component_hashes
+        ),
         "output_dir": str(resolved_output) if resolved_output else None,
         "resume": str(Path(resume).resolve()) if resume else None,
     }
 
 
 def _failure_stage(error: BaseException) -> str:
+    if isinstance(error, ReproducibilityBindingError):
+        return "reproducibility_binding"
     if isinstance(error, ContainmentGateError):
         return "containment_unproven"
     if isinstance(error, DeviceUnavailableError):
@@ -711,8 +861,11 @@ def train_candidate_in_process(
     model: torch.nn.Module | None = None
     optimizer: torch.optim.Optimizer | None = None
     result: TrainingResult | None = None
-    failure_error: BaseException | None = None
     current_stage = "candidate_contract"
+    candidate_format = CandidateFormat.ARBITRARY_PYTHON
+    candidate_graph_hash: str | None = None
+    component_hashes = trusted_component_hashes()
+    component_set_hash = trusted_component_set_sha256(component_hashes)
 
     try:
         if destination_is_symlink:
@@ -721,20 +874,28 @@ def train_candidate_in_process(
             )
         _prepare_output_directory(destination, resume_path)
         output_prepared = True
-        source_contract = inspect_candidate_path(candidate)
-        if not source_contract.valid:
+        inspection = inspect_candidate_artifact(candidate)
+        if not inspection.valid:
             raise ValueError(
-                "candidate contract failed: " + "; ".join(source_contract.reasons)
+                "candidate contract failed: " + "; ".join(inspection.reasons)
             )
+        candidate_format = inspection.candidate_format
+        candidate_graph_hash = inspection.graph_hash
         profile.validate()
 
         containment_audit = audit_runtime()
         containment_decision = assess_scientific_execution(
             containment_audit,
             ScientificExecutionRequest(
-                candidate_format=CandidateFormat.ARBITRARY_PYTHON,
+                candidate_format=candidate_format,
                 requested_device=requested_device,
                 scientific=profile.scientific,
+                ir_validated=(
+                    candidate_format is CandidateFormat.ARCHITECTURE_IR
+                ),
+                trusted_ir_interpreter=(
+                    candidate_format is CandidateFormat.ARCHITECTURE_IR
+                ),
                 candidate_artifact_hash=candidate_hash,
             ),
         )
@@ -750,6 +911,9 @@ def train_candidate_in_process(
             allow_cpu_for_tests=allow_cpu_for_tests,
             containment_audit=containment_audit.to_dict(),
             containment_decision=containment_decision.to_dict(),
+            candidate_format=candidate_format,
+            candidate_graph_hash=candidate_graph_hash,
+            component_hashes=component_hashes,
         )
         _atomic_json(destination / "training_manifest.json", manifest)
         event_path.touch(exist_ok=True)
@@ -777,9 +941,14 @@ def train_candidate_in_process(
                 profile=profile,
                 task=task,
                 seeds=seeds,
+                trusted_component_set_hash=component_set_hash,
             )
 
-        candidate_copy = destination / "candidate_source.py"
+        candidate_copy = destination / (
+            "candidate_graph.json"
+            if candidate_format is CandidateFormat.ARCHITECTURE_IR
+            else "candidate_source.py"
+        )
         if candidate_copy.exists():
             if sha256_file(candidate_copy) != candidate_hash:
                 raise ResumeMismatchError(
@@ -806,6 +975,9 @@ def train_candidate_in_process(
             allow_cpu_for_tests=allow_cpu_for_tests,
             containment_audit=containment_audit.to_dict(),
             containment_decision=containment_decision.to_dict(),
+            candidate_format=candidate_format,
+            candidate_graph_hash=candidate_graph_hash,
+            component_hashes=component_hashes,
         )
         _atomic_json(destination / "training_manifest.json", manifest)
 
@@ -815,18 +987,11 @@ def train_candidate_in_process(
         )
         dataloader_generator.manual_seed(seeds.dataloader_seed)
         current_stage = "model_initialization"
-        module = load_candidate(candidate_copy)
-        built = module.build_untrained_model(seeds.model_initialization_seed)
-        if not isinstance(built, tuple) or len(built) != 2:
-            raise TypeError(
-                "build_untrained_model(seed) must return (torch.nn.Module, metadata)"
-            )
-        model, _metadata = built
-        contract = validate_candidate(module, model)
-        if not contract.valid:
-            raise ValueError(
-                "candidate runtime contract failed: " + "; ".join(contract.reasons)
-            )
+        built = build_candidate_artifact(
+            candidate_copy,
+            seed=seeds.model_initialization_seed,
+        )
+        model = built.model
         parameter_count = sum(parameter.numel() for parameter in model.parameters())
         model = model.to(device=device, dtype=torch.float32)
 
@@ -871,10 +1036,7 @@ def train_candidate_in_process(
 
         while steps_completed < profile.max_steps:
             elapsed = prior_elapsed + (time.perf_counter() - trajectory_started)
-            if elapsed >= profile.maximum_wall_seconds:
-                raise TrainingTimeoutError(
-                    f"candidate exceeded {profile.maximum_wall_seconds}s wall-time cap"
-                )
+            _enforce_training_wall_time(elapsed, profile, stage="training_execution")
 
             optimizer.zero_grad(set_to_none=True)
             accumulated_loss = 0.0
@@ -914,10 +1076,7 @@ def train_candidate_in_process(
             examples_processed += profile.global_batch_size
             final_loss = accumulated_loss / profile.gradient_accumulation_steps
             elapsed = prior_elapsed + (time.perf_counter() - trajectory_started)
-            if elapsed >= profile.maximum_wall_seconds:
-                raise TrainingTimeoutError(
-                    f"candidate exceeded {profile.maximum_wall_seconds}s wall-time cap"
-                )
+            _enforce_training_wall_time(elapsed, profile, stage="training_execution")
 
             validation_loss: float | None = None
             validation_accuracy: float | None = None
@@ -964,10 +1123,19 @@ def train_candidate_in_process(
                         examples_processed=examples_processed,
                         best_accuracy=best_accuracy,
                         best_loss=best_loss,
+                        trusted_component_set_hash=component_set_hash,
                     )
                     _atomic_torch_save(best_path, best_payload)
                     checkpoint_decision = "best_development"
                 current_stage = "training_execution"
+                elapsed = prior_elapsed + (
+                    synchronized_time(device) - trajectory_started
+                )
+                _enforce_training_wall_time(
+                    elapsed,
+                    profile,
+                    stage="development_evaluation",
+                )
 
             memory = mps_memory(device)
             current_mps = memory["current"]
@@ -1015,12 +1183,26 @@ def train_candidate_in_process(
                     best_accuracy=best_accuracy,
                     best_loss=best_loss,
                     final_training_loss=final_loss,
+                    trusted_component_set_hash=component_set_hash,
                 )
                 _atomic_torch_save(latest_path, resume_payload)
                 current_stage = "training_execution"
+                elapsed = prior_elapsed + (
+                    synchronized_time(device) - trajectory_started
+                )
+                _enforce_training_wall_time(
+                    elapsed,
+                    profile,
+                    stage="checkpoint_write",
+                )
 
         train_seconds = prior_elapsed + (
             synchronized_time(device) - trajectory_started
+        )
+        _enforce_training_wall_time(
+            train_seconds,
+            profile,
+            stage="training_completion",
         )
         if not best_path.exists():
             raise OSError("training completed without a best development checkpoint")
@@ -1028,6 +1210,10 @@ def train_candidate_in_process(
             raise RuntimeError("candidate source copy changed during execution")
         if sha256_file(candidate) != candidate_hash:
             raise RuntimeError("original candidate source changed during execution")
+        if trusted_component_hashes() != component_hashes:
+            raise ReproducibilityBindingError(
+                "trusted executable components changed during training"
+            )
         checkpoint_hash = sha256_file(best_path)
         result = TrainingResult(
             success=True,
@@ -1068,7 +1254,6 @@ def train_candidate_in_process(
             cleanup_completed=False,
         )
     except BaseException as error:
-        failure_error = error
         train_seconds = max(0.0, time.perf_counter() - started)
         stage = (
             "candidate_contract"

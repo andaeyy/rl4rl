@@ -21,6 +21,7 @@ class SemanticArchive:
     signatures: dict[tuple[int, ...], set[str]] = field(
         default_factory=lambda: defaultdict(set)
     )
+    ineligible_programs: set[str] = field(default_factory=set)
 
     def add(self, program_id: str, metrics: dict[str, float], axes: Iterable[str]) -> None:
         selected = list(axes)
@@ -37,13 +38,20 @@ class SemanticArchive:
 
 def install_semantic_archive() -> None:
     """Patch OpenEvolve to keep categorical codes stable across a run."""
+    # The semantic wrapper must sit outside the validity gate so failed
+    # programs can be recorded as unknown without ever entering parent pools.
+    # Installing the inner policy here makes patch order deterministic for
+    # tests, offline tools, and native runners alike.
+    from common.openevolve_policy import install_validity_first_policy
     from openevolve.database import ProgramDatabase
 
+    install_validity_first_policy()
     if getattr(ProgramDatabase, "_semantic_archive_installed", False):
         return
 
     original_coords = ProgramDatabase._calculate_feature_coords
     original_exploration = ProgramDatabase._sample_exploration_parent
+    original_island_random = ProgramDatabase._sample_from_island_random
     original_add = ProgramDatabase.add
 
     def fixed_coords(self, program):
@@ -59,17 +67,17 @@ def install_semantic_archive() -> None:
             coordinates.append(max(0, min(bins - 1, code)))
         return coordinates
 
-    def rare_family_parent(self):
+    def rare_family_from_identifiers(self, identifiers):
         dimensions = self.config.feature_dimensions
-        if not dimensions or not all(name.startswith("semantic_") for name in dimensions):
-            return original_exploration(self)
         identifiers = [
             identifier
-            for identifier in self.islands[self.current_island]
+            for identifier in identifiers
             if identifier in self.programs
+            and self.programs[identifier].metrics.get("eligible_for_parent", 0.0)
+            >= 0.5
         ]
         if not identifiers:
-            return original_exploration(self)
+            return None
         counts = {
             name: Counter(
                 int(round(self.programs[identifier].metrics.get(name, 0.0)))
@@ -91,6 +99,30 @@ def install_semantic_archive() -> None:
             k=1,
         )[0]
 
+    def rare_family_parent(self):
+        dimensions = self.config.feature_dimensions
+        if not dimensions or not all(name.startswith("semantic_") for name in dimensions):
+            return original_exploration(self)
+        selected = rare_family_from_identifiers(
+            self,
+            self.islands[self.current_island],
+        )
+        return selected if selected is not None else original_exploration(self)
+
+    def rare_family_island_random(self, island_id):
+        dimensions = self.config.feature_dimensions
+        if not dimensions or not all(name.startswith("semantic_") for name in dimensions):
+            return original_island_random(self, island_id)
+        resolved_island = island_id % len(self.islands)
+        selected = rare_family_from_identifiers(
+            self,
+            self.islands[resolved_island],
+        )
+        return selected if selected is not None else original_island_random(
+            self,
+            resolved_island,
+        )
+
     def semantic_add(self, program, iteration=None, target_island=None):
         program_id = original_add(
             self,
@@ -105,13 +137,31 @@ def install_semantic_archive() -> None:
                 sidecar = SemanticArchive()
                 self.semantic_coverage = sidecar
             all_axes = list(SEMANTIC_METRIC_NAMES.values())
-            sidecar.add(program.id, program.metrics, all_axes)
+            coverage_eligible = (
+                program.metrics.get("eligible_for_parent", 0.0) >= 0.5
+            )
+            if not coverage_eligible:
+                # OpenEvolve itself may collapse an unexpected evaluator
+                # exception or timeout to {"error": 0.0}, bypassing the normal
+                # adapter. Keep that failure insertable and explicitly unknown.
+                for name in all_axes:
+                    program.metrics.setdefault(name, 0.0)
             values = [int(round(program.metrics[name])) for name in all_axes]
             program.metadata["semantic_signature"] = values
+            program.metadata["semantic_coverage_eligible"] = coverage_eligible
+            if coverage_eligible:
+                sidecar.add(program.id, program.metrics, all_axes)
+            else:
+                # Preserve the failed record without pretending that the
+                # all-unknown signature represents explored valid coverage.
+                sidecar.ineligible_programs.add(program.id)
+            if self.config.db_path:
+                self._save_program(program)
         return program_id
 
     ProgramDatabase._calculate_feature_coords = fixed_coords
     ProgramDatabase._sample_exploration_parent = rare_family_parent
+    ProgramDatabase._sample_from_island_random = rare_family_island_random
     ProgramDatabase.add = semantic_add
     ProgramDatabase._semantic_archive_installed = True
 

@@ -1,10 +1,14 @@
 import hashlib
 import json
+from dataclasses import replace
 from pathlib import Path
 
+import pytest
 import torch
 
 from common.evaluator import load_candidate
+from common.trainer import TrainingTimeoutError, _enforce_training_wall_time
+from common.training_config import SMOKE_TRAIN_V1
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -62,3 +66,12 @@ def test_cpu_smoke_is_marked_engineering_only(cpu_smoke_training):
     assert not result.scientific
     assert not result.hardware_matched
     assert manifest["scientific_limitations"]
+
+
+def test_wall_time_cap_applies_to_evaluator_owned_post_step_work():
+    profile = replace(SMOKE_TRAIN_V1, maximum_wall_seconds=2)
+    _enforce_training_wall_time(1.999, profile, stage="development_evaluation")
+    with pytest.raises(TrainingTimeoutError, match="development_evaluation"):
+        _enforce_training_wall_time(2.0, profile, stage="development_evaluation")
+    with pytest.raises(TrainingTimeoutError, match="checkpoint_write"):
+        _enforce_training_wall_time(3.0, profile, stage="checkpoint_write")

@@ -15,6 +15,13 @@ def test_readiness_audit_is_provider_free_and_fails_closed():
     assert not gates["principal_investigator_decisions"]["passed"]
     assert not gates["strong_candidate_containment"]["passed"]
     assert not gates["frozen_populated_reference_corpus"]["passed"]
+    assert not gates["recorded_unit_test_evidence"]["passed"]
+    assert not gates["recorded_offline_smoke_evidence"]["passed"]
+    assert "not bound to a source revision" in gates[
+        "recorded_unit_test_evidence"
+    ]["blockers"][0]
+    assert report["readiness_levels"]["unit_tested"] is False
+    assert report["readiness_levels"]["offline_smoke_tested"] is False
 
 
 def test_mps_receipt_rejects_integer_boolean_spoofing(tmp_path):

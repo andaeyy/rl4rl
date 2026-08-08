@@ -44,14 +44,23 @@ def _exact_bool(payload: dict[str, Any], field: str, expected: bool) -> None:
 def _validate_training_output(output_dir: Path) -> tuple[dict[str, Any], dict[str, Any]]:
     summary_path = output_dir / "training_summary.json"
     manifest_path = output_dir / "training_manifest.json"
-    candidate_path = output_dir / "candidate_source.py"
-    for path in (summary_path, manifest_path, candidate_path):
+    for path in (summary_path, manifest_path):
         if not path.is_file():
             raise FileNotFoundError(path)
     summary = json.loads(summary_path.read_text(encoding="utf-8"))
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     if not isinstance(summary, dict) or not isinstance(manifest, dict):
         raise ValueError("training summary and manifest must be JSON objects")
+    candidate_format = manifest.get("candidate_format", "arbitrary_python")
+    if candidate_format not in {"architecture_ir", "arbitrary_python"}:
+        raise ValueError("training manifest has an unsupported candidate_format")
+    candidate_path = output_dir / (
+        "candidate_graph.json"
+        if candidate_format == "architecture_ir"
+        else "candidate_source.py"
+    )
+    if not candidate_path.is_file():
+        raise FileNotFoundError(candidate_path)
 
     for field, expected in {
         "success": True,

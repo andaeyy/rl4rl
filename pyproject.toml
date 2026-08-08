@@ -29,6 +29,7 @@ packages = ["src/rl4rl"]
 
 [tool.pytest.ini_options]
 addopts = "-q"
+pythonpath = ["src"]
 testpaths = ["tests"]
 
 [tool.ruff]
@@ -37,4 +38,3 @@ target-version = "py311"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM"]
-

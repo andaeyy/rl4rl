@@ -1,12 +1,19 @@
 schema_name: scientific_readiness_evidence
 schema_version: "2"
 status: blocked
-updated_at_utc: "2026-08-01T00:26:11Z"
+updated_at_utc: "2026-08-08T00:36:21Z"
 note: >-
   Passing engineering tests does not authorize a paid pilot or main study. A
   gate is true only when its evidence identifies implemented, reproducible
-  behavior. Hardware, scientific-governance, and external-custody gates remain
-  deliberately false.
+  behavior. The positive engineering levels below are dated local self-reports,
+  not externally attested receipts. Hardware, scientific-governance, and
+  external-custody gates remain deliberately false.
+
+engineering_evidence_provenance:
+  authority: local_self_report
+  source_revision_bound: false
+  externally_attested: false
+  scientific_launch_authority: false
 
 levels:
   infrastructure_implemented:
@@ -14,19 +21,19 @@ levels:
     evidence: common engine, evaluation firewall, scientific packages, immutable ledger, reconstruction, and reporting code
   unit_tested:
     passed: true
-    evidence: .venv/bin/python -m pytest -q completed successfully with all 285 collected tests passing on 2026-08-01 UTC
+    evidence: local command PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -p no:cacheprovider -q completed successfully with all 421 collected tests passing on 2026-08-08 UTC; this result is not bound to a source revision or externally attested
   offline_smoke_tested:
     passed: true
-    evidence: C0-C3 plus the feedback-free no-search control completed and exactly resumed at /private/tmp/architecture-discovery-final-offline-20260731-v3; provider calls 0 and torch training runs 0
+    evidence: a dated local C0-C3 synthetic run completed at outputs/development/autonomous_pilot_validation/offline_engine with assignment hash 24840bee5689841d2a1f452496c2ceb587324b2047ebe3024d731b8df4af6127; all four named controller surfaces passed bounded full-document Architecture IR checks; the no-search stdout result was not retained and is not claimed by this evidence level
   mps_validated:
     passed: false
-    evidence: full_train_v1 has not completed in an MPS-available process
+    evidence: a live provider-backed one-opportunity Greedy canary and the four sequential 10-opportunity engineering runs under outputs/engineering_10x4 completed smoke_train_v1 on MPS with fallback disabled; all 40 opportunities terminated, all 44 seed/proposal trainings completed ten steps, and all runtime probes passed, but the artifacts are locally self-authored, all public smoke accuracies were 0.0, full_train_v1 has not completed, and engineering smoke cannot satisfy this scientific gate
   pilot_ready:
     passed: false
-    evidence: scripts/audit_scientific_readiness.py reports open launch gates
+    evidence: the host readiness audit remains blocked; the successful live IR-only MPS engineering canary and 10-by-4 mechanics run do not replace revision-bound test receipts, migration of the primary C0-C3 adapter, scientific decisions, frozen plans, or launch authorization
   pilot_validated:
     passed: false
-    evidence: no paid scientific pilot has run
+    evidence: the paid 10-by-4 run was explicitly non-scientific engineering work; no paid scientific pilot has run
   main_study_ready:
     passed: false
     evidence: pilot, frozen final analysis plan, and all launch gates are incomplete
@@ -64,10 +71,10 @@ gates:
     evidence: explicit A/B/C counts of at least 10000 are required; scientific values remain unresolved
   strong_candidate_containment:
     passed: false
-    evidence: actual candidate-bound macOS/MPS OS attestation or trusted IR execution is required
+    evidence: trusted IR execution is integrated for the four native harnesses, but the primary C0-C3 scientific engine still lacks a frozen IR-only candidate contract or candidate-bound macOS/MPS OS attestation
   transformer_runtime_validity:
-    passed: false
-    evidence: runtime probe exists, but no trusted IR interpreter is integrated with scientific evaluation records
+    passed: true
+    evidence: common/evaluator.py runs evaluator-owned runtime/metamorphic probes for interpreted IR candidates and retains a hash-linked Layer A runtime-validity artifact
   full_profile_mps_validation:
     passed: false
     evidence: full_train_v1 has not completed in an MPS-available process

@@ -898,10 +898,20 @@ def audit_readiness(
         output_dir = Path(output_dir_value).resolve()
         manifest_path = output_dir / "training_manifest.json"
         summary_path = output_dir / "training_summary.json"
-        candidate_path = output_dir / "candidate_source.py"
-        for path in (manifest_path, summary_path, candidate_path):
+        for path in (manifest_path, summary_path):
             if not path.is_file():
                 raise FileNotFoundError(path)
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        candidate_format = manifest.get("candidate_format", "arbitrary_python")
+        if candidate_format not in {"architecture_ir", "arbitrary_python"}:
+            raise ValueError("MPS evidence manifest has unsupported candidate_format")
+        candidate_path = output_dir / (
+            "candidate_graph.json"
+            if candidate_format == "architecture_ir"
+            else "candidate_source.py"
+        )
+        if not candidate_path.is_file():
+            raise FileNotFoundError(candidate_path)
         observed_hashes = {
             "training_manifest_hash": _sha256_file(manifest_path),
             "training_summary_hash": _sha256_file(summary_path),
@@ -1188,6 +1198,15 @@ def audit_readiness(
             raise ValueError(f"readiness level {level_name} is not passed")
         if not isinstance(record["evidence"], str) or not record["evidence"].strip():
             raise ValueError(f"readiness level {level_name} lacks evidence")
+        provenance = evidence_ledger.get("engineering_evidence_provenance")
+        if not isinstance(provenance, dict):
+            raise ValueError("engineering evidence lacks provenance")
+        if provenance.get("authority") != "local_self_report":
+            raise ValueError("engineering evidence authority is invalid")
+        if provenance.get("source_revision_bound") is not True:
+            raise ValueError("engineering evidence is not bound to a source revision")
+        if provenance.get("externally_attested") is not True:
+            raise ValueError("engineering evidence is not externally attested")
         return record["evidence"]
 
     results.append(
@@ -1215,7 +1234,6 @@ def audit_readiness(
         if result.gate not in main_only_gates
     )
     main_ready = all(result.passed for result in results)
-    recorded_levels = evidence_ledger.get("levels", {})
     passed_count = sum(result.passed for result in results)
     payload = {
         "schema_name": "ScientificReadinessAudit",
@@ -1234,19 +1252,10 @@ def audit_readiness(
                     "reproducibility_reporting_implementation",
                 )
             ),
-            "unit_tested": (
-                recorded_levels.get("unit_tested", {}).get("passed") is True
-                and type(
-                    recorded_levels.get("unit_tested", {}).get("passed")
-                ) is bool
-            ),
-            "offline_smoke_tested": (
-                recorded_levels.get("offline_smoke_tested", {}).get("passed")
-                is True
-                and type(
-                    recorded_levels.get("offline_smoke_tested", {}).get("passed")
-                ) is bool
-            ),
+            "unit_tested": by_name["recorded_unit_test_evidence"].passed,
+            "offline_smoke_tested": by_name[
+                "recorded_offline_smoke_evidence"
+            ].passed,
             "mps_validated": by_name["full_profile_mps_validation"].passed,
             "pilot_ready": pilot_ready,
             "pilot_validated": by_name["scientific_pilot_completed"].passed,

@@ -65,9 +65,28 @@ def require_bool(value: object, field_name: str) -> bool:
     return value
 
 
-def _probability(value: float, field_name: str) -> None:
-    if not math.isfinite(value) or not 0.0 <= value <= 1.0:
+def _finite_number(value: object, field_name: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{field_name} must be numeric")
+    converted = float(value)
+    if not math.isfinite(converted):
+        raise ValueError(f"{field_name} must be finite")
+    return converted
+
+
+def _probability(value: object, field_name: str) -> float:
+    converted = _finite_number(value, field_name)
+    if not 0.0 <= converted <= 1.0:
         raise ValueError(f"{field_name} must be finite and in [0, 1]")
+    return converted
+
+
+def _nonnegative_integer(value: object, field_name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{field_name} must be an integer")
+    if value < 0:
+        raise ValueError(f"{field_name} cannot be negative")
+    return value
 
 
 def _metric_pairs(
@@ -79,8 +98,7 @@ def _metric_pairs(
         if name in names:
             raise ValueError(f"duplicate {field_name} name {name!r}")
         names.add(name)
-        if not math.isfinite(value):
-            raise ValueError(f"{field_name} values must be finite")
+        _finite_number(value, f"{field_name} value")
 
 
 @dataclass(frozen=True)
@@ -234,6 +252,7 @@ class SearchEvaluationRecord:
     parameter_count_metadata: int = 0
     online_descriptor_codes: tuple[tuple[str, float], ...] = ()
     public_artifacts: tuple[ArtifactReference, ...] = ()
+    runtime_validity_artifact: ArtifactReference | None = None
 
     def __post_init__(self) -> None:
         self.envelope.validate(expected_schema="search_evaluation")
@@ -241,8 +260,10 @@ class SearchEvaluationRecord:
         _require_identifier(self.training_record_id, "training_record_id")
         _probability(self.public_accuracy, "public_accuracy")
         _probability(self.search_score, "search_score")
-        if self.parameter_count_metadata < 0:
-            raise ValueError("parameter_count_metadata cannot be negative")
+        _nonnegative_integer(
+            self.parameter_count_metadata,
+            "parameter_count_metadata",
+        )
         if self.eligible_for_parent and not (
             self.execution_ok and self.transformer_valid
         ):
@@ -252,6 +273,10 @@ class SearchEvaluationRecord:
         _metric_pairs(self.online_descriptor_codes, "online descriptor")
         for artifact in self.public_artifacts:
             artifact.validate(expected_layer=EvaluationLayer.SEARCH)
+        if self.runtime_validity_artifact is not None:
+            self.runtime_validity_artifact.validate(
+                expected_layer=EvaluationLayer.SEARCH
+            )
 
     def controller_view(self) -> ControllerSearchView:
         return ControllerSearchView(
@@ -282,7 +307,7 @@ class SearchEvaluationRecord:
 def search_evaluation_from_dict(payload: Mapping[str, Any]) -> SearchEvaluationRecord:
     """Reconstruct an exact Layer A record from an untrusted JSON object."""
 
-    allowed = {
+    required = {
         "envelope",
         "candidate_id",
         "training_record_id",
@@ -297,7 +322,8 @@ def search_evaluation_from_dict(payload: Mapping[str, Any]) -> SearchEvaluationR
         "online_descriptor_codes",
         "public_artifacts",
     }
-    if set(payload) != allowed:
+    optional = {"runtime_validity_artifact"}
+    if not required.issubset(payload) or set(payload).difference(required | optional):
         raise ValueError("Layer A worker response has unexpected or missing fields")
     envelope_value = payload["envelope"]
     if not isinstance(envelope_value, Mapping):
@@ -316,6 +342,17 @@ def search_evaluation_from_dict(payload: Mapping[str, Any]) -> SearchEvaluationR
         values = dict(item)
         values["layer"] = EvaluationLayer(values["layer"])
         artifacts.append(ArtifactReference(**values))
+    # ``runtime_validity_artifact`` was introduced as an optional additive v1
+    # field.  Accept records written before it existed instead of silently
+    # making old schema-v1 records unparsable.
+    runtime_artifact_value = payload.get("runtime_validity_artifact")
+    runtime_artifact: ArtifactReference | None = None
+    if runtime_artifact_value is not None:
+        if not isinstance(runtime_artifact_value, Mapping):
+            raise ValueError("runtime validity artifact must be an object or null")
+        runtime_values = dict(runtime_artifact_value)
+        runtime_values["layer"] = EvaluationLayer(runtime_values["layer"])
+        runtime_artifact = ArtifactReference(**runtime_values)
     return SearchEvaluationRecord(
         envelope=envelope,
         candidate_id=str(payload["candidate_id"]),
@@ -324,8 +361,8 @@ def search_evaluation_from_dict(payload: Mapping[str, Any]) -> SearchEvaluationR
         transformer_valid=require_bool(
             payload["transformer_valid"], "transformer_valid"
         ),
-        public_accuracy=float(payload["public_accuracy"]),
-        search_score=float(payload["search_score"]),
+        public_accuracy=_probability(payload["public_accuracy"], "public_accuracy"),
+        search_score=_probability(payload["search_score"], "search_score"),
         eligible_for_parent=require_bool(
             payload["eligible_for_parent"], "eligible_for_parent"
         ),
@@ -333,11 +370,19 @@ def search_evaluation_from_dict(payload: Mapping[str, Any]) -> SearchEvaluationR
         infrastructure_failure=require_bool(
             payload["infrastructure_failure"], "infrastructure_failure"
         ),
-        parameter_count_metadata=int(payload["parameter_count_metadata"]),
+        parameter_count_metadata=_nonnegative_integer(
+            payload["parameter_count_metadata"],
+            "parameter_count_metadata",
+        ),
         online_descriptor_codes=tuple(
-            (str(item[0]), float(item[1])) for item in descriptor_value
+            (
+                str(item[0]),
+                _finite_number(item[1], "online descriptor value"),
+            )
+            for item in descriptor_value
         ),
         public_artifacts=tuple(artifacts),
+        runtime_validity_artifact=runtime_artifact,
     )
 
 

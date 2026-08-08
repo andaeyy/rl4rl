@@ -1,0 +1,29 @@
+# Parent candidate
+
+Fitness: {fitness_score}
+Feature coordinates: {feature_coords}
+Focus areas inferred from public search feedback: {improvement_areas}
+
+{artifacts}
+
+# Search history
+
+{evolution_history}
+
+# Complete parent Architecture IR
+
+```json
+{current_program}
+```
+
+# Proposal opportunity
+
+Design one testable architectural mechanism intended to improve validity or
+public search accuracy. Return the complete replacement graph, not a patch.
+Preserve the fixed task-facing input and readout shapes. The response must be a
+single `json` code block containing only one strict JSON object; do not put any
+text before or after it. Put the short mechanism hypothesis in `metadata`.
+
+Use the complete parent document above as the structural example. Preserve all
+required top-level, node, edge, and task metadata fields while returning a
+fully connected, interpreter-valid replacement rather than an empty skeleton.

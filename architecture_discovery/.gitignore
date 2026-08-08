@@ -11,6 +11,9 @@ outputs/raw/
 outputs/*_seed_*/
 outputs/candidate_training/
 outputs/development/
+outputs/engineering_canary/
+outputs/engineering_10x4/
+outputs/validation/
 outputs/.candidate_training.lock
 
 # Local controller state.

@@ -1,0 +1,31 @@
+# Parent candidate
+
+Fitness: {fitness_score}
+Semantic feature coordinates: {feature_coords}
+Semantic dimensions: {feature_dimensions}
+Focus areas inferred from public search feedback: {improvement_areas}
+
+{artifacts}
+
+# Search history and diverse inspirations
+
+{evolution_history}
+
+# Complete parent Architecture IR
+
+```json
+{current_program}
+```
+
+# Proposal opportunity
+
+Design one testable mechanism that is meaningfully different from overrepresented
+semantic families while remaining a valid causal transformer graph. Return the
+complete replacement graph, not a patch. Preserve the fixed task-facing input
+and readout shapes. The response must be a single `json` code block containing
+only one strict JSON object; do not put any text before or after it. Put the
+short mechanism hypothesis and intended semantic family in `metadata`.
+
+Use the complete parent document above as the structural example. Preserve all
+required top-level, node, edge, and task metadata fields while returning a
+fully connected, interpreter-valid replacement rather than an empty skeleton.

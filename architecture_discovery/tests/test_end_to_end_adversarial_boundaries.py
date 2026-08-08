@@ -84,6 +84,27 @@ def test_untrusted_layer_a_boolean_strings_are_rejected_not_coerced() -> None:
         search_evaluation_from_dict(payload)
 
 
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    (
+        ("public_accuracy", True, "numeric"),
+        ("public_accuracy", "0.8", "numeric"),
+        ("search_score", "0.8", "numeric"),
+        ("parameter_count_metadata", False, "integer"),
+        ("parameter_count_metadata", 1.5, "integer"),
+    ),
+)
+def test_untrusted_layer_a_numeric_fields_are_not_coerced(
+    field: str,
+    value: object,
+    message: str,
+) -> None:
+    payload = _search_record().to_dict()
+    payload[field] = value
+    with pytest.raises(ValueError, match=message):
+        search_evaluation_from_dict(payload)
+
+
 def test_smoke_profile_cannot_be_relabelled_as_scientific_layer_b() -> None:
     with pytest.raises(ValueError, match="requires at least 10000 cases"):
         resolve_evaluation_plan(

@@ -44,6 +44,42 @@ def test_trained_candidate_returns_typed_public_layer_a_only(cpu_smoke_training)
     assert "sealed_metrics" not in record.to_dict()
 
 
+def test_training_failure_never_claims_runtime_transformer_validity(
+    cpu_smoke_training,
+):
+    training, _output = cpu_smoke_training
+    failed_training = replace(
+        training,
+        success=False,
+        failure_stage="training_timeout",
+        error="wall-time cap exceeded",
+    )
+    plan = resolve_evaluation_plan(
+        "smoke_eval_v1",
+        layer=EvaluationLayer.SEARCH,
+        case_source_id=PUBLIC_LAYER_A_SOURCE_ID,
+        case_source_sha256=PUBLIC_LAYER_A_SOURCE_SHA256,
+    )
+    record = evaluate_trained_candidate_in_process(
+        candidate_path="common/initial_candidate.py",
+        training=failed_training,
+        seeds=TrainingSeedBundle.from_run_seed(17),
+        requested_device="cpu",
+        allow_cpu_for_tests=True,
+        evaluation_plan=plan,
+        context=SearchEvaluationContext(
+            study_id="test-study",
+            block_id="test-block",
+            run_id="failed-run",
+            condition_id="C0",
+        ),
+        eligibility_threshold=0.0,
+    )
+    assert not record.execution_ok
+    assert not record.transformer_valid
+    assert not record.eligible_for_parent
+
+
 def test_scientific_candidate_evaluation_has_no_implicit_smoke_count(monkeypatch):
     monkeypatch.delenv("DISCOVERY_LAYER_A_CASES", raising=False)
     monkeypatch.delenv("DISCOVERY_SCIENTIFIC_DECISION_RECORD", raising=False)
@@ -81,3 +117,4 @@ def test_worker_round_trip_returns_exact_layer_a_record(tmp_path):
     assert record.envelope.study_id == "worker-test"
     assert record.execution_ok
     assert record.eligible_for_parent
+from dataclasses import replace

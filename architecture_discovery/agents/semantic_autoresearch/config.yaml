@@ -1,0 +1,43 @@
+condition: semantic_autoresearch
+iterations: 5
+seed: 1
+reasoning_effort: high
+temperature: null
+top_p: null
+max_tokens: 16384
+timeout_seconds: 300
+retries: 2
+retry_delay_seconds: 3
+candidate_path: common/initial_candidate.ir.json
+
+training:
+  profile: full_train_v1
+  profile_version: "1"
+  task_adapter: fixed_addition_v1
+  seed_derivation: sha256-v1
+  device: mps
+  allow_cpu_for_tests: false
+
+evaluation:
+  profile: scientific_layer_a_v1
+  case_count: null
+  eligibility_threshold: 0.99
+
+archive:
+  axes:
+    - semantic_token_representation
+    - semantic_positional_integration
+    - semantic_attention_projection
+    - semantic_attention_organization
+    - semantic_feedforward_mechanism
+    - semantic_normalization
+    - semantic_depth_topology
+    - semantic_output_readout
+    - semantic_tokenization
+  parent_policy: least_used_cell_then_accuracy
+  novelty_role: exploratory_coverage_tiebreak_only
+  require_parent_eligibility: true
+
+acceptance:
+  require_eligibility: true
+  use_parameter_count: false
