@@ -5,7 +5,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from common.evaluation_profiles import EvaluationLayer, EvaluationPlan
-from evaluation.records import QualificationEvaluationRecord, RecordEnvelope
+from evaluation.records import (
+    QualificationEvaluationRecord,
+    RecordEnvelope,
+    require_bool,
+)
+
 from sealed_eval.snapshot import FrozenRunSnapshot
 
 
@@ -14,6 +19,9 @@ class QualificationMeasurements:
     exact_match_accuracy: float
     metrics: tuple[tuple[str, float], ...] = ()
     complete: bool = True
+
+    def validate(self) -> None:
+        require_bool(self.complete, "qualification measurements complete")
 
 
 @dataclass(frozen=True)
@@ -24,7 +32,10 @@ class QualificationPolicy:
     def validate(self) -> None:
         if not 0.0 <= self.exact_match_threshold <= 1.0:
             raise ValueError("Layer B exact-match threshold must be in [0, 1]")
-        if not self.decision_record_id:
+        if (
+            not isinstance(self.decision_record_id, str)
+            or not self.decision_record_id.strip()
+        ):
             raise ValueError("Layer B policy requires a frozen decision record")
 
 
@@ -63,8 +74,9 @@ class LayerBQualificationRunner:
     ) -> QualificationEvaluationRecord:
         snapshot.validate(require_completed=True)
         snapshot.candidate(candidate_id)
+        measurements.validate()
         qualifies = (
-            measurements.complete
+            measurements.complete is True
             and measurements.exact_match_accuracy
             >= self._policy.exact_match_threshold
         )

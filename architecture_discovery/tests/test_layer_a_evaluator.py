@@ -1,3 +1,6 @@
+from dataclasses import replace
+
+import common.evaluator as evaluator_module
 from common.evaluation_profiles import EvaluationLayer, resolve_evaluation_plan
 from common.evaluator import (
     SearchEvaluationContext,
@@ -80,6 +83,46 @@ def test_training_failure_never_claims_runtime_transformer_validity(
     assert not record.eligible_for_parent
 
 
+def test_evaluator_cleanup_failure_is_an_infrastructure_failure(
+    cpu_smoke_training,
+    monkeypatch,
+):
+    training, _output = cpu_smoke_training
+    plan = resolve_evaluation_plan(
+        "smoke_eval_v1",
+        layer=EvaluationLayer.SEARCH,
+        case_source_id=PUBLIC_LAYER_A_SOURCE_ID,
+        case_source_sha256=PUBLIC_LAYER_A_SOURCE_SHA256,
+    )
+
+    def fail_cleanup(_device):
+        raise RuntimeError("sensitive-driver-detail")
+
+    monkeypatch.setattr(evaluator_module, "cleanup_accelerator", fail_cleanup)
+    record = evaluate_trained_candidate_in_process(
+        candidate_path="common/initial_candidate.py",
+        training=training,
+        seeds=TrainingSeedBundle.from_run_seed(17),
+        requested_device="cpu",
+        allow_cpu_for_tests=True,
+        evaluation_plan=plan,
+        context=SearchEvaluationContext(
+            study_id="test-study",
+            block_id="test-block",
+            run_id="cleanup-failure-run",
+            condition_id="C0",
+        ),
+        eligibility_threshold=0.0,
+    )
+
+    assert not record.execution_ok
+    assert not record.transformer_valid
+    assert not record.eligible_for_parent
+    assert record.failure_stage == "accelerator_cleanup_failure"
+    assert record.infrastructure_failure
+    assert "sensitive-driver-detail" not in str(record.to_dict())
+
+
 def test_scientific_candidate_evaluation_has_no_implicit_smoke_count(monkeypatch):
     monkeypatch.delenv("DISCOVERY_LAYER_A_CASES", raising=False)
     monkeypatch.delenv("DISCOVERY_SCIENTIFIC_DECISION_RECORD", raising=False)
@@ -117,4 +160,3 @@ def test_worker_round_trip_returns_exact_layer_a_record(tmp_path):
     assert record.envelope.study_id == "worker-test"
     assert record.execution_ok
     assert record.eligible_for_parent
-from dataclasses import replace

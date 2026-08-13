@@ -12,30 +12,52 @@
 
 ---
 
-## July 2026 implementation status
+## July 2026 implementation status (superseded execution snapshot)
 
-Evaluator-owned candidate training is now implemented: architecture candidates
-return a seeded, untrained CPU model; trusted code owns the fixed Phase-1 task
-adapter, deterministic public data, AdamW training, public-development
-checkpoint selection, strict MPS selection, resume hashes, and evaluator-owned
-decoding. The pretrained vendor checkpoint is isolated to a regression test.
+This section records the pre-Modal execution condition in the past tense. Its
+MPS-specific execution and evidence statements are superseded by the August
+2026 amendment immediately below; they are not current launch blockers.
 
-Generated candidates run in a credential-scrubbed subprocess, but this is not a
-complete filesystem or network sandbox. The common C0-C3 engine, typed Layer
-A/B/C firewall, comparable budget ledger, blocked randomization, sequential MPS
-scheduler, no-search control, novelty/mechanism/replication/statistics
+Evaluator-owned candidate training had been implemented: architecture
+candidates returned a seeded, untrained CPU model; trusted code owned the fixed
+Phase-1 task adapter, deterministic public data, AdamW training,
+public-development checkpoint selection, then-strict MPS selection, resume
+hashes, and evaluator-owned decoding. The pretrained vendor checkpoint was
+isolated to a regression test.
+
+Generated candidates ran in a credential-scrubbed subprocess, but this was not
+a complete filesystem or network sandbox. The common C0-C3 engine, typed Layer
+A/B/C firewall, comparable budget ledger, blocked randomization, then-sequential
+MPS scheduler, no-search control, novelty/mechanism/replication/statistics
 infrastructure, adversarial suite, immutable event ledger, reconstruction, and
-reporting are now implemented and offline-tested. Scientific execution remains
-blocked by the trusted IR/OS boundary, real MPS evidence, external artifact
-anchoring, frozen corpus/reviewer/policy artifacts, unresolved PI decisions,
-scientific no-search and Layer B orchestration, explicit PI authorization, and
-a completed pilot. Scientific receipts are exact-typed and cross-linked, but
-the external-anchor signature verifier is still an open gate. This
-implementation status does not authorize a paid run.
+reporting had been implemented and offline-tested. At that time, scientific
+execution remained blocked by the trusted IR/OS boundary, full-profile evidence
+on the then-canonical MPS condition, external artifact anchoring, frozen
+corpus/reviewer/policy artifacts, unresolved PI decisions, scientific no-search
+and Layer B orchestration, explicit PI authorization, and a completed pilot.
+Scientific receipts were exact-typed and cross-linked, but the external-anchor
+signature verifier remained an open gate. This historical implementation status
+does not authorize a paid run.
 
 Any later reference in this historical roadmap to an online "shadow" score is
 superseded: only public Layer A information may adapt search. Layer B is sealed
 post-run qualification, and Layer C is one-shot confirmation.
+
+## August 2026 execution-condition amendment
+
+Modal with NVIDIA CUDA is canonical for new remote engineering runs and the
+future scientific execution profile. `full_train_cuda_v2` and
+`smoke_train_cuda_v2` are new, separately hashed conditions; they do not reuse
+or imply equivalence with `full_train_v1` or `smoke_train_v1` on MPS. Active
+resource accounting and scheduling are accelerator-neutral and remain strictly
+sequential. Historical MPS records and receipts remain readable without hash
+rewriting.
+
+This amendment changes execution infrastructure only. It does not fill any PI
+decision, authorize paid provider work, prove arbitrary-Python containment, or
+relax the protocol, evaluation firewall, custody, external-anchor, pilot, or
+launch gates below. Live Modal CUDA validation and post-run cleanup evidence
+must be recorded before Modal infrastructure can be considered validated.
 
 ---
 

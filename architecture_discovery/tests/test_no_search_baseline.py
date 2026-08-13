@@ -2,6 +2,7 @@ from dataclasses import fields, replace
 
 import pytest
 
+from architecture_ir import validate_ir_candidate_json
 from baselines.no_search import (
     DeterministicFakeBackend,
     GeneratorBudgetMismatch,
@@ -13,7 +14,7 @@ from baselines.no_search import (
 from baselines.prompt_placebo import PromptPlaceboSpec
 from study.budget import BudgetExceeded, BudgetLedger, BudgetSpec, OpportunityOutcome
 from study.contracts import ConditionSpec
-from study.interfaces import ProposalContext
+from study.interfaces import ProposalContext, RetryableProviderError
 
 
 def _context(
@@ -94,7 +95,30 @@ def test_each_no_search_opportunity_is_independent_but_reproducible() -> None:
 
     assert first_results == second_results
     assert first_results[0].candidate_source != first_results[1].candidate_source
+    assert all(
+        result.candidate_source is not None
+        and validate_ir_candidate_json(result.candidate_source).valid
+        for result in first_results
+    )
     assert first_backend.requests[0].model_input == first_backend.requests[1].model_input
+
+
+def test_no_search_backend_failures_use_common_retry_accounting() -> None:
+    class FailingBackend:
+        is_test_double = False
+
+        def complete(self, _request):
+            raise TimeoutError("secret transport detail")
+
+    generator = NoSearchProposalGenerator(
+        spec=_spec(), backend=FailingBackend(), scientific=False
+    )
+
+    with pytest.raises(
+        RetryableProviderError,
+        match="no-search provider attempt failed: TimeoutError",
+    ):
+        generator.generate(_context())
 
 
 def test_fake_backend_cannot_be_used_for_a_scientific_run() -> None:

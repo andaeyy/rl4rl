@@ -1,8 +1,10 @@
 import json
+from dataclasses import asdict
+from pathlib import Path
 
 import pytest
 
-from study.contracts import ConditionId, StudySpec
+from study.contracts import ConditionId, RunSpec, StudySpec
 from study.randomization import generate_plan, load_or_create_plan
 
 
@@ -13,6 +15,16 @@ def test_blocked_randomization_is_complete_paired_and_unique(tmp_path) -> None:
     assert len(plan.blocks) == 4
     assert len({run.run_id for run in plan.runs}) == 16
     assert len({run.run_directory for run in plan.runs}) == 16
+    assert plan.schema_version == "2.0"
+    assert all(not Path(run.run_directory).is_absolute() for run in plan.runs)
+    assert all(run.run_directory == f"runs/{run.run_id}" for run in plan.runs)
+    assert all(
+        run.execution_directory
+        == (tmp_path / spec.study_id / "runs" / run.run_id).resolve()
+        for run in plan.runs
+    )
+    assert all("execution_root" not in asdict(run) for run in plan.runs)
+    assert all("_execution_root" not in asdict(run) for run in plan.runs)
     for block in plan.blocks:
         assert {run.condition.condition_id for run in block.runs} == set(ConditionId)
         assert len({run.run_seed for run in block.runs}) == 1
@@ -37,6 +49,61 @@ def test_frozen_plan_resume_preserves_bytes_hash_and_order(tmp_path) -> None:
     assert [run.condition.condition_id for run in second.runs] == [
         run.condition.condition_id for run in first.runs
     ]
+
+
+def test_v2_assignment_hash_is_portable_across_execution_roots(tmp_path) -> None:
+    spec = StudySpec.toy(study_id="portable-plan", study_seed=43)
+    first = generate_plan(spec, tmp_path / "executor-a")
+    second = generate_plan(spec, tmp_path / "executor-b")
+
+    assert first.to_dict() == second.to_dict()
+    assert first.assignment_hash == second.assignment_hash
+    assert first.runs[0].execution_directory != second.runs[0].execution_directory
+
+
+def test_v1_plan_round_trips_without_field_or_hash_rewrite(tmp_path) -> None:
+    spec = StudySpec.toy(study_id="legacy-plan", study_seed=47)
+    legacy = generate_plan(spec, tmp_path, schema_version="1.0")
+    payload = legacy.to_dict()
+    restored = type(legacy).from_dict(payload)
+
+    assert restored.to_dict() == payload
+    assert restored.assignment_hash == legacy.assignment_hash
+    assert all(Path(run.run_directory).is_absolute() for run in restored.runs)
+    assert all(
+        run.execution_directory == Path(run.run_directory) for run in restored.runs
+    )
+
+
+def test_v2_execution_directory_rejects_symlink_escape(tmp_path) -> None:
+    spec = StudySpec.toy(study_id="symlink-plan", study_seed=53)
+    plan = generate_plan(spec, tmp_path)
+    study_root = tmp_path / spec.study_id
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    study_root.mkdir()
+    (study_root / "runs").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="escapes"):
+        _ = plan.runs[0].execution_directory
+
+
+def test_v2_run_spec_rejects_parent_traversal(tmp_path) -> None:
+    spec = StudySpec.toy(study_id="traversal-plan", study_seed=59)
+    payload = generate_plan(spec, tmp_path).runs[0].to_dict()
+    payload["run_directory"] = "runs/../outside"
+
+    with pytest.raises(ValueError, match="canonical relative POSIX"):
+        RunSpec.from_dict(payload, execution_root=tmp_path / spec.study_id)
+
+
+def test_v2_run_spec_refuses_to_deserialize_an_execution_root(tmp_path) -> None:
+    spec = StudySpec.toy(study_id="serialized-root", study_seed=61)
+    payload = generate_plan(spec, tmp_path).runs[0].to_dict()
+    payload["execution_root"] = "/mnt/discovery/private"
+
+    with pytest.raises(ValueError, match="exact schema"):
+        RunSpec.from_dict(payload, execution_root=tmp_path / spec.study_id)
 
 
 def test_changed_study_spec_cannot_reuse_frozen_assignment(tmp_path) -> None:

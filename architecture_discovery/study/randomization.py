@@ -32,13 +32,17 @@ class RandomizationPlan:
     blocks: tuple[BlockSpec, ...]
     assignment_hash: str
     schema_name: str = field(default="RandomizationPlan", init=False)
-    schema_version: str = field(default="1.0", init=False)
+    schema_version: str = "2.0"
 
     def __post_init__(self) -> None:
         require_str(self.study_id, "study_id")
         require_str(self.study_spec_hash, "study_spec_hash")
         require_str(self.assignment_hash, "assignment_hash")
         require_int(self.randomization_seed, "randomization_seed")
+        if self.schema_version not in {"1.0", "2.0"}:
+            raise ValueError("unsupported RandomizationPlan schema version")
+        if any(block.schema_version != self.schema_version for block in self.blocks):
+            raise ValueError("plan and block schema versions differ")
 
     @property
     def runs(self) -> tuple[RunSpec, ...]:
@@ -61,11 +65,31 @@ class RandomizationPlan:
         }
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> RandomizationPlan:
+    def from_dict(
+        cls,
+        payload: dict[str, Any],
+        *,
+        execution_root: str | Path | None = None,
+    ) -> RandomizationPlan:
         if payload.get("schema_name") != "RandomizationPlan":
             raise ValueError("expected RandomizationPlan schema")
-        if payload.get("schema_version") != "1.0":
+        version = payload.get("schema_version")
+        if version not in {"1.0", "2.0"}:
             raise ValueError("unsupported RandomizationPlan schema version")
+        if version == "2.0":
+            expected = {
+                "schema_name",
+                "schema_version",
+                "study_id",
+                "study_spec_hash",
+                "randomization_seed",
+                "blocks",
+                "assignment_hash",
+            }
+            if set(payload) != expected:
+                raise ValueError(
+                    "v2 RandomizationPlan fields differ from the exact schema"
+                )
         plan = cls(
             study_id=require_str(payload["study_id"], "study_id"),
             study_spec_hash=require_str(
@@ -74,10 +98,14 @@ class RandomizationPlan:
             randomization_seed=require_int(
                 payload["randomization_seed"], "randomization_seed"
             ),
-            blocks=tuple(BlockSpec.from_dict(block) for block in payload["blocks"]),
+            blocks=tuple(
+                BlockSpec.from_dict(block, execution_root=execution_root)
+                for block in payload["blocks"]
+            ),
             assignment_hash=require_str(
                 payload["assignment_hash"], "assignment_hash"
             ),
+            schema_version=str(version),
         )
         plan.validate()
         return plan
@@ -109,10 +137,18 @@ class RandomizationPlan:
             raise ValueError("randomization-plan assignment hash mismatch")
 
 
-def generate_plan(spec: StudySpec, output_root: str | Path) -> RandomizationPlan:
+def generate_plan(
+    spec: StudySpec,
+    output_root: str | Path,
+    *,
+    schema_version: str = "2.0",
+) -> RandomizationPlan:
     """Generate a deterministic complete-block assignment without touching disk."""
 
     root = Path(output_root).resolve()
+    if schema_version not in {"1.0", "2.0"}:
+        raise ValueError("unsupported RandomizationPlan schema version")
+    execution_root = root / spec.study_id
     blocks: list[BlockSpec] = []
     for block_index in range(spec.block_count):
         block_seed = _derived_seed(spec.study_seed, "block", block_index)
@@ -142,7 +178,11 @@ def generate_plan(spec: StudySpec, output_root: str | Path) -> RandomizationPlan
                 },
                 length=16,
             )
-            run_directory = str(root / spec.study_id / "runs" / run_id)
+            run_directory = (
+                str(root / spec.study_id / "runs" / run_id)
+                if schema_version == "1.0"
+                else f"runs/{run_id}"
+            )
             row = {
                 "study_id": spec.study_id,
                 "block_id": block_id,
@@ -162,6 +202,10 @@ def generate_plan(spec: StudySpec, output_root: str | Path) -> RandomizationPlan
                     run_seed=run_seed,
                     run_directory=run_directory,
                     assignment_hash=content_hash(row),
+                    execution_root=(
+                        None if schema_version == "1.0" else execution_root
+                    ),
+                    schema_version=schema_version,
                 )
             )
         blocks.append(
@@ -171,6 +215,7 @@ def generate_plan(spec: StudySpec, output_root: str | Path) -> RandomizationPlan
                 block_index=block_index,
                 randomization_seed=block_seed,
                 runs=tuple(runs),
+                schema_version=schema_version,
             )
         )
     plan_payload = {
@@ -185,6 +230,7 @@ def generate_plan(spec: StudySpec, output_root: str | Path) -> RandomizationPlan
         randomization_seed=spec.study_seed,
         blocks=tuple(blocks),
         assignment_hash=content_hash(plan_payload),
+        schema_version=schema_version,
     )
     plan.validate()
     return plan
@@ -199,16 +245,41 @@ def load_or_create_plan(
     """Load an existing frozen table, or create it exactly once before execution."""
 
     destination = Path(plan_path)
-    expected = generate_plan(spec, output_root)
+    execution_root = Path(output_root).resolve() / spec.study_id
     if destination.exists():
-        plan = RandomizationPlan.from_dict(read_json(destination))
+        stored = read_json(destination)
+        stored_version = stored.get("schema_version")
+        expected = generate_plan(
+            spec,
+            output_root,
+            schema_version=str(stored_version),
+        )
+        plan = RandomizationPlan.from_dict(
+            stored,
+            execution_root=(
+                None if stored_version == "1.0" else execution_root
+            ),
+        )
     else:
+        expected = generate_plan(spec, output_root, schema_version="2.0")
         try:
             create_json_exclusive(destination, expected.to_dict())
             plan = expected
         except FileExistsError:
             # Another coordinator won the creation race. Its frozen bytes are authority.
-            plan = RandomizationPlan.from_dict(read_json(destination))
+            stored = read_json(destination)
+            stored_version = stored.get("schema_version")
+            expected = generate_plan(
+                spec,
+                output_root,
+                schema_version=str(stored_version),
+            )
+            plan = RandomizationPlan.from_dict(
+                stored,
+                execution_root=(
+                    None if stored_version == "1.0" else execution_root
+                ),
+            )
     if plan.study_id != spec.study_id:
         raise ValueError("frozen plan belongs to a different study")
     if plan.study_spec_hash != spec.spec_hash:

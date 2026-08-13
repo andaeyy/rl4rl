@@ -1,6 +1,4 @@
 from dataclasses import fields
-from pathlib import Path
-
 import pytest
 
 from common.evaluation_profiles import EvaluationLayer, resolve_evaluation_plan

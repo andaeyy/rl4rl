@@ -15,6 +15,9 @@ dependencies = [
 dev = [
     "pytest==8.4.1",
 ]
+modal = [
+    "modal==1.5.3",
+]
 
 [tool.uv.sources]
 openevolve = { path = "vendor/openevolve", editable = false }

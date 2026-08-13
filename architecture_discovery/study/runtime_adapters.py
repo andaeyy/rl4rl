@@ -2,8 +2,8 @@
 
 Importing this module performs no provider request and starts no training. The
 offline smoke uses ``study.fakes`` instead. Scientific execution remains
-subject to the explicit readiness, evaluation-profile, MPS, and containment
-gates in the called evaluator.
+subject to the explicit readiness, evaluation-profile, accelerator, and
+containment gates in the called evaluator.
 """
 
 from __future__ import annotations
@@ -11,14 +11,20 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
-from openevolve.utils.code_utils import apply_diff, extract_diffs
-
+from architecture_ir import encode_graph_json, validate_ir_candidate_json
+from architecture_ir.codec import MAX_IR_JSON_BYTES
 from common.evaluation_profiles import EvaluationLayer
-from common.evaluator import SearchEvaluationContext, evaluate_candidate
+from common.evaluator import (
+    SearchEvaluationContext,
+    evaluate_candidate,
+    file_hash,
+    validate_controller_view_binding,
+)
 from common.gpt56_sol import GPT56SolProfile
 from evaluation.artifacts import EvaluationArtifactRoots, JsonEvaluationArtifactStore
 from evaluation.records import SearchEvaluationRecord
@@ -36,25 +42,102 @@ class ScientificReadinessBlocked(RuntimeError):
     """A launch gate failed and the study must stop rather than charge a candidate."""
 
 
+class ArchitectureIRProposalError(ValueError):
+    """A provider response is not one complete, valid Architecture IR document."""
+
+
+_JSON_FENCE = re.compile(r"\A```json[ \t]*\r?\n(?P<body>.*)\r?\n```\Z", re.DOTALL)
+
+
+def canonicalize_architecture_ir(
+    text: str,
+    *,
+    require_hypothesis: bool,
+    allow_json_fence: bool = True,
+) -> str:
+    """Validate untrusted IR text and return the one canonical JSON encoding.
+
+    A provider may wrap its document in one exact ``json`` fence for transport
+    compatibility. No surrounding prose, additional fences, partial objects,
+    patches, or executable source are accepted.
+    """
+
+    if not isinstance(text, str):
+        raise TypeError("architecture IR proposal must be text")
+    if len(text.encode("utf-8")) > MAX_IR_JSON_BYTES:
+        raise ArchitectureIRProposalError(
+            f"architecture IR proposal exceeds {MAX_IR_JSON_BYTES} bytes"
+        )
+    stripped = text.strip()
+    if stripped.startswith("```") or stripped.endswith("```"):
+        match = _JSON_FENCE.fullmatch(stripped) if allow_json_fence else None
+        if match is None:
+            raise ArchitectureIRProposalError(
+                "architecture IR may use at most one exact json fence"
+            )
+        stripped = match.group("body")
+    elif "```" in stripped:
+        raise ArchitectureIRProposalError(
+            "architecture IR response contains an unexpected Markdown fence"
+        )
+    validation = validate_ir_candidate_json(stripped)
+    if not validation.valid or validation.graph is None:
+        issue_codes = sorted({issue.code for issue in validation.issues})
+        detail = ", ".join(issue_codes) or "unknown_validation_failure"
+        raise ArchitectureIRProposalError(
+            f"architecture IR candidate failed validation: {detail}"
+        )
+    if require_hypothesis:
+        hypothesis = validation.graph.metadata.get("mechanism_hypothesis")
+        if not isinstance(hypothesis, str) or not hypothesis.strip():
+            raise ArchitectureIRProposalError(
+                "architecture IR metadata.mechanism_hypothesis must be non-empty"
+            )
+    canonical = encode_graph_json(validation.graph)
+    if len(canonical.encode("utf-8")) > MAX_IR_JSON_BYTES:
+        raise ArchitectureIRProposalError(
+            f"canonical architecture IR exceeds {MAX_IR_JSON_BYTES} bytes"
+        )
+    return canonical
+
+
 class CandidateSourceStore:
-    """Immutable local source objects addressed by the engine's content hash."""
+    """Immutable canonical IR objects addressed by the engine's content hash."""
 
     def __init__(self, root: str | Path) -> None:
-        self.root = Path(root).resolve()
-        self.root.mkdir(parents=True, exist_ok=True)
+        requested_root = Path(root).expanduser()
+        if requested_root.is_symlink():
+            raise ValueError("candidate source-store root cannot be a symlink")
+        requested_root.mkdir(parents=True, exist_ok=True)
+        if requested_root.is_symlink() or not requested_root.is_dir():
+            raise ValueError("candidate source-store root must be a directory")
+        self.root = requested_root.resolve()
 
     def register(self, candidate_id: str, source: str) -> Path:
         if not candidate_id or any(character in candidate_id for character in "/\\\x00"):
             raise ValueError("candidate_id is not a safe source-store identifier")
-        destination = self.root / f"{candidate_id}.py"
-        payload = source.encode("utf-8")
+        canonical = canonicalize_architecture_ir(
+            source,
+            require_hypothesis=False,
+        )
+        if candidate_id != content_hash(canonical):
+            raise ValueError(
+                "candidate ID does not match the canonical architecture IR"
+            )
+        destination = self.root / f"{candidate_id}.json"
+        payload = canonical.encode("utf-8")
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
         try:
             descriptor = os.open(
                 destination,
-                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                flags,
                 0o400,
             )
         except FileExistsError:
+            if destination.is_symlink():
+                raise ValueError("candidate source object cannot be a symlink")
             if destination.read_bytes() != payload:
                 raise ValueError("candidate ID collided with different source")
             return destination
@@ -65,12 +148,16 @@ class CandidateSourceStore:
         return destination
 
     def put(self, source: str) -> tuple[str, Path]:
-        candidate_id = content_hash(source)
-        return candidate_id, self.register(candidate_id, source)
+        canonical = canonicalize_architecture_ir(
+            source,
+            require_hypothesis=True,
+        )
+        candidate_id = content_hash(canonical)
+        return candidate_id, self.register(candidate_id, canonical)
 
     def path(self, candidate_id: str) -> Path:
-        path = self.root / f"{candidate_id}.py"
-        if not path.is_file():
+        path = self.root / f"{candidate_id}.json"
+        if path.is_symlink() or not path.is_file():
             raise KeyError(f"candidate source {candidate_id!r} is unavailable")
         return path
 
@@ -107,10 +194,15 @@ class MatchedCausalProposalGenerator:
 
     def build_user_prompt(self, context: ProposalContext) -> str:
         slots = self._parent_slots(context)
-        rendered_slots = "\n\n".join(
-            f"PARENT SLOT {index + 1}:\n```python\n{source}\n```"
-            for index, source in enumerate(slots)
-        )
+        rendered: list[str] = []
+        for index, source in enumerate(slots):
+            if source == self.neutral_slot_text:
+                rendered.append(f"PARENT SLOT {index + 1}:\n{source}")
+            else:
+                rendered.append(
+                    f"PARENT SLOT {index + 1}:\n```json\n{source}\n```"
+                )
+        rendered_slots = "\n\n".join(rendered)
         designated_base = len(context.parent_ids)
         treatment_directive = (
             "Reconsider one abstract architectural assumption before proposing "
@@ -124,8 +216,8 @@ class MatchedCausalProposalGenerator:
                 raise ValueError("repair context lacks the failed response")
             proposal_directive = (
                 f"{treatment_directive} The previous response could not be parsed. "
-                "Repair only its SEARCH/REPLACE format without using evaluation "
-                "feedback. Previous response follows:\n"
+                "Repair only its complete Architecture IR JSON format without using "
+                "evaluation feedback. Previous response follows:\n"
                 f"{context.previous_response}"
             )
         else:
@@ -135,8 +227,10 @@ class MatchedCausalProposalGenerator:
             f"Designated mutation base: active parent slot {designated_base}.\n"
             f"Proposal directive: {proposal_directive}\n\n"
             f"{rendered_slots}\n\n"
-            "Return a short falsifiable mechanism hypothesis followed by "
-            "SEARCH/REPLACE blocks for the designated base."
+            "Return exactly one complete replacement architecture_tensor_graph "
+            "version 1.0 JSON object. Put a short falsifiable mechanism hypothesis "
+            "in metadata.mechanism_hypothesis. Return no Python, source diff, "
+            "Markdown prose, or executable content."
         )
 
     def generate(self, context: ProposalContext) -> ProposalResult:
@@ -156,11 +250,15 @@ class MatchedCausalProposalGenerator:
             ) from error
         response_text = response.choices[0].message.content or ""
         usage = response.usage
-        base_id = context.parent_ids[-1]
-        base_source = self.source_store.read(base_id)
         candidate_source: str | None = None
-        if extract_diffs(response_text):
-            candidate_source = apply_diff(base_source, response_text)
+        try:
+            candidate_source = canonicalize_architecture_ir(
+                response_text,
+                require_hypothesis=True,
+            )
+        except ArchitectureIRProposalError:
+            candidate_source = None
+        if candidate_source is not None:
             generated_id, _ = self.source_store.put(candidate_source)
             if generated_id != content_hash(candidate_source):
                 raise RuntimeError("candidate source store changed the engine identity")
@@ -282,6 +380,8 @@ class LayerACandidateEvaluator:
         label: str,
     ) -> EvaluationResult:
         training_dir = self.output_root / "candidate_training" / label
+        artifact_digest = file_hash(source_path)
+        context = self._context()
         record = self.evaluate_function(
             source_path,
             training_profile=self.training_profile,
@@ -293,12 +393,17 @@ class LayerACandidateEvaluator:
             evaluation_case_count=self.evaluation_case_count,
             pi_decision_record_id=self.pi_decision_record_id,
             eligibility_threshold=self.eligibility_threshold,
-            context=self._context(),
+            context=context,
+        )
+        validate_controller_view_binding(
+            record.controller_view(),
+            candidate_source_hash=artifact_digest,
+            context=context,
         )
         self._artifact_store.write_json(record.envelope.record_id, record.to_dict())
         attempts, steps, examples, seconds = self._training_resources(
             training_dir,
-            expected_candidate_hash=candidate_id,
+            expected_candidate_hash=artifact_digest,
             expected_profile_name=self.training_profile,
         )
         if record.failure_stage in {
@@ -322,7 +427,8 @@ class LayerACandidateEvaluator:
             training_attempts=attempts,
             training_steps=steps,
             training_examples=examples,
-            mps_seconds=seconds,
+            accelerator_kind=self.device,
+            accelerator_seconds=seconds,
             evaluation_cases=(self.evaluation_case_count if record.execution_ok else 0),
             failure_stage=record.failure_stage,
         )
@@ -345,10 +451,16 @@ class LayerACandidateEvaluator:
         opportunity_index: int,
         run_seed: int,
     ) -> EvaluationResult:
-        expected = content_hash(candidate_source)
+        canonical = canonicalize_architecture_ir(
+            candidate_source,
+            require_hypothesis=True,
+        )
+        if candidate_source != canonical:
+            raise ValueError("engine candidate source must already be canonical IR")
+        expected = content_hash(canonical)
         if candidate_id != expected:
             raise ValueError("engine candidate ID does not match candidate source")
-        source_path = self.source_store.register(candidate_id, candidate_source)
+        source_path = self.source_store.register(candidate_id, canonical)
         return self._run(
             candidate_id=candidate_id,
             source_path=source_path,

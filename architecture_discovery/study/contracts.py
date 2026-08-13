@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field, fields as dataclass_fields
+from dataclasses import InitVar, dataclass, field, fields as dataclass_fields
 from datetime import UTC, datetime
 from enum import StrEnum
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, ClassVar
 
 from study.budget import BudgetSpec
@@ -261,10 +261,15 @@ class RunSpec:
     run_seed: int
     run_directory: str
     assignment_hash: str
+    execution_root: InitVar[str | Path | None] = None
     schema_name: str = field(default="RunSpec", init=False)
-    schema_version: str = field(default="1.0", init=False)
+    schema_version: str = "2.0"
 
-    def __post_init__(self) -> None:
+    def __post_init__(self, execution_root: str | Path | None) -> None:
+        resolved_execution_root = (
+            None if execution_root is None else Path(execution_root)
+        )
+        object.__setattr__(self, "_execution_root", resolved_execution_root)
         for field_name in (
             "study_id",
             "block_id",
@@ -277,10 +282,50 @@ class RunSpec:
         require_int(self.run_seed, "run_seed")
         if self.order_index < 0:
             raise ValueError("order_index cannot be negative")
-        if not Path(self.run_directory).is_absolute():
-            raise ValueError("run_directory must be absolute")
+        if self.schema_version == "1.0":
+            if not Path(self.run_directory).is_absolute():
+                raise ValueError("v1 run_directory must be absolute")
+        elif self.schema_version == "2.0":
+            logical = PurePosixPath(self.run_directory)
+            if (
+                logical.is_absolute()
+                or logical.as_posix() != self.run_directory
+                or not logical.parts
+                or any(part in {"", ".", ".."} for part in logical.parts)
+            ):
+                raise ValueError(
+                    "v2 run_directory must be a canonical relative POSIX path"
+                )
+            if resolved_execution_root is not None:
+                root = resolved_execution_root
+                if not root.is_absolute():
+                    raise ValueError("execution_root must be absolute when provided")
+        else:
+            raise ValueError("unsupported RunSpec schema version")
         if not self.assignment_hash:
             raise ValueError("assignment_hash cannot be empty")
+
+    @property
+    def execution_directory(self) -> Path:
+        """Resolve the executor-only location without serializing it.
+
+        Historical v1 assignments already contain an absolute directory. New
+        v2 assignments contain only a portable logical path and must be bound
+        to an absolute execution root by the process that loaded them.
+        """
+
+        if self.schema_version == "1.0":
+            return Path(self.run_directory)
+        execution_root = getattr(self, "_execution_root", None)
+        if execution_root is None:
+            raise ValueError("v2 RunSpec is not bound to an execution_root")
+        root = Path(execution_root).resolve()
+        resolved = (root / PurePosixPath(self.run_directory)).resolve()
+        try:
+            resolved.relative_to(root)
+        except ValueError as error:  # Defensive even after lexical validation.
+            raise ValueError("run_directory escapes its execution_root") from error
+        return resolved
 
     def assignment_payload(self) -> dict[str, Any]:
         return {
@@ -302,11 +347,32 @@ class RunSpec:
         }
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> RunSpec:
+    def from_dict(
+        cls,
+        payload: dict[str, Any],
+        *,
+        execution_root: str | Path | None = None,
+    ) -> RunSpec:
         if payload.get("schema_name") != "RunSpec":
             raise ValueError("expected RunSpec schema")
-        if payload.get("schema_version") != "1.0":
+        version = payload.get("schema_version")
+        if version not in {"1.0", "2.0"}:
             raise ValueError("unsupported RunSpec schema version")
+        if version == "2.0":
+            expected = {
+                "schema_name",
+                "schema_version",
+                "study_id",
+                "block_id",
+                "run_id",
+                "condition",
+                "order_index",
+                "run_seed",
+                "run_directory",
+                "assignment_hash",
+            }
+            if set(payload) != expected:
+                raise ValueError("v2 RunSpec fields differ from the exact schema")
         return cls(
             study_id=require_str(payload["study_id"], "study_id"),
             block_id=require_str(payload["block_id"], "block_id"),
@@ -318,6 +384,10 @@ class RunSpec:
             assignment_hash=require_str(
                 payload["assignment_hash"], "assignment_hash"
             ),
+            execution_root=(
+                None if execution_root is None else Path(execution_root).resolve()
+            ),
+            schema_version=str(version),
         )
 
 
@@ -329,7 +399,7 @@ class BlockSpec:
     randomization_seed: int
     runs: tuple[RunSpec, ...]
     schema_name: str = field(default="BlockSpec", init=False)
-    schema_version: str = field(default="1.0", init=False)
+    schema_version: str = "2.0"
 
     def __post_init__(self) -> None:
         require_str(self.study_id, "study_id")
@@ -346,6 +416,10 @@ class BlockSpec:
             raise ValueError("run order indices must be contiguous within a block")
         if any(run.block_id != self.block_id for run in self.runs):
             raise ValueError("run refers to a different block")
+        if self.schema_version not in {"1.0", "2.0"}:
+            raise ValueError("unsupported BlockSpec schema version")
+        if any(run.schema_version != self.schema_version for run in self.runs):
+            raise ValueError("block and run schema versions differ")
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -359,11 +433,29 @@ class BlockSpec:
         }
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> BlockSpec:
+    def from_dict(
+        cls,
+        payload: dict[str, Any],
+        *,
+        execution_root: str | Path | None = None,
+    ) -> BlockSpec:
         if payload.get("schema_name") != "BlockSpec":
             raise ValueError("expected BlockSpec schema")
-        if payload.get("schema_version") != "1.0":
+        version = payload.get("schema_version")
+        if version not in {"1.0", "2.0"}:
             raise ValueError("unsupported BlockSpec schema version")
+        if version == "2.0":
+            expected = {
+                "schema_name",
+                "schema_version",
+                "study_id",
+                "block_id",
+                "block_index",
+                "randomization_seed",
+                "runs",
+            }
+            if set(payload) != expected:
+                raise ValueError("v2 BlockSpec fields differ from the exact schema")
         return cls(
             study_id=require_str(payload["study_id"], "study_id"),
             block_id=require_str(payload["block_id"], "block_id"),
@@ -371,7 +463,11 @@ class BlockSpec:
             randomization_seed=require_int(
                 payload["randomization_seed"], "randomization_seed"
             ),
-            runs=tuple(RunSpec.from_dict(run) for run in payload["runs"]),
+            runs=tuple(
+                RunSpec.from_dict(run, execution_root=execution_root)
+                for run in payload["runs"]
+            ),
+            schema_version=str(version),
         )
 
 
@@ -391,11 +487,13 @@ class RunState:
     active_opportunity: dict[str, Any] | None
     terminal_opportunities: list[dict[str, Any]]
     ledger: dict[str, Any]
+    remote_call_id: str | None = None
+    artifact_location: str | None = None
     state_revision: int = 0
     created_at: str = field(default_factory=utc_now)
     updated_at: str = field(default_factory=utc_now)
     schema_name: str = field(default="RunState", init=False)
-    schema_version: str = field(default="1.0", init=False)
+    schema_version: str = field(default="2.0", init=False)
 
     def __post_init__(self) -> None:
         for field_name in (
@@ -436,22 +534,67 @@ class RunState:
             raise ValueError("terminal_opportunities must be a list of objects")
         if not isinstance(self.ledger, dict):
             raise ValueError("ledger must be an object")
+        for field_name in ("remote_call_id", "artifact_location"):
+            value = getattr(self, field_name)
+            if value is not None:
+                require_str(value, field_name)
+                if not value:
+                    raise ValueError(f"{field_name} cannot be empty")
 
     def to_dict(self) -> dict[str, Any]:
-        return json_value(self)
+        payload = {
+            "schema_name": self.schema_name,
+            "schema_version": self.schema_version,
+            "study_id": self.study_id,
+            "block_id": self.block_id,
+            "run_id": self.run_id,
+            "condition_id": self.condition_id,
+            "assignment_hash": self.assignment_hash,
+            "status": self.status,
+            "initial_candidate_id": self.initial_candidate_id,
+            "incumbent_id": self.incumbent_id,
+            "portfolio_ids": self.portfolio_ids,
+            "seed_evaluation": self.seed_evaluation,
+            "next_opportunity": self.next_opportunity,
+            "active_opportunity": self.active_opportunity,
+            "terminal_opportunities": self.terminal_opportunities,
+            "ledger": self.ledger,
+            "state_revision": self.state_revision,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+        }
+        if self.schema_version == "1.0":
+            return json_value(payload)
+        if self.schema_version != "2.0":
+            raise ValueError("unsupported RunState schema version")
+        payload["remote_call_id"] = self.remote_call_id
+        payload["artifact_location"] = self.artifact_location
+        return json_value(payload)
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> RunState:
         if payload.get("schema_name") != "RunState":
             raise ValueError("expected RunState schema")
-        if payload.get("schema_version") != "1.0":
+        version = payload.get("schema_version")
+        if version not in {"1.0", "2.0"}:
             raise ValueError("unsupported RunState schema version")
         init_names = {item.name for item in dataclass_fields(cls) if item.init}
-        expected_names = init_names | {"schema_name", "schema_version"}
+        if version == "1.0":
+            serialized_init_names = init_names - {
+                "remote_call_id",
+                "artifact_location",
+            }
+        else:
+            serialized_init_names = init_names
+        expected_names = serialized_init_names | {"schema_name", "schema_version"}
         if set(payload) != expected_names:
             missing = sorted(expected_names - set(payload))
             extra = sorted(set(payload) - expected_names)
             raise ValueError(
                 f"invalid RunState fields; missing={missing}, extra={extra}"
             )
-        return cls(**{name: payload[name] for name in init_names})
+        values = {name: payload[name] for name in serialized_init_names}
+        result = cls(**values)
+        if version == "1.0":
+            result.schema_version = "1.0"
+        return result

@@ -16,9 +16,15 @@ from common.gpt56_sol import TARGET_MODEL
 
 
 def main() -> None:
-    requested_device = os.environ.get("DISCOVERY_TRAIN_DEVICE", "mps")
+    requested_device = os.environ.get("DISCOVERY_TRAIN_DEVICE", "cuda")
     mps_available = torch.backends.mps.is_available()
-    if requested_device == "mps" and mps_available:
+    cuda_available = torch.cuda.is_available()
+    cuda_device_count = int(torch.cuda.device_count())
+    if requested_device.startswith("cuda") and cuda_available:
+        device_status = "cuda_ready"
+    elif requested_device.startswith("cuda"):
+        device_status = "cuda_unavailable_no_fallback"
+    elif requested_device == "mps" and mps_available:
         device_status = "mps_ready"
     elif requested_device == "mps":
         device_status = "mps_unavailable_no_fallback"
@@ -39,6 +45,27 @@ def main() -> None:
         ),
         "mps_built": torch.backends.mps.is_built(),
         "mps_available": mps_available,
+        "cuda_runtime": torch.version.cuda,
+        "cuda_available": cuda_available,
+        "cuda_device_count": cuda_device_count,
+        "cuda_devices": [
+            {
+                "index": index,
+                "name": torch.cuda.get_device_name(index),
+                "compute_capability": ".".join(
+                    str(part) for part in torch.cuda.get_device_capability(index)
+                ),
+                "total_memory_bytes": int(
+                    torch.cuda.get_device_properties(index).total_memory
+                ),
+            }
+            for index in range(cuda_device_count)
+        ]
+        if cuda_available
+        else [],
+        "cublas_workspace_config": os.environ.get(
+            "CUBLAS_WORKSPACE_CONFIG", "unset"
+        ),
         "generation": {
             "target_model": TARGET_MODEL,
             "configured_model": os.environ.get("DISCOVERY_MODEL"),

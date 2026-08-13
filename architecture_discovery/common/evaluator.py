@@ -19,33 +19,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 
 import torch
-
 from architecture_ir import probe_runtime_validity
-from common.candidate_artifact import (
-    build_candidate_artifact,
-    inspect_candidate_artifact,
-)
-from common.candidate_loader import load_candidate  # noqa: F401 - public compatibility
-from common.descriptor_extractor import extract_descriptors, extract_ir_descriptors
-from common.device import resolve_training_device, synchronize
-from common.evaluation_profiles import (
-    EvaluationLayer,
-    EvaluationPlan,
-    resolve_evaluation_plan,
-)
-from common.public_evaluation import (
-    PUBLIC_LAYER_A_SOURCE_ID,
-    PUBLIC_LAYER_A_SOURCE_SHA256,
-    public_search_cases,
-)
-from common.task_adapter import DEFAULT_TASK
-from common.training_client import WorkerError, run_worker_job
-from common.training_config import TrainingResult, TrainingSeedBundle, get_training_profile
-from common.trainer import (
-    trusted_component_hashes,
-    trusted_component_set_sha256,
-    validate_training_request,
-)
 from containment.audit import audit_runtime
 from containment.policy import (
     CandidateFormat,
@@ -63,6 +37,36 @@ from evaluation.records import (
     search_evaluation_from_dict,
 )
 
+from common.candidate_artifact import (
+    build_candidate_artifact,
+    inspect_candidate_artifact,
+)
+from common.candidate_loader import load_candidate  # noqa: F401 - public compatibility
+from common.descriptor_extractor import extract_descriptors, extract_ir_descriptors
+from common.device import cleanup_accelerator, resolve_training_device
+from common.evaluation_profiles import (
+    EvaluationLayer,
+    EvaluationPlan,
+    resolve_evaluation_plan,
+)
+from common.public_evaluation import (
+    PUBLIC_LAYER_A_SOURCE_ID,
+    PUBLIC_LAYER_A_SOURCE_SHA256,
+    public_search_cases,
+)
+from common.task_adapter import DEFAULT_TASK
+from common.trainer import (
+    _dependency_lock_hash,
+    trusted_component_hashes,
+    trusted_component_set_sha256,
+    validate_training_request,
+)
+from common.training_client import WorkerError, run_worker_job
+from common.training_config import (
+    TrainingResult,
+    TrainingSeedBundle,
+    get_training_profile,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 INFRASTRUCTURE_FAILURE_STAGES = {
@@ -70,6 +74,11 @@ INFRASTRUCTURE_FAILURE_STAGES = {
     "checkpoint_resume_mismatch",
     "containment_unproven",
     "device_unavailable",
+    "accelerator_cleanup_failure",
+    "cuda_unavailable",
+    "cuda_driver_failure",
+    "cuda_deterministic_kernel_unavailable",
+    "modal_infrastructure_failure",
     "training_oom",
     "training_timeout",
     "unsupported_operation",
@@ -88,7 +97,7 @@ class SearchEvaluationContext:
     condition_id: str
 
     @classmethod
-    def development(cls) -> "SearchEvaluationContext":
+    def development(cls) -> SearchEvaluationContext:
         return cls(
             study_id="development-only",
             block_id="development-block",
@@ -123,16 +132,48 @@ def file_hash(path: str | Path) -> str:
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
-def _training_manifest_hash(training: TrainingResult) -> str | None:
+def _resolve_training_artifact_path(
+    relative_or_absolute: str,
+    *,
+    artifact_root: str | Path | None,
+    expected_name: str,
+) -> Path | None:
+    if not relative_or_absolute:
+        return None
+    raw = Path(relative_or_absolute).expanduser()
+    if raw.is_absolute():
+        candidate = raw
+    else:
+        if artifact_root is None or len(raw.parts) != 1:
+            return None
+        candidate = Path(artifact_root).resolve() / raw
+    if candidate.is_symlink():
+        return None
+    resolved = candidate.resolve()
+    if resolved.name != expected_name:
+        return None
+    if artifact_root is not None:
+        root = Path(artifact_root).resolve()
+        if resolved.parent != root:
+            return None
+    return resolved
+
+
+def _training_manifest_hash(
+    training: TrainingResult,
+    *,
+    artifact_root: str | Path | None = None,
+) -> str | None:
     """Return the colocated manifest hash without trusting arbitrary paths."""
 
     if not training.event_log_path:
         return None
-    raw_event_path = Path(training.event_log_path).expanduser()
-    if raw_event_path.is_symlink():
-        return None
-    event_path = raw_event_path.resolve()
-    if event_path.name != "training_events.jsonl":
+    event_path = _resolve_training_artifact_path(
+        training.event_log_path,
+        artifact_root=artifact_root,
+        expected_name="training_events.jsonl",
+    )
+    if event_path is None:
         return None
     manifest_path = event_path.parent / "training_manifest.json"
     if manifest_path.is_symlink() or not manifest_path.is_file():
@@ -145,6 +186,7 @@ def _validated_immutable_candidate(
     requested_candidate_path: str | Path,
     training: TrainingResult,
     seeds: TrainingSeedBundle,
+    artifact_root: str | Path | None = None,
 ) -> tuple[Path, CandidateFormat, dict[str, str], str]:
     """Resolve and authenticate the exact artifact that produced a checkpoint.
 
@@ -163,11 +205,12 @@ def _validated_immutable_candidate(
 
     if not training.event_log_path:
         raise EvaluationBindingError("training result is missing its event log path")
-    raw_event_path = Path(training.event_log_path).expanduser()
-    if raw_event_path.is_symlink():
-        raise EvaluationBindingError("training event log must not be a symlink")
-    event_path = raw_event_path.resolve()
-    if event_path.name != "training_events.jsonl" or not event_path.is_file():
+    event_path = _resolve_training_artifact_path(
+        training.event_log_path,
+        artifact_root=artifact_root,
+        expected_name="training_events.jsonl",
+    )
+    if event_path is None or not event_path.is_file():
         raise EvaluationBindingError("training event log is missing or misnamed")
     output_dir = event_path.parent
 
@@ -196,18 +239,36 @@ def _validated_immutable_candidate(
         raise EvaluationBindingError("training manifest seed bundle mismatch")
     if manifest.get("seed_bundle_hash") != seeds.bundle_hash:
         raise EvaluationBindingError("training manifest seed-bundle hash mismatch")
+    if (
+        training.profile_version == "2"
+        and manifest.get("dependency_lock_hash") != _dependency_lock_hash()
+    ):
+        raise EvaluationBindingError("training manifest dependency lock mismatch")
 
     try:
         candidate_format = CandidateFormat(str(manifest["candidate_format"]))
     except (KeyError, ValueError) as error:
-        raise EvaluationBindingError("training manifest candidate format is invalid") from error
+        raise EvaluationBindingError(
+            "training manifest candidate format is invalid"
+        ) from error
     expected_copy_name = (
         "candidate_graph.json"
         if candidate_format is CandidateFormat.ARCHITECTURE_IR
         else "candidate_source.py"
     )
+    if training.profile_version == "2":
+        if manifest.get("schema_name") != "TrainingManifest":
+            raise EvaluationBindingError("training manifest schema name mismatch")
+        if manifest.get("schema_version") != "2.0":
+            raise EvaluationBindingError("training manifest schema version mismatch")
+        if manifest.get("candidate_path") != expected_copy_name:
+            raise EvaluationBindingError(
+                "training manifest candidate path is not portable"
+            )
     if manifest.get("immutable_candidate_relative_path") != expected_copy_name:
-        raise EvaluationBindingError("training manifest immutable candidate path mismatch")
+        raise EvaluationBindingError(
+            "training manifest immutable candidate path mismatch"
+        )
     immutable_candidate = output_dir / expected_copy_name
     if immutable_candidate.is_symlink() or not immutable_candidate.is_file():
         raise EvaluationBindingError(
@@ -308,6 +369,7 @@ def _record_envelope(
     training: TrainingResult,
     plan: EvaluationPlan,
     requested_device: str,
+    artifact_root: str | Path | None = None,
 ) -> RecordEnvelope:
     component_hashes = trusted_component_hashes()
     component_set_hash = trusted_component_set_sha256(component_hashes)
@@ -327,7 +389,9 @@ def _record_envelope(
                 "checkpoint_sha256": training.checkpoint_sha256,
                 "training_profile_hash": training.profile_hash,
                 "evaluation_plan_hash": plan.plan_hash,
-                "training_manifest_sha256": _training_manifest_hash(training),
+                "training_manifest_sha256": _training_manifest_hash(
+                    training, artifact_root=artifact_root
+                ),
                 "trusted_component_set_sha256": component_set_hash,
             }
         ),
@@ -365,6 +429,7 @@ def _training_failure(
     context: SearchEvaluationContext,
     plan: EvaluationPlan,
     requested_device: str,
+    artifact_root: str | Path | None = None,
 ) -> SearchEvaluationRecord:
     return SearchEvaluationRecord(
         envelope=_record_envelope(
@@ -372,6 +437,7 @@ def _training_failure(
             training=training,
             plan=plan,
             requested_device=requested_device,
+            artifact_root=artifact_root,
         ),
         candidate_id=_candidate_id(training),
         training_record_id=_training_record_id(training),
@@ -401,6 +467,7 @@ def evaluate_trained_candidate_in_process(
     evaluation_plan: EvaluationPlan,
     context: SearchEvaluationContext,
     eligibility_threshold: float,
+    artifact_root: str | Path | None = None,
 ) -> SearchEvaluationRecord:
     """Reload the public-development winner and evaluate public Layer A only."""
 
@@ -417,6 +484,7 @@ def evaluate_trained_candidate_in_process(
             context=context,
             plan=evaluation_plan,
             requested_device=requested_device,
+            artifact_root=artifact_root,
         )
 
     execution_ok = False
@@ -437,6 +505,7 @@ def evaluate_trained_candidate_in_process(
             requested_candidate_path=candidate_path,
             training=training,
             seeds=seeds,
+            artifact_root=artifact_root,
         )
         if (
             seeds.model_initialization_seed != training.initialization_seed
@@ -459,11 +528,14 @@ def evaluate_trained_candidate_in_process(
         )
         device = selection.device
         event_parent = immutable_candidate.parent
-        raw_checkpoint_path = Path(training.checkpoint_path).expanduser()
-        checkpoint_path = raw_checkpoint_path.resolve()
+        checkpoint_path = _resolve_training_artifact_path(
+            training.checkpoint_path,
+            artifact_root=artifact_root,
+            expected_name="best_checkpoint.pt",
+        )
         if (
-            checkpoint_path != event_parent / "best_checkpoint.pt"
-            or raw_checkpoint_path.is_symlink()
+            checkpoint_path is None
+            or checkpoint_path != event_parent / "best_checkpoint.pt"
             or not checkpoint_path.is_file()
         ):
             raise EvaluationBindingError(
@@ -479,7 +551,11 @@ def evaluate_trained_candidate_in_process(
         if not isinstance(checkpoint, dict):
             raise TypeError("best checkpoint must contain a mapping")
         expected_checkpoint_identity = {
-            "checkpoint_kind": "best_evaluation_weights_v1",
+            "checkpoint_kind": (
+                "best_evaluation_weights_v1"
+                if training.profile_version == "1"
+                else "best_evaluation_weights_v2"
+            ),
             "candidate_source_hash": training.candidate_source_hash,
             "profile_hash": training.profile_hash,
             "task_adapter_version": DEFAULT_TASK.version,
@@ -488,6 +564,10 @@ def evaluate_trained_candidate_in_process(
             "seed_bundle": asdict(seeds),
             "trusted_component_set_sha256": component_set_hash,
         }
+        if training.profile_version == "2":
+            expected_checkpoint_identity["dependency_lock_hash"] = (
+                _dependency_lock_hash()
+            )
         checkpoint_mismatches = {
             key: {"expected": expected, "observed": checkpoint.get(key)}
             for key, expected in expected_checkpoint_identity.items()
@@ -536,6 +616,7 @@ def evaluate_trained_candidate_in_process(
                     ScientificExecutionRequest(
                         candidate_format=CandidateFormat.ARCHITECTURE_IR,
                         requested_device=requested_device,
+                        required_accelerator=profile.device_requirement,
                         phase=GatePhase.POST_EXECUTION,
                         scientific=profile.scientific,
                         ir_validated=True,
@@ -558,7 +639,9 @@ def evaluate_trained_candidate_in_process(
                     "requested_device": requested_device,
                     "selected_device": str(device),
                     "evaluation_plan_hash": evaluation_plan.plan_hash,
-                    "training_manifest_sha256": _training_manifest_hash(training),
+                    "training_manifest_sha256": _training_manifest_hash(
+                        training, artifact_root=artifact_root
+                    ),
                     "trusted_component_set_sha256": component_set_hash,
                     "runtime_evidence": runtime_evidence.to_dict(),
                     "post_execution_decision": post_decision.to_dict(),
@@ -601,12 +684,12 @@ def evaluate_trained_candidate_in_process(
         if model is not None:
             del model
         gc.collect()
-        if requested_device == "mps" and hasattr(torch, "mps"):
-            try:
-                synchronize(torch.device("mps"))
-                torch.mps.empty_cache()
-            except RuntimeError:
-                pass
+        try:
+            cleanup_accelerator(torch.device(requested_device))
+        except (RuntimeError, ValueError):
+            execution_ok = False
+            transformer_valid = False
+            failure_stage = "accelerator_cleanup_failure"
         _ = time.perf_counter() - verification_started
 
     eligible = (
@@ -746,7 +829,7 @@ def evaluate_candidate(
     candidate = Path(candidate_path).resolve()
     profile = get_training_profile(
         training_profile
-        or os.environ.get("DISCOVERY_TRAINING_PROFILE", "full_train_v1")
+        or os.environ.get("DISCOVERY_TRAINING_PROFILE", "full_train_cuda_v2")
     )
     plan = _resolve_layer_a_plan(
         training_profile_name=profile.name,
@@ -778,10 +861,12 @@ def evaluate_candidate(
             best_development_loss=0.0,
             final_training_loss=0.0,
             train_seconds=0.0,
-            peak_mps_allocated_bytes=None,
-            current_mps_allocated_bytes=None,
-            driver_mps_allocated_bytes=None,
-            recommended_mps_memory_bytes=None,
+            accelerator_kind=device or profile.device_requirement,
+            peak_accelerator_allocated_bytes=None,
+            current_accelerator_allocated_bytes=None,
+            reserved_accelerator_allocated_bytes=None,
+            accelerator_total_memory_bytes=None,
+            accelerator_fingerprint={},
             parameter_count_metadata=0,
             checkpoint_path="",
             checkpoint_sha256="",
@@ -790,12 +875,13 @@ def evaluate_candidate(
             scientific=profile.scientific,
             hardware_matched=False,
             cleanup_completed=True,
+            schema_version="1.0" if profile.version == "1" else "2.0",
         )
         return _training_failure(
             training=failed,
             context=resolved_context,
             plan=plan,
-            requested_device=device or "mps",
+            requested_device=device or profile.device_requirement,
         )
 
     run_seed = (
@@ -804,7 +890,9 @@ def evaluate_candidate(
         else int(os.environ.get("DISCOVERY_TRAINING_SEED", "1"))
     )
     seeds = TrainingSeedBundle.from_run_seed(run_seed)
-    requested_device = device or os.environ.get("DISCOVERY_TRAIN_DEVICE", "mps")
+    requested_device = device or os.environ.get(
+        "DISCOVERY_TRAIN_DEVICE", profile.device_requirement
+    )
     if training_output_dir is None:
         identifier = f"{file_hash(candidate)[:12]}_{uuid.uuid4().hex[:8]}"
         output_dir = ROOT / "outputs" / "candidate_training" / identifier
@@ -825,10 +913,15 @@ def evaluate_candidate(
             eligibility_threshold=eligibility_threshold,
         )
     except (WorkerError, OSError, ValueError) as error:
+        error_text = (
+            f"{type(error).__name__}: worker failed; details suppressed"
+            if profile.version == "2"
+            else f"{type(error).__name__}: {error}"[:2_000]
+        )
         failed = TrainingResult(
             success=False,
             failure_stage="worker_infrastructure",
-            error=f"{type(error).__name__}: {error}"[:2_000],
+            error=error_text,
             profile_name=profile.name,
             profile_version=profile.version,
             profile_hash=profile.profile_hash,
@@ -846,10 +939,12 @@ def evaluate_candidate(
             best_development_loss=0.0,
             final_training_loss=0.0,
             train_seconds=0.0,
-            peak_mps_allocated_bytes=None,
-            current_mps_allocated_bytes=None,
-            driver_mps_allocated_bytes=None,
-            recommended_mps_memory_bytes=None,
+            accelerator_kind=requested_device,
+            peak_accelerator_allocated_bytes=None,
+            current_accelerator_allocated_bytes=None,
+            reserved_accelerator_allocated_bytes=None,
+            accelerator_total_memory_bytes=None,
+            accelerator_fingerprint={},
             parameter_count_metadata=0,
             checkpoint_path="",
             checkpoint_sha256="",
@@ -858,6 +953,7 @@ def evaluate_candidate(
             scientific=profile.scientific,
             hardware_matched=False,
             cleanup_completed=True,
+            schema_version="1.0" if profile.version == "1" else "2.0",
         )
         return _training_failure(
             training=failed,
@@ -868,12 +964,13 @@ def evaluate_candidate(
     if response.get("kind") == "search_evaluation":
         return search_evaluation_from_dict(response["evaluation"])
     if response.get("kind") == "training_result":
-        training = TrainingResult(**response["training"])
+        training = TrainingResult.from_dict(response["training"])
         return _training_failure(
             training=training,
             context=resolved_context,
             plan=plan,
             requested_device=requested_device,
+            artifact_root=output_dir,
         )
     raise WorkerError(
         str(response.get("error", "candidate worker returned an invalid response"))

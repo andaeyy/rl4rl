@@ -40,7 +40,6 @@ from reporting.records import (
     ReportArtifactKind,
     ReportSection,
     ResourceDisclosure,
-    SectionName,
     SectionStatus,
     SourceArtifactReference,
     StudyProvenance,
@@ -154,13 +153,14 @@ def _append_completed_run(store: RunArtifactStore, *, qualifying: bool) -> None:
     store.append(
         EventKind.BUDGET,
         {
+            "accelerator_kind": "cpu",
             "totals": {
                 "proposal_opportunities": 1,
                 "provider_attempts": 0,
                 "prompt_tokens": 0,
                 "completion_tokens": 0,
                 "training_steps": 0,
-                "mps_seconds": 0,
+                "accelerator_seconds": 0,
             }
         },
     )
@@ -193,13 +193,14 @@ def _append_candidate_failure(store: RunArtifactStore) -> None:
     store.append(
         EventKind.BUDGET,
         {
+            "accelerator_kind": "cpu",
             "totals": {
                 "proposal_opportunities": 1,
                 "provider_attempts": 0,
                 "prompt_tokens": 0,
                 "completion_tokens": 0,
                 "training_steps": 0,
-                "mps_seconds": 0,
+                "accelerator_seconds": 0,
             }
         },
     )
@@ -231,13 +232,14 @@ def _append_infrastructure_rerun(store: RunArtifactStore) -> None:
     store.append(
         EventKind.BUDGET,
         {
+            "accelerator_kind": "cpu",
             "totals": {
                 "proposal_opportunities": 0,
                 "provider_attempts": 0,
                 "prompt_tokens": 0,
                 "completion_tokens": 0,
                 "training_steps": 0,
-                "mps_seconds": 0,
+                "accelerator_seconds": 0,
                 "infrastructure_retries": 1,
             }
         },
@@ -567,7 +569,10 @@ def build_synthetic_reconstruction(
     resources = ResourceDisclosure(
         quantities=(
             QuantityDisclosure(
-                "mps_compute", "mps_seconds", MeasurementStatus.MEASURED, 0.0,
+                "accelerator_compute",
+                "accelerator_seconds",
+                MeasurementStatus.MEASURED,
+                0.0,
                 "The fixture does not launch candidate training.",
             ),
             QuantityDisclosure(

@@ -9,11 +9,11 @@ language: json
 file_suffix: .json
 
 training:
-  profile: full_train_v1
-  profile_version: "1"
+  profile: full_train_cuda_v2
+  profile_version: "2"
   task_adapter: fixed_addition_v1
   seed_derivation: sha256-v1
-  device: mps
+  device: cuda
   allow_cpu_for_tests: false
 
 llm:
@@ -26,9 +26,9 @@ llm:
   temperature: null
   top_p: null
   max_tokens: 16384
-  timeout: 300
-  retries: 2
-  retry_delay: 3
+  timeout: 180
+  retries: 0
+  retry_delay: 0
   reasoning_effort: high
 
 prompt:

@@ -1,9 +1,17 @@
 schema_name: scientific_decision_ledger
-schema_version: "1"
+schema_version: "2"
 status: unresolved
 note: >-
   Null values are deliberate launch blockers. Toy tests may supply fixture
   values, but no value in this ledger may be inferred from a smoke test.
+
+schema_migration:
+  from_version: "1"
+  active_replacements:
+    containment.mps_resource_limits: containment.accelerator_resource_limits
+    containment.mps_evidence_custody_rule: containment.accelerator_evidence_custody_rule
+  compatibility: historical version-1 ledgers remain readable and hash-stable
+  equivalence_claim: Modal CUDA is a new execution condition, not an MPS-equivalent condition
 
 approval:
   principal_investigator: null
@@ -50,11 +58,11 @@ evaluation:
 containment:
   scientific_candidate_format: null
   ir_primitive_governance: null
-  mps_resource_limits: null
+  accelerator_resource_limits: null
   unsupported_operation_classification: null
   layer_b_custodian: null
   layer_c_custodian: null
-  mps_evidence_custody_rule: null
+  accelerator_evidence_custody_rule: null
 
 novelty:
   reference_corpus_cutoff_date: null

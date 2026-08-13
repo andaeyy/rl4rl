@@ -12,16 +12,16 @@ import random
 import tempfile
 import time
 import traceback
+from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import asdict
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 
 import numpy as np
 import torch
 import yaml
-
 from containment.audit import audit_runtime
 from containment.policy import (
     CandidateFormat,
@@ -34,12 +34,16 @@ from common.candidate_artifact import (
     inspect_candidate_artifact,
 )
 from common.device import (
+    AcceleratorKind,
     DeviceUnavailableError,
-    mps_memory,
+    accelerator_memory,
+    cleanup_accelerator,
+    reset_peak_memory,
     resolve_training_device,
-    synchronized_time,
     synchronize,
+    synchronized_time,
 )
+from common.runtime_context import ExecutionContextV1
 from common.task_adapter import DEFAULT_TASK, FixedAdditionTask
 from common.training_config import (
     TrainingProfile,
@@ -47,7 +51,6 @@ from common.training_config import (
     TrainingSeedBundle,
 )
 from common.training_data import public_development_cases, training_batch
-
 
 ROOT = Path(__file__).resolve().parents[1]
 LOCK_PATH = ROOT / "outputs" / ".candidate_training.lock"
@@ -158,6 +161,32 @@ def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
         os.fsync(handle.fileno())
         temporary = Path(handle.name)
     os.replace(temporary, path)
+
+
+def _create_json(path: Path, payload: dict[str, Any]) -> None:
+    """Publish one immutable JSON receipt without replacing prior evidence."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    encoded = (
+        json.dumps(payload, indent=2, sort_keys=True).encode("utf-8") + b"\n"
+    )
+    with tempfile.NamedTemporaryFile(
+        mode="wb",
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        delete=False,
+    ) as handle:
+        handle.write(encoded)
+        handle.flush()
+        os.fsync(handle.fileno())
+        temporary = Path(handle.name)
+    try:
+        # A hard link is an atomic create-if-absent operation.  Unlike replace,
+        # it cannot silently rewrite a prior resume attestation.
+        os.link(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def _atomic_torch_save(path: Path, payload: dict[str, Any]) -> None:
@@ -285,7 +314,10 @@ def training_manifest(
     containment_decision: dict[str, Any],
     candidate_format: CandidateFormat,
     candidate_graph_hash: str | None,
+    accelerator_fingerprint: dict[str, Any] | None = None,
     component_hashes: dict[str, str] | None = None,
+    execution_context: ExecutionContextV1 | None = None,
+    dependency_lock_hash: str | None = None,
 ) -> dict[str, Any]:
     mps_built = bool(
         hasattr(torch.backends, "mps") and torch.backends.mps.is_built()
@@ -310,16 +342,21 @@ def training_manifest(
         if candidate_format is CandidateFormat.ARCHITECTURE_IR
         else "candidate_source.py"
     )
-    return {
+    manifest = {
         "created_at": _utc_now(),
-        "candidate_path": str(candidate_path),
+        # V1 evidence historically recorded an executor-absolute source path.
+        # V2 records only the immutable colocated artifact name; its SHA-256
+        # below is the portable identity.
+        "candidate_path": (
+            str(candidate_path) if profile.version == "1" else candidate_copy_name
+        ),
         "candidate_source_hash": candidate_hash,
         "candidate_artifact_hash": candidate_hash,
         "candidate_format": candidate_format.value,
         "candidate_graph_hash": candidate_graph_hash,
         "immutable_candidate_relative_path": candidate_copy_name,
         "candidate_initialization": "from_scratch",
-        "profile": asdict(profile),
+        "profile": profile.to_dict(),
         "profile_hash": profile.profile_hash,
         "seed_bundle": asdict(seeds),
         "seed_bundle_hash": seeds.bundle_hash,
@@ -329,7 +366,9 @@ def training_manifest(
         "selected_device": selected_device,
         "allow_cpu_for_tests": allow_cpu_for_tests,
         "hardware_matched_scientific_run": bool(
-            profile.scientific and selected_device == "mps"
+            profile.scientific
+            and selected_device is not None
+            and torch.device(selected_device).type == profile.device_requirement
         ),
         "runtime": {
             "platform": platform.platform(),
@@ -339,14 +378,34 @@ def training_manifest(
             "torch": torch.__version__,
             "mps_built": mps_built,
             "mps_available": mps_available,
+            "cuda_runtime": str(torch.version.cuda) if torch.version.cuda else None,
+            "cuda_available": bool(
+                hasattr(torch, "cuda") and torch.cuda.is_available()
+            ),
+            "cuda_device_count": int(torch.cuda.device_count())
+            if hasattr(torch, "cuda")
+            else 0,
             "deterministic_algorithms": profile.deterministic_algorithms,
             "pytorch_enable_mps_fallback": os.environ.get(
                 "PYTORCH_ENABLE_MPS_FALLBACK", ""
             ),
-            "mps_memory_fraction": profile.mps_memory_fraction,
+            "accelerator_memory_fraction": profile.accelerator_memory_fraction,
+            "cublas_workspace_config": os.environ.get(
+                "CUBLAS_WORKSPACE_CONFIG", ""
+            ),
+            "cudnn_deterministic": bool(torch.backends.cudnn.deterministic),
+            "cudnn_benchmark": bool(torch.backends.cudnn.benchmark),
+            "cuda_matmul_allow_tf32": bool(
+                getattr(torch.backends.cuda.matmul, "allow_tf32", False)
+            ),
+            "accelerator_fingerprint": accelerator_fingerprint or {},
             "declared_machine": declared_machine,
         },
-        "dependency_lock_hash": _dependency_lock_hash(),
+        "dependency_lock_hash": (
+            _dependency_lock_hash()
+            if dependency_lock_hash is None
+            else dependency_lock_hash
+        ),
         "trusted_executable_component_hashes": trusted_hashes,
         "trusted_component_set_sha256": trusted_set_hash,
         # Backward-compatible name retained for existing evidence readers.  It
@@ -375,14 +434,27 @@ def training_manifest(
             "platforms, or devices even when all recorded seeds are fixed."
         ),
     }
+    if execution_context is not None:
+        manifest["execution_context"] = execution_context.to_dict()
+    if profile.version == "2":
+        manifest["schema_name"] = "TrainingManifest"
+        manifest["schema_version"] = "2.0"
+    return manifest
 
 
-def seed_everything(seed: int, *, deterministic: bool) -> torch.Generator:
+def seed_everything(
+    seed: int,
+    *,
+    deterministic: bool,
+    device: torch.device,
+) -> torch.Generator:
     random.seed(seed)
     np.random.seed(seed % (2**32))
     torch.manual_seed(seed)
     if hasattr(torch, "mps") and hasattr(torch.mps, "manual_seed"):
         torch.mps.manual_seed(seed)
+    if device.type == AcceleratorKind.CUDA.value:
+        torch.cuda.manual_seed_all(seed)
     torch.use_deterministic_algorithms(deterministic)
     generator = torch.Generator(device="cpu")
     generator.manual_seed(seed)
@@ -407,6 +479,14 @@ def _rng_state() -> dict[str, Any]:
             state["torch_mps"] = torch.mps.get_rng_state()
         except RuntimeError:
             state["torch_mps"] = None
+    if hasattr(torch, "cuda") and torch.cuda.is_available():
+        try:
+            state["torch_cuda"] = [
+                item.detach().cpu().clone()
+                for item in torch.cuda.get_rng_state_all()
+            ]
+        except RuntimeError:
+            state["torch_cuda"] = None
     return state
 
 
@@ -428,6 +508,60 @@ def _restore_rng_state(state: dict[str, Any]) -> None:
     mps_state = state.get("torch_mps")
     if mps_state is not None and hasattr(torch.mps, "set_rng_state"):
         torch.mps.set_rng_state(mps_state)
+    cuda_state = state.get("torch_cuda")
+    if cuda_state is not None and hasattr(torch, "cuda"):
+        torch.cuda.set_rng_state_all(cuda_state)
+
+
+def _canonical_rng_value(value: Any) -> Any:
+    """Normalize the trusted RNG-state vocabulary for a portable digest."""
+
+    if isinstance(value, torch.Tensor):
+        tensor = value.detach().cpu().contiguous()
+        return {
+            "dtype": str(tensor.dtype),
+            "shape": list(tensor.shape),
+            "sha256": hashlib.sha256(tensor.numpy().tobytes()).hexdigest(),
+        }
+    if isinstance(value, dict):
+        if not all(isinstance(key, str) for key in value):
+            raise ResumeMismatchError("RNG-state mapping keys must be text")
+        return {
+            key: _canonical_rng_value(item)
+            for key, item in sorted(value.items())
+        }
+    if isinstance(value, (tuple, list)):
+        return [_canonical_rng_value(item) for item in value]
+    if value is None or type(value) in {bool, int, float, str}:
+        return value
+    raise ResumeMismatchError(
+        f"unsupported RNG-state value type: {type(value).__name__}"
+    )
+
+
+def rng_state_sha256(state: dict[str, Any]) -> str:
+    """Hash RNG state using the frozen tensor-aware canonical representation."""
+
+    if not isinstance(state, dict):
+        raise ResumeMismatchError("RNG state must be a mapping")
+    encoded = json.dumps(
+        _canonical_rng_value(state),
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _advance_checkpoint_rng_lineage() -> None:
+    """Advance the persisted RNG lineage once per completed optimizer step.
+
+    The sampled value is deliberately unused by training.  Its only purpose is
+    to make checkpoint RNG continuation observable while leaving examples,
+    gradients, optimizer updates, and model outputs unchanged.
+    """
+
+    random.getrandbits(64)
 
 
 def _learning_rate_factor(step: int, profile: TrainingProfile) -> float:
@@ -507,14 +641,19 @@ def _checkpoint_payload(
     best_loss: float,
     final_training_loss: float,
     trusted_component_set_hash: str | None = None,
+    dependency_lock_hash: str | None = None,
 ) -> dict[str, Any]:
     component_set_hash = (
         trusted_component_set_sha256()
         if trusted_component_set_hash is None
         else trusted_component_set_hash
     )
-    return {
-        "checkpoint_kind": "trusted_resume_state_v1",
+    payload = {
+        "checkpoint_kind": (
+            "trusted_resume_state_v1"
+            if profile.version == "1"
+            else "trusted_resume_state_v2"
+        ),
         "model_state": _cpu_copy(model.state_dict()),
         "optimizer_state": _cpu_copy(optimizer.state_dict()),
         "scheduler_state": _cpu_copy(scheduler.state_dict()),
@@ -535,6 +674,13 @@ def _checkpoint_payload(
         "trusted_component_set_sha256": component_set_hash,
         "rng_state": _rng_state(),
     }
+    if profile.version == "2":
+        payload["dependency_lock_hash"] = (
+            _dependency_lock_hash()
+            if dependency_lock_hash is None
+            else dependency_lock_hash
+        )
+    return payload
 
 
 def _best_evaluation_checkpoint_payload(
@@ -549,6 +695,7 @@ def _best_evaluation_checkpoint_payload(
     best_accuracy: float,
     best_loss: float,
     trusted_component_set_hash: str | None = None,
+    dependency_lock_hash: str | None = None,
 ) -> dict[str, Any]:
     """Plain tensor/primitives-only checkpoint safe for ``weights_only=True``."""
 
@@ -557,8 +704,12 @@ def _best_evaluation_checkpoint_payload(
         if trusted_component_set_hash is None
         else trusted_component_set_hash
     )
-    return {
-        "checkpoint_kind": "best_evaluation_weights_v1",
+    payload = {
+        "checkpoint_kind": (
+            "best_evaluation_weights_v1"
+            if profile.version == "1"
+            else "best_evaluation_weights_v2"
+        ),
         "model_state": _cpu_copy(model.state_dict()),
         "global_step": step,
         "examples_processed": examples_processed,
@@ -572,6 +723,13 @@ def _best_evaluation_checkpoint_payload(
         "seed_bundle_hash": seeds.bundle_hash,
         "trusted_component_set_sha256": component_set_hash,
     }
+    if profile.version == "2":
+        payload["dependency_lock_hash"] = (
+            _dependency_lock_hash()
+            if dependency_lock_hash is None
+            else dependency_lock_hash
+        )
+    return payload
 
 
 def _validate_resume(
@@ -582,6 +740,7 @@ def _validate_resume(
     task: FixedAdditionTask,
     seeds: TrainingSeedBundle,
     trusted_component_set_hash: str | None = None,
+    dependency_lock_hash: str | None = None,
 ) -> None:
     expected_component_set_hash = (
         trusted_component_set_sha256()
@@ -589,7 +748,11 @@ def _validate_resume(
         else trusted_component_set_hash
     )
     expected = {
-        "checkpoint_kind": "trusted_resume_state_v1",
+        "checkpoint_kind": (
+            "trusted_resume_state_v1"
+            if profile.version == "1"
+            else "trusted_resume_state_v2"
+        ),
         "candidate_source_hash": candidate_hash,
         "profile_hash": profile.profile_hash,
         "task_adapter_version": task.version,
@@ -597,6 +760,12 @@ def _validate_resume(
         "seed_bundle_hash": seeds.bundle_hash,
         "trusted_component_set_sha256": expected_component_set_hash,
     }
+    if profile.version == "2":
+        expected["dependency_lock_hash"] = (
+            _dependency_lock_hash()
+            if dependency_lock_hash is None
+            else dependency_lock_hash
+        )
     mismatches = {
         key: {"expected": value, "observed": checkpoint.get(key)}
         for key, value in expected.items()
@@ -629,8 +798,12 @@ def _validate_resume(
         "trusted_component_set_sha256",
         "rng_state",
     }
+    if profile.version == "2":
+        required_fields.add("dependency_lock_hash")
     if set(checkpoint) != required_fields:
-        raise ResumeMismatchError("resume checkpoint fields differ from trusted v1")
+        raise ResumeMismatchError(
+            f"resume checkpoint fields differ from trusted v{profile.version}"
+        )
     for field in (
         "global_step",
         "next_data_step",
@@ -712,6 +885,7 @@ def validate_training_request(
         ScientificExecutionRequest(
             candidate_format=inspection.candidate_format,
             requested_device=requested_device,
+            required_accelerator=profile.device_requirement,
             scientific=profile.scientific,
             ir_validated=(
                 inspection.candidate_format is CandidateFormat.ARCHITECTURE_IR
@@ -762,8 +936,28 @@ def validate_training_request(
                 seeds=seeds,
             )
     component_hashes = trusted_component_hashes()
+
+    def portable_path(path: Path | None) -> str | None:
+        if path is None:
+            return None
+        if profile.version == "1":
+            return str(path)
+        try:
+            return path.relative_to(ROOT).as_posix()
+        except ValueError:
+            pass
+        # Controller candidates and training outputs are colocated below one
+        # of these logical artifact roots. Retain that useful suffix without
+        # recording the machine-specific prefix.
+        for marker in ("artifacts", "candidate_training"):
+            if marker in path.parts:
+                index = path.parts.index(marker)
+                return Path(*path.parts[index:]).as_posix()
+        return path.name
+
+    resolved_resume = Path(resume).resolve() if resume else None
     return {
-        "candidate": str(candidate),
+        "candidate": portable_path(candidate),
         "candidate_source_hash": sha256_file(candidate),
         "candidate_artifact_hash": sha256_file(candidate),
         "candidate_format": inspection.candidate_format.value,
@@ -776,6 +970,8 @@ def validate_training_request(
         "task_adapter_version": task.version,
         "task_adapter_hash": task.config_hash,
         "device": str(selection.device),
+        "accelerator_kind": selection.requested_kind.value,
+        "accelerator_fingerprint": selection.fingerprint.to_dict(),
         "scientific": profile.scientific,
         "hardware_matched": selection.hardware_matched,
         "containment_audit_hash": containment_audit.audit_hash,
@@ -784,17 +980,24 @@ def validate_training_request(
         "trusted_component_set_sha256": trusted_component_set_sha256(
             component_hashes
         ),
-        "output_dir": str(resolved_output) if resolved_output else None,
-        "resume": str(Path(resume).resolve()) if resume else None,
+        "output_dir": portable_path(resolved_output),
+        "resume": portable_path(resolved_resume),
     }
 
 
-def _failure_stage(error: BaseException) -> str:
+def _failure_stage(
+    error: BaseException,
+    *,
+    requested_device: str = "",
+) -> str:
+    accelerator = requested_device.split(":", 1)[0].lower()
     if isinstance(error, ReproducibilityBindingError):
         return "reproducibility_binding"
     if isinstance(error, ContainmentGateError):
         return "containment_unproven"
     if isinstance(error, DeviceUnavailableError):
+        if accelerator == "cuda" or "cuda" in str(error).lower():
+            return "cuda_unavailable"
         return "device_unavailable"
     if isinstance(error, ResumeMismatchError):
         return "checkpoint_resume_mismatch"
@@ -815,7 +1018,14 @@ def _failure_stage(error: BaseException) -> str:
         "deterministic" in str(error).lower()
         or "not implemented for" in str(error).lower()
     ):
+        if accelerator == "cuda":
+            return "cuda_deterministic_kernel_unavailable"
         return "unsupported_operation"
+    if isinstance(error, RuntimeError) and accelerator == "cuda" and any(
+        marker in str(error).lower()
+        for marker in ("cuda", "cudnn", "cublas", "driver")
+    ):
+        return "cuda_driver_failure"
     return "model_initialization"
 
 
@@ -829,6 +1039,7 @@ def train_candidate_in_process(
     allow_cpu_for_tests: bool,
     resume: str | Path | None = None,
     task: FixedAdditionTask = DEFAULT_TASK,
+    execution_context: ExecutionContextV1 | None = None,
 ) -> TrainingResult:
     """Train one candidate. Call only inside the sanitized worker process."""
 
@@ -841,6 +1052,7 @@ def train_candidate_in_process(
     event_path = destination / "training_events.jsonl"
     best_path = destination / "best_checkpoint.pt"
     latest_path = destination / "latest_resume_checkpoint.pt"
+    partial_resume_path = destination / "partial_resume_checkpoint.pt"
     started = time.perf_counter()
     prior_elapsed = 0.0
     steps_completed = 0
@@ -851,10 +1063,11 @@ def train_candidate_in_process(
     final_loss = float("nan")
     parameter_count = 0
     selected_device = requested_device
-    peak_mps = 0
-    current_mps: int | None = None
-    driver_mps: int | None = None
-    recommended_mps: int | None = None
+    peak_accelerator = 0
+    current_accelerator: int | None = None
+    reserved_accelerator: int | None = None
+    total_accelerator: int | None = None
+    fingerprint: dict[str, Any] = {}
     checkpoint_hash = ""
     cleanup_completed = False
     output_prepared = False
@@ -864,8 +1077,14 @@ def train_candidate_in_process(
     current_stage = "candidate_contract"
     candidate_format = CandidateFormat.ARBITRARY_PYTHON
     candidate_graph_hash: str | None = None
+    resume_source_checkpoint_sha256: str | None = None
+    resume_source_rng_sha256: str | None = None
+    resume_observed_rng_sha256: str | None = None
+    resume_source_step: int | None = None
+    resume_source_examples: int | None = None
     component_hashes = trusted_component_hashes()
     component_set_hash = trusted_component_set_sha256(component_hashes)
+    dependency_lock_hash = _dependency_lock_hash()
 
     try:
         if destination_is_symlink:
@@ -889,6 +1108,7 @@ def train_candidate_in_process(
             ScientificExecutionRequest(
                 candidate_format=candidate_format,
                 requested_device=requested_device,
+                required_accelerator=profile.device_requirement,
                 scientific=profile.scientific,
                 ir_validated=(
                     candidate_format is CandidateFormat.ARCHITECTURE_IR
@@ -914,6 +1134,8 @@ def train_candidate_in_process(
             candidate_format=candidate_format,
             candidate_graph_hash=candidate_graph_hash,
             component_hashes=component_hashes,
+            execution_context=execution_context,
+            dependency_lock_hash=dependency_lock_hash,
         )
         _atomic_json(destination / "training_manifest.json", manifest)
         event_path.touch(exist_ok=True)
@@ -942,7 +1164,14 @@ def train_candidate_in_process(
                 task=task,
                 seeds=seeds,
                 trusted_component_set_hash=component_set_hash,
+                dependency_lock_hash=dependency_lock_hash,
             )
+            # Capture the source identities before the latest-checkpoint path is
+            # overwritten by the resumed trajectory.
+            resume_source_checkpoint_sha256 = sha256_file(resume_path)
+            resume_source_rng_sha256 = rng_state_sha256(resume_state["rng_state"])
+            resume_source_step = int(resume_state["global_step"])
+            resume_source_examples = int(resume_state["examples_processed"])
 
         candidate_copy = destination / (
             "candidate_graph.json"
@@ -964,6 +1193,8 @@ def train_candidate_in_process(
         )
         device = selection.device
         selected_device = str(device)
+        fingerprint = selection.fingerprint.to_dict()
+        reset_peak_memory(device)
         manifest = training_manifest(
             candidate_path=candidate,
             candidate_hash=candidate_hash,
@@ -977,13 +1208,17 @@ def train_candidate_in_process(
             containment_decision=containment_decision.to_dict(),
             candidate_format=candidate_format,
             candidate_graph_hash=candidate_graph_hash,
+            accelerator_fingerprint=fingerprint,
             component_hashes=component_hashes,
+            execution_context=execution_context,
+            dependency_lock_hash=dependency_lock_hash,
         )
         _atomic_json(destination / "training_manifest.json", manifest)
 
         dataloader_generator = seed_everything(
             seeds.model_initialization_seed,
             deterministic=profile.deterministic_algorithms,
+            device=device,
         )
         dataloader_generator.manual_seed(seeds.dataloader_seed)
         current_stage = "model_initialization"
@@ -1025,6 +1260,13 @@ def train_candidate_in_process(
                 resume_state.get("final_training_loss", best_loss)
             )
             _restore_rng_state(resume_state["rng_state"])
+            # This observation is intentionally adjacent to restore: no data,
+            # model, optimizer, scheduler, or evaluator work may intervene.
+            resume_observed_rng_sha256 = rng_state_sha256(_rng_state())
+            if resume_observed_rng_sha256 != resume_source_rng_sha256:
+                raise ReproducibilityBindingError(
+                    "post-restore RNG state differs from the source checkpoint"
+                )
 
         development_cases = public_development_cases(
             seeds.development_set_seed, profile.validation_examples
@@ -1074,6 +1316,7 @@ def train_candidate_in_process(
             scheduler.step()
             steps_completed += 1
             examples_processed += profile.global_batch_size
+            _advance_checkpoint_rng_lineage()
             final_loss = accumulated_loss / profile.gradient_accumulation_steps
             elapsed = prior_elapsed + (time.perf_counter() - trajectory_started)
             _enforce_training_wall_time(elapsed, profile, stage="training_execution")
@@ -1124,6 +1367,7 @@ def train_candidate_in_process(
                         best_accuracy=best_accuracy,
                         best_loss=best_loss,
                         trusted_component_set_hash=component_set_hash,
+                        dependency_lock_hash=dependency_lock_hash,
                     )
                     _atomic_torch_save(best_path, best_payload)
                     checkpoint_decision = "best_development"
@@ -1137,13 +1381,25 @@ def train_candidate_in_process(
                     stage="development_evaluation",
                 )
 
-            memory = mps_memory(device)
-            current_mps = memory["current"]
-            driver_mps = memory["driver"]
-            recommended_mps = memory["recommended"]
-            if current_mps is not None:
-                peak_mps = max(peak_mps, current_mps)
+            memory = accelerator_memory(device)
+            current_accelerator = memory["current"]
+            reserved_accelerator = memory["reserved_or_driver"]
+            total_accelerator = memory["recommended_or_total"]
+            measured_peak = memory["peak"] or current_accelerator
+            if measured_peak is not None:
+                peak_accelerator = max(peak_accelerator, measured_peak)
             elapsed = prior_elapsed + (time.perf_counter() - trajectory_started)
+            memory_event = {
+                "current_accelerator_allocated_bytes": current_accelerator,
+                "reserved_accelerator_allocated_bytes": reserved_accelerator,
+                "peak_accelerator_allocated_bytes": peak_accelerator or None,
+                "accelerator_total_memory_bytes": total_accelerator,
+            }
+            if profile.version == "1":
+                memory_event = {
+                    "current_mps_allocated_bytes": current_accelerator,
+                    "driver_mps_allocated_bytes": reserved_accelerator,
+                }
             _append_event(
                 event_path,
                 {
@@ -1156,8 +1412,7 @@ def train_candidate_in_process(
                     "validation_loss": validation_loss,
                     "validation_exact_match_accuracy": validation_accuracy,
                     "elapsed_seconds": elapsed,
-                    "current_mps_allocated_bytes": current_mps,
-                    "driver_mps_allocated_bytes": driver_mps,
+                    **memory_event,
                     "checkpoint_decision": checkpoint_decision,
                 },
             )
@@ -1184,8 +1439,15 @@ def train_candidate_in_process(
                     best_loss=best_loss,
                     final_training_loss=final_loss,
                     trusted_component_set_hash=component_set_hash,
+                    dependency_lock_hash=dependency_lock_hash,
                 )
                 _atomic_torch_save(latest_path, resume_payload)
+                if (
+                    profile.version == "2"
+                    and steps_completed < profile.max_steps
+                    and not partial_resume_path.exists()
+                ):
+                    _atomic_torch_save(partial_resume_path, resume_payload)
                 current_stage = "training_execution"
                 elapsed = prior_elapsed + (
                     synchronized_time(device) - trajectory_started
@@ -1214,6 +1476,81 @@ def train_candidate_in_process(
             raise ReproducibilityBindingError(
                 "trusted executable components changed during training"
             )
+        if _dependency_lock_hash() != dependency_lock_hash:
+            raise ReproducibilityBindingError(
+                "dependency lock changed during training"
+            )
+        if resume_state is not None:
+            if execution_context is None:
+                local_run_id = "local-resume-" + hashlib.sha256(
+                    str(destination).encode("utf-8")
+                ).hexdigest()[:16]
+                attestation_context = ExecutionContextV1.local(run_id=local_run_id)
+            else:
+                attestation_context = execution_context
+            if any(
+                value is None
+                for value in (
+                    resume_source_checkpoint_sha256,
+                    resume_source_rng_sha256,
+                    resume_observed_rng_sha256,
+                    resume_source_step,
+                    resume_source_examples,
+                )
+            ):
+                raise ReproducibilityBindingError(
+                    "resume RNG attestation inputs were not captured"
+                )
+            final_resume_checkpoint_sha256 = sha256_file(latest_path)
+            final_resume_state = torch.load(
+                latest_path, map_location="cpu", weights_only=True
+            )
+            _validate_resume(
+                final_resume_state,
+                candidate_hash=candidate_hash,
+                profile=profile,
+                task=task,
+                seeds=seeds,
+                trusted_component_set_hash=component_set_hash,
+                dependency_lock_hash=dependency_lock_hash,
+            )
+            final_rng_sha256 = rng_state_sha256(final_resume_state["rng_state"])
+            final_step = int(final_resume_state["global_step"])
+            final_examples = int(final_resume_state["examples_processed"])
+            restored_exactly = (
+                resume_observed_rng_sha256 == resume_source_rng_sha256
+            )
+            rng_progressed = final_rng_sha256 != resume_observed_rng_sha256
+            if (
+                not restored_exactly
+                or not rng_progressed
+                or final_step <= resume_source_step
+                or final_examples <= resume_source_examples
+            ):
+                raise ReproducibilityBindingError(
+                    "resumed checkpoint did not prove RNG and optimizer progression"
+                )
+            _create_json(
+                destination / "rng_restore_attestation.json",
+                {
+                    "schema_name": "RNGRestoreAttestation",
+                    "schema_version": "1.0",
+                    "source_checkpoint_sha256": resume_source_checkpoint_sha256,
+                    "source_rng_state_sha256": resume_source_rng_sha256,
+                    "observed_post_restore_rng_state_sha256": (
+                        resume_observed_rng_sha256
+                    ),
+                    "restored_exactly": restored_exactly,
+                    "source_optimizer_step": resume_source_step,
+                    "source_examples_processed": resume_source_examples,
+                    "final_checkpoint_sha256": final_resume_checkpoint_sha256,
+                    "final_rng_state_sha256": final_rng_sha256,
+                    "final_optimizer_step": final_step,
+                    "final_examples_processed": final_examples,
+                    "rng_progressed": rng_progressed,
+                    "execution_context": attestation_context.to_dict(),
+                },
+            )
         checkpoint_hash = sha256_file(best_path)
         result = TrainingResult(
             success=True,
@@ -1240,18 +1577,25 @@ def train_candidate_in_process(
                 final_loss if math.isfinite(final_loss) else 0.0
             ),
             train_seconds=train_seconds,
-            peak_mps_allocated_bytes=peak_mps if selected_device == "mps" else None,
-            current_mps_allocated_bytes=current_mps,
-            driver_mps_allocated_bytes=driver_mps,
-            recommended_mps_memory_bytes=recommended_mps,
+            accelerator_kind=torch.device(selected_device).type,
+            peak_accelerator_allocated_bytes=(peak_accelerator or None),
+            current_accelerator_allocated_bytes=current_accelerator,
+            reserved_accelerator_allocated_bytes=reserved_accelerator,
+            accelerator_total_memory_bytes=total_accelerator,
+            accelerator_fingerprint=fingerprint,
             parameter_count_metadata=parameter_count,
-            checkpoint_path=str(best_path),
+            checkpoint_path=(
+                best_path.name if profile.version == "2" else str(best_path)
+            ),
             checkpoint_sha256=checkpoint_hash,
-            event_log_path=str(event_path),
+            event_log_path=(
+                event_path.name if profile.version == "2" else str(event_path)
+            ),
             unsupported_operation_fallback=False,
             scientific=profile.scientific,
             hardware_matched=selection.hardware_matched,
             cleanup_completed=False,
+            schema_version="1.0" if profile.version == "1" else "2.0",
         )
     except BaseException as error:
         train_seconds = max(0.0, time.perf_counter() - started)
@@ -1259,21 +1603,32 @@ def train_candidate_in_process(
             "candidate_contract"
             if isinstance(error, ValueError)
             and "contract failed" in str(error)
-            else _failure_stage(error)
+            else _failure_stage(error, requested_device=selected_device)
         )
         if stage == "model_initialization" and current_stage != "model_initialization":
             stage = current_stage
-        error_text = f"{type(error).__name__}: {error}"
+        error_text = (
+            f"{type(error).__name__}: training failed; details suppressed"
+            if profile.version == "2"
+            else f"{type(error).__name__}: {error}"
+        )
         if output_prepared:
-            _atomic_json(
-                destination / "failure.json",
+            failure_payload = (
                 {
+                    "failure_stage": stage,
+                    "error_type": type(error).__name__,
+                    "message": "training failed; details suppressed",
+                    "timestamp": _utc_now(),
+                }
+                if profile.version == "2"
+                else {
                     "failure_stage": stage,
                     "error": error_text,
                     "traceback": traceback.format_exc(),
                     "timestamp": _utc_now(),
-                },
+                }
             )
+            _atomic_json(destination / "failure.json", failure_payload)
         result = TrainingResult(
             success=False,
             failure_stage=stage,
@@ -1299,36 +1654,64 @@ def train_candidate_in_process(
                 final_loss if math.isfinite(final_loss) else 0.0
             ),
             train_seconds=train_seconds,
-            peak_mps_allocated_bytes=peak_mps or None,
-            current_mps_allocated_bytes=current_mps,
-            driver_mps_allocated_bytes=driver_mps,
-            recommended_mps_memory_bytes=recommended_mps,
+            accelerator_kind=AcceleratorKind.parse(selected_device).value,
+            peak_accelerator_allocated_bytes=peak_accelerator or None,
+            current_accelerator_allocated_bytes=current_accelerator,
+            reserved_accelerator_allocated_bytes=reserved_accelerator,
+            accelerator_total_memory_bytes=total_accelerator,
+            accelerator_fingerprint=fingerprint,
             parameter_count_metadata=parameter_count,
-            checkpoint_path=str(best_path) if best_path.exists() else "",
+            checkpoint_path=(
+                best_path.name
+                if best_path.exists() and profile.version == "2"
+                else str(best_path) if best_path.exists() else ""
+            ),
             checkpoint_sha256=checkpoint_hash,
-            event_log_path=str(event_path),
+            event_log_path=(
+                event_path.name if profile.version == "2" else str(event_path)
+            ),
             unsupported_operation_fallback=False,
             scientific=profile.scientific,
             hardware_matched=False,
             cleanup_completed=False,
+            schema_version="1.0" if profile.version == "1" else "2.0",
         )
     finally:
         del optimizer
         del model
         gc.collect()
-        if selected_device == "mps" and hasattr(torch, "mps"):
-            try:
-                torch.mps.empty_cache()
-            except RuntimeError:
-                pass
-        cleanup_completed = True
+        try:
+            cleanup_accelerator(torch.device(selected_device))
+        except (RuntimeError, ValueError, DeviceUnavailableError) as cleanup_error:
+            cleanup_completed = False
+            if output_prepared:
+                _atomic_json(
+                    destination / "cleanup_failure.json",
+                    {
+                        "failure_stage": "accelerator_cleanup_failure",
+                        "error_type": type(cleanup_error).__name__,
+                        "timestamp": _utc_now(),
+                    },
+                )
+            if result is not None and result.success:
+                result = TrainingResult.from_dict(
+                    {
+                        **result.to_dict(),
+                        "success": False,
+                        "failure_stage": "accelerator_cleanup_failure",
+                        "error": (
+                            f"{type(cleanup_error).__name__}: "
+                            "accelerator cleanup failed"
+                        ),
+                        "cleanup_completed": False,
+                    }
+                )
+        else:
+            cleanup_completed = True
 
     assert result is not None
-    result = TrainingResult(
-        **{
-            **result.to_dict(),
-            "cleanup_completed": cleanup_completed,
-        }
+    result = TrainingResult.from_dict(
+        {**result.to_dict(), "cleanup_completed": cleanup_completed}
     )
     if output_prepared:
         _atomic_json(destination / "training_summary.json", result.to_dict())

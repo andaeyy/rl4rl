@@ -5,7 +5,9 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import stat
 import tempfile
+from contextlib import suppress
 from dataclasses import asdict, is_dataclass
 from enum import Enum
 from pathlib import Path
@@ -105,32 +107,185 @@ def atomic_write_json(path: str | Path, value: Any) -> None:
             temporary.unlink()
 
 
-def create_json_exclusive(path: str | Path, value: Any) -> None:
-    """Create a frozen JSON file exactly once, leaving an existing file untouched."""
+def _open_exclusive_json_parent(
+    destination: Path,
+    *,
+    create: bool,
+) -> tuple[int, Path]:
+    """Open a path's parent without following any directory symlink."""
 
-    destination = Path(path)
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    descriptor = os.open(
+    absolute = Path(os.path.abspath(os.fspath(destination)))
+    if not absolute.name or absolute.name in {".", ".."}:
+        raise ValueError("exclusive JSON destination must name a file")
+    components = absolute.parts
+    if not absolute.is_absolute() or not components:
+        raise ValueError("exclusive JSON destination could not be anchored")
+
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_DIRECTORY", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(absolute.anchor, flags)
+    try:
+        for component in components[1:-1]:
+            if component in {"", ".", ".."}:
+                raise ValueError(
+                    "exclusive JSON parent contains an unsafe path component"
+                )
+            if create:
+                try:
+                    os.mkdir(component, 0o755, dir_fd=descriptor)
+                except FileExistsError:
+                    pass
+                else:
+                    os.fsync(descriptor)
+            try:
+                before = os.stat(
+                    component,
+                    dir_fd=descriptor,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                raise FileNotFoundError(
+                    f"exclusive JSON parent does not exist: {absolute.parent}"
+                ) from None
+            if stat.S_ISLNK(before.st_mode):
+                raise ValueError("exclusive JSON parent may not contain a symlink")
+            if not stat.S_ISDIR(before.st_mode):
+                raise NotADirectoryError(
+                    f"exclusive JSON parent component is not a directory: {component}"
+                )
+            try:
+                next_descriptor = os.open(component, flags, dir_fd=descriptor)
+            except OSError as error:
+                raise ValueError(
+                    "exclusive JSON parent changed while it was opened"
+                ) from error
+            opened = os.fstat(next_descriptor)
+            if (before.st_dev, before.st_ino) != (opened.st_dev, opened.st_ino):
+                os.close(next_descriptor)
+                raise ValueError(
+                    "exclusive JSON parent changed while it was opened"
+                )
+            os.close(descriptor)
+            descriptor = next_descriptor
+        return descriptor, absolute
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _require_same_exclusive_json_parent(
+    destination: Path,
+    expected_descriptor: int,
+) -> None:
+    reopened_descriptor, _ = _open_exclusive_json_parent(
         destination,
-        os.O_WRONLY | os.O_CREAT | os.O_EXCL,
-        0o600,
+        create=False,
     )
     try:
-        payload = json.dumps(
+        expected = os.fstat(expected_descriptor)
+        reopened = os.fstat(reopened_descriptor)
+        if (expected.st_dev, expected.st_ino) != (
+            reopened.st_dev,
+            reopened.st_ino,
+        ):
+            raise ValueError(
+                "exclusive JSON parent changed during create-only publication"
+            )
+    finally:
+        os.close(reopened_descriptor)
+
+
+def create_json_exclusive(path: str | Path, value: Any) -> None:
+    """Durably create one frozen JSON file without following path symlinks."""
+
+    destination = Path(path)
+    encoded = (
+        json.dumps(
             json_value(value),
             sort_keys=True,
             indent=2,
             ensure_ascii=False,
             allow_nan=False,
-        ) + "\n"
-        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-            handle.write(payload)
-            handle.flush()
-            os.fsync(handle.fileno())
-    except BaseException:
-        # A partial frozen plan is safer left visible than silently replaced. Loading it
-        # will fail closed and require deliberate operator recovery.
-        raise
+        )
+        + "\n"
+    ).encode("utf-8")
+    parent_descriptor, absolute = _open_exclusive_json_parent(
+        destination,
+        create=True,
+    )
+    published = False
+    try:
+        _require_same_exclusive_json_parent(absolute, parent_descriptor)
+        write_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        write_flags |= getattr(os, "O_CLOEXEC", 0)
+        write_flags |= getattr(os, "O_NOFOLLOW", 0)
+        published_descriptor = os.open(
+            absolute.name,
+            write_flags,
+            0o600,
+            dir_fd=parent_descriptor,
+        )
+        published = True
+        try:
+            remaining = memoryview(encoded)
+            while remaining:
+                try:
+                    written = os.write(published_descriptor, remaining)
+                except InterruptedError:
+                    continue
+                if written <= 0:
+                    raise OSError("exclusive JSON write made no progress")
+                remaining = remaining[written:]
+            os.fsync(published_descriptor)
+            published_stat = os.fstat(published_descriptor)
+            if (
+                not stat.S_ISREG(published_stat.st_mode)
+                or published_stat.st_nlink != 1
+                or published_stat.st_uid != os.getuid()
+                or published_stat.st_size != len(encoded)
+                or stat.S_IMODE(published_stat.st_mode) & 0o077
+            ):
+                raise ValueError("published exclusive JSON file is unsafe")
+        except BaseException:
+            # Never remove or replace a partially written frozen record.  A
+            # durable invalid file quarantines the run and blocks silent reuse.
+            with suppress(OSError):
+                os.fsync(published_descriptor)
+            raise
+        finally:
+            os.close(published_descriptor)
+        os.fsync(parent_descriptor)
+
+        read_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        read_flags |= getattr(os, "O_NOFOLLOW", 0)
+        reopened_descriptor = os.open(
+            absolute.name,
+            read_flags,
+            dir_fd=parent_descriptor,
+        )
+        try:
+            reopened_stat = os.fstat(reopened_descriptor)
+            if (
+                not stat.S_ISREG(reopened_stat.st_mode)
+                or reopened_stat.st_nlink != 1
+                or reopened_stat.st_uid != os.getuid()
+                or reopened_stat.st_size != len(encoded)
+                or stat.S_IMODE(reopened_stat.st_mode) & 0o077
+            ):
+                raise ValueError("published exclusive JSON file is unsafe")
+            with os.fdopen(reopened_descriptor, "rb", closefd=False) as handle:
+                reopened = handle.read(len(encoded) + 1)
+        finally:
+            os.close(reopened_descriptor)
+        if reopened != encoded:
+            raise ValueError("published exclusive JSON bytes differ")
+        _require_same_exclusive_json_parent(absolute, parent_descriptor)
+    finally:
+        if published:
+            with suppress(OSError):
+                os.fsync(parent_descriptor)
+        os.close(parent_descriptor)
 
 
 def read_json(path: str | Path) -> dict[str, Any]:

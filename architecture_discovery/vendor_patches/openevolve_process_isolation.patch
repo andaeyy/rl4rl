@@ -1,0 +1,286 @@
+diff --git a/openevolve/process_parallel.py b/openevolve/process_parallel.py
+index b2cfeab..bd87890 100644
+--- a/openevolve/process_parallel.py
++++ b/openevolve/process_parallel.py
+@@ -3,8 +3,10 @@ Process-based parallel controller for true parallelism
+ """
+ 
+ import asyncio
++import hmac
+ import logging
+ import multiprocessing as mp
++import os
+ import pickle
+ import signal
+ import time
+@@ -20,6 +22,9 @@ from openevolve.utils.metrics_utils import safe_numeric_average
+ 
+ logger = logging.getLogger(__name__)
+ 
++_DISCOVERY_API_KEY_ENV = "DISCOVERY_API_KEY"
++_DISCOVERY_API_KEY_REFERENCE = "${DISCOVERY_API_KEY}"
++
+ 
+ @dataclass
+ class SerializableResult:
+@@ -36,14 +41,31 @@ class SerializableResult:
+     target_island: Optional[int] = None  # Island where child should be placed
+ 
+ 
+-def _worker_init(config_dict: dict, evaluation_file: str, parent_env: dict = None) -> None:
+-    """Initialize worker process with necessary components"""
+-    import os
++def _resolve_worker_api_key_reference(value: Optional[str]) -> Optional[str]:
++    """Resolve the one approved process-boundary credential reference.
++
++    Provider credentials must reach a spawned worker only through its inherited
++    environment.  Rejecting every other serialized value prevents a caller from
++    smuggling a literal key (or a reference to an unapproved variable) through
++    ``ProcessPoolExecutor.initargs``.
++    """
+ 
+-    # Set environment from parent process
+-    if parent_env:
+-        os.environ.update(parent_env)
++    if value is None:
++        return None
++    if value != _DISCOVERY_API_KEY_REFERENCE:
++        raise ValueError(
++            "worker provider config must use the approved DISCOVERY_API_KEY reference"
++        )
++    inherited = os.environ.get(_DISCOVERY_API_KEY_ENV)
++    if not inherited:
++        raise ValueError(
++            "DISCOVERY_API_KEY must be non-empty in the inherited worker environment"
++        )
++    return inherited
+ 
++
++def _worker_init(config_dict: dict, evaluation_file: str) -> None:
++    """Initialize worker process with necessary components"""
+     global _worker_config
+     global _worker_evaluation_file
+     global _worker_evaluator
+@@ -61,12 +83,26 @@ def _worker_init(config_dict: dict, evaluation_file: str, parent_env: dict = Non
+         PromptConfig,
+     )
+ 
+-    # Reconstruct model objects
+-    models = [LLMModelConfig(**m) for m in config_dict["llm"]["models"]]
+-    evaluator_models = [LLMModelConfig(**m) for m in config_dict["llm"]["evaluator_models"]]
++    # Resolve only the exact non-secret reference emitted by the parent.  Do
++    # this before constructing config dataclasses so their generic ${VAR}
++    # support cannot expand an unexpected environment variable here.
++    def model_config(payload: dict) -> LLMModelConfig:
++        resolved = payload.copy()
++        resolved["api_key"] = _resolve_worker_api_key_reference(
++            resolved.get("api_key")
++        )
++        return LLMModelConfig(**resolved)
++
++    models = [model_config(m) for m in config_dict["llm"]["models"]]
++    evaluator_models = [
++        model_config(m) for m in config_dict["llm"]["evaluator_models"]
++    ]
+ 
+     # Create LLM config with models
+     llm_dict = config_dict["llm"].copy()
++    llm_dict["api_key"] = _resolve_worker_api_key_reference(
++        llm_dict.get("api_key")
++    )
+     llm_dict["models"] = models
+     llm_dict["evaluator_models"] = evaluator_models
+     llm_config = LLMConfig(**llm_dict)
+@@ -415,18 +451,25 @@ class ProcessParallelController:
+         logger.info(f"Initialized process parallel controller with {self.num_workers} workers")
+ 
+     def _serialize_config(self, config: Config) -> dict:
+-        """Serialize config object to a dictionary that can be pickled"""
++        """Serialize config without copying provider credential bytes."""
+         # Manual serialization to handle nested objects properly
+ 
+         # The asdict() call itself triggers the deepcopy which tries to serialize novelty_llm. Remove it first.
+         config.database.novelty_llm = None
+ 
++        def model_dict(model) -> dict:
++            payload = asdict(model)
++            payload["api_key"] = self._api_key_reference(payload.get("api_key"))
++            return payload
++
+         return {
+             "llm": {
+-                "models": [asdict(m) for m in config.llm.models],
+-                "evaluator_models": [asdict(m) for m in config.llm.evaluator_models],
++                "models": [model_dict(m) for m in config.llm.models],
++                "evaluator_models": [
++                    model_dict(m) for m in config.llm.evaluator_models
++                ],
+                 "api_base": config.llm.api_base,
+-                "api_key": config.llm.api_key,
++                "api_key": self._api_key_reference(config.llm.api_key),
+                 "temperature": config.llm.temperature,
+                 "top_p": config.llm.top_p,
+                 "max_tokens": config.llm.max_tokens,
+@@ -448,22 +491,39 @@ class ProcessParallelController:
+             "file_suffix": self.file_suffix,
+         }
+ 
++    @staticmethod
++    def _api_key_reference(value: Optional[str]) -> Optional[str]:
++        """Replace a validated in-memory key with its environment reference."""
++
++        if value is None:
++            return None
++        expected = os.environ.get(_DISCOVERY_API_KEY_ENV)
++        if expected is None:
++            raise ValueError(
++                "DISCOVERY_API_KEY must be present before serializing provider config"
++            )
++        if value == _DISCOVERY_API_KEY_REFERENCE:
++            return value
++        if not hmac.compare_digest(str(value), expected):
++            raise ValueError(
++                "provider config key does not match the approved environment key"
++            )
++        return _DISCOVERY_API_KEY_REFERENCE
++
+     def start(self) -> None:
+         """Start the process pool"""
+         # Convert config to dict for pickling
+         # We need to be careful with nested dataclasses
+         config_dict = self._serialize_config(self.config)
+ 
+-        # Pass current environment to worker processes
+-        import os
++        # Workers inherit the already-narrow proposal environment directly from
++        # the OS. Never place an environment snapshot in ProcessPool initargs.
+         import sys
+ 
+-        current_env = dict(os.environ)
+-
+         executor_kwargs = {
+             "max_workers": self.num_workers,
+             "initializer": _worker_init,
+-            "initargs": (config_dict, self.evaluation_file, current_env),
++            "initargs": (config_dict, self.evaluation_file),
+         }
+         if sys.version_info >= (3, 11):
+             logger.info(f"Set max {self.config.max_tasks_per_child} tasks per child")
+diff --git a/tests/test_process_parallel.py b/tests/test_process_parallel.py
+index 23c6f92..56777dc 100644
+--- a/tests/test_process_parallel.py
++++ b/tests/test_process_parallel.py
+@@ -4,6 +4,7 @@ Tests for process-based parallel controller
+ 
+ import asyncio
+ import os
++import pickle
+ from pathlib import Path
+ import tempfile
+ import unittest
+@@ -21,7 +22,14 @@ def _slow_test_worker(marker_path: str) -> str:
+ # Set dummy API key for testing
+ os.environ["OPENAI_API_KEY"] = "test"
+ 
+-from openevolve.config import Config, DatabaseConfig, EvaluatorConfig, LLMConfig, PromptConfig
++from openevolve.config import (
++    Config,
++    DatabaseConfig,
++    EvaluatorConfig,
++    LLMConfig,
++    LLMModelConfig,
++    PromptConfig,
++)
+ from openevolve.database import Program, ProgramDatabase
+ from openevolve import process_parallel as process_parallel_module
+ from openevolve.process_parallel import ProcessParallelController, SerializableResult
+@@ -95,6 +103,89 @@ def evaluate(program_path):
+         self.assertIsNone(controller.executor)
+         self.assertTrue(controller.shutdown_event.is_set())
+ 
++    def test_controller_initargs_contain_only_api_key_environment_reference(self):
++        """Process-pool pickle payloads never contain provider key bytes."""
++
++        literal_key = "fake-provider-key-never-pickle"
++        model = LLMModelConfig(name="test-model", api_key=literal_key)
++        self.config.llm.api_key = literal_key
++        self.config.llm.models = [model]
++        self.config.llm.evaluator_models = [model]
++        captured = {}
++
++        class FakeExecutor:
++            def __init__(self, **kwargs):
++                captured.update(kwargs)
++
++        controller = ProcessParallelController(
++            self.config, self.eval_file, self.database
++        )
++        with patch.dict(os.environ, {"DISCOVERY_API_KEY": literal_key}), patch.object(
++            process_parallel_module,
++            "ProcessPoolExecutor",
++            FakeExecutor,
++        ):
++            controller.start()
++
++        pickled = pickle.dumps(captured["initargs"])
++        self.assertNotIn(literal_key.encode(), pickled)
++        self.assertIn(b"${DISCOVERY_API_KEY}", pickled)
++        self.assertEqual(len(captured["initargs"]), 2)
++        self.assertNotIn("OPENAI_API_KEY", repr(captured["initargs"]))
++
++    def test_worker_initializer_resolves_reference_before_client_construction(self):
++        """The spawned worker gives the inherited key, not a placeholder, to OpenAI."""
++
++        literal_key = "inherited-fake-provider-key"
++        model = LLMModelConfig(name="test-model", api_key=literal_key)
++        self.config.llm.api_key = literal_key
++        self.config.llm.models = [model]
++        self.config.llm.evaluator_models = [model]
++        controller = ProcessParallelController(
++            self.config, self.eval_file, self.database
++        )
++        client_calls = []
++
++        class FakeOpenAI:
++            def __init__(self, **kwargs):
++                client_calls.append(kwargs)
++
++        from openevolve.llm import openai as openai_module
++        from openevolve.llm.ensemble import LLMEnsemble
++
++        with patch.dict(
++            os.environ, {"DISCOVERY_API_KEY": literal_key}
++        ), patch.object(openai_module.openai, "OpenAI", FakeOpenAI):
++            serialized = controller._serialize_config(self.config)
++            process_parallel_module._worker_init(serialized, self.eval_file)
++            ensemble = LLMEnsemble(
++                process_parallel_module._worker_config.llm.models
++            )
++
++        self.assertEqual(ensemble.models[0].api_key, literal_key)
++        self.assertEqual(client_calls[0]["api_key"], literal_key)
++        self.assertNotEqual(
++            client_calls[0]["api_key"], "${DISCOVERY_API_KEY}"
++        )
++
++    def test_worker_rejects_raw_or_unapproved_api_key_references(self):
++        with patch.dict(
++            os.environ, {"DISCOVERY_API_KEY": "inherited-fake-provider-key"}
++        ):
++            for value in ("literal-key", "${OPENAI_API_KEY}"):
++                with self.subTest(value=value), self.assertRaisesRegex(
++                    ValueError, "approved DISCOVERY_API_KEY reference"
++                ):
++                    process_parallel_module._resolve_worker_api_key_reference(value)
++
++    def test_worker_rejects_missing_inherited_api_key(self):
++        with patch.dict(os.environ, {}, clear=True), self.assertRaisesRegex(
++            ValueError, "must be non-empty"
++        ):
++            process_parallel_module._resolve_worker_api_key_reference(
++                "${DISCOVERY_API_KEY}"
++            )
++
+     def test_controller_stop_terminates_running_workers(self):
+         """Stopping the controller does not wait for stuck process-pool work."""
+         controller = ProcessParallelController(self.config, self.eval_file, self.database)

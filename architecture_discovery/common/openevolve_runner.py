@@ -38,6 +38,14 @@ from common.public_evaluation import (
     PUBLIC_LAYER_A_SOURCE_ID,
     PUBLIC_LAYER_A_SOURCE_SHA256,
 )
+from common.provider_attempts import (
+    PROVIDER_ATTEMPT_ACTION_ENV,
+    PROVIDER_ATTEMPT_HARNESS_ENV,
+    PROVIDER_ATTEMPT_LEDGER_ENV,
+    PROVIDER_ATTEMPT_LEDGER_FILENAME,
+    PROVIDER_ATTEMPT_SCHEMA,
+    ProviderAttemptLedger,
+)
 from common.task_adapter import DEFAULT_TASK
 from common.trainer import (
     trusted_component_hashes,
@@ -49,7 +57,7 @@ from common.training_config import PROFILES, TrainingSeedBundle, get_training_pr
 
 ROOT = Path(__file__).resolve().parents[1]
 INITIAL_IR_CANDIDATE = ROOT / "common" / "initial_candidate.ir.json"
-ENGINEERING_TRAINING_PROFILE = "smoke_train_v1"
+ENGINEERING_TRAINING_PROFILE = "smoke_train_cuda_v2"
 ENGINEERING_EVALUATION_PROFILE = "smoke_eval_v1"
 _PARENT_CHANGE_ENFORCEMENT_ENV = "DISCOVERY_ENFORCE_PARENT_ARCHITECTURE_CHANGE"
 _PARENT_ARCHITECTURE_HASH_ENV = "DISCOVERY_PARENT_ARCHITECTURE_HASH"
@@ -293,7 +301,7 @@ def _build_model_config(
     )
 
 
-def run_controller(kind: str, argv: Sequence[str] | None = None) -> None:
+def _run_controller_impl(kind: str, argv: Sequence[str] | None = None) -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--iterations", type=_positive_int, default=5)
     parser.add_argument("--seed", type=int, default=1)
@@ -312,7 +320,7 @@ def run_controller(kind: str, argv: Sequence[str] | None = None) -> None:
         choices=sorted(EVALUATION_PROFILES),
     )
     parser.add_argument("--evaluation-cases", type=_positive_int)
-    parser.add_argument("--device", choices=("mps", "cpu"))
+    parser.add_argument("--device", choices=("cuda", "mps", "cpu"))
     parser.add_argument("--resume-checkpoint")
     args = parser.parse_args(argv)
     if args.resume_checkpoint:
@@ -372,9 +380,19 @@ def run_controller(kind: str, argv: Sequence[str] | None = None) -> None:
         or os.environ.get("DISCOVERY_TRAIN_DEVICE")
         or training_config["device"]
     ).lower()
-    if args.engineering_pilot and training_device != "mps":
+    if (
+        args.engineering_pilot
+        and training_device != training_profile.device_requirement
+    ):
         raise SystemExit(
-            "provider-backed OpenEvolve engineering pilots require device='mps'"
+            "provider-backed OpenEvolve engineering pilots require device='cuda'"
+        )
+    if training_profile.scientific and (
+        training_device != training_profile.device_requirement
+    ):
+        raise SystemExit(
+            "scientific OpenEvolve training requires "
+            f"device={training_profile.device_requirement!r}"
         )
     allow_cpu_for_tests = bool(training_config["allow_cpu_for_tests"])
     training_seeds = TrainingSeedBundle.from_run_seed(args.seed)
@@ -508,6 +526,27 @@ def run_controller(kind: str, argv: Sequence[str] | None = None) -> None:
         )
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc
+    if generation.retries != 0 or generation.retry_delay_seconds != 0:
+        raise SystemExit(
+            "provider attempts are single-shot; retries and retry delay must be zero"
+        )
+    attempt_action = (
+        "one_opportunity_engineering_canary"
+        if args.engineering_pilot
+        else "scientific_replication"
+    )
+    attempt_ledger = output_dir / PROVIDER_ATTEMPT_LEDGER_FILENAME
+    ProviderAttemptLedger.create(
+        attempt_ledger,
+        harness=f"openevolve_{kind}",
+        action=attempt_action,
+        controller_run_id=run_id,
+        api_endpoint=provider_endpoint.base_url,
+        model=generation.model,
+    )
+    os.environ[PROVIDER_ATTEMPT_LEDGER_ENV] = str(attempt_ledger)
+    os.environ[PROVIDER_ATTEMPT_HARNESS_ENV] = f"openevolve_{kind}"
+    os.environ[PROVIDER_ATTEMPT_ACTION_ENV] = attempt_action
     config.max_iterations = args.iterations
     config.random_seed = args.seed
     config.database.random_seed = args.seed
@@ -552,6 +591,8 @@ def run_controller(kind: str, argv: Sequence[str] | None = None) -> None:
         "mutation_budget": args.iterations,
         "proposal_opportunities": args.iterations,
         "maximum_provider_attempts": args.iterations * (generation.retries + 1),
+        "provider_attempt_ledger": PROVIDER_ATTEMPT_LEDGER_FILENAME,
+        "provider_attempt_schema": PROVIDER_ATTEMPT_SCHEMA,
         "candidate_training_budget": args.iterations + 1,
         "initial_program_is_evaluated": True,
         "engineering_pilot": args.engineering_pilot,
@@ -574,7 +615,11 @@ def run_controller(kind: str, argv: Sequence[str] | None = None) -> None:
             "duplicate_proposals_train": False,
             "duplicate_proposals_consume_opportunity": True,
         },
-        "proposal_terminal_ledger": str(terminal_ledger),
+        "proposal_terminal_ledger": (
+            str(terminal_ledger)
+            if training_profile.version == "1"
+            else terminal_ledger.name
+        ),
         "evaluator_hash": file_hash(ROOT / "common" / "evaluator.py"),
         "trusted_executable_component_hashes": component_hashes,
         "trusted_component_set_sha256": trusted_component_set_sha256(
@@ -622,6 +667,10 @@ def run_controller(kind: str, argv: Sequence[str] | None = None) -> None:
             "pi_decision_record_id": evaluation_plan.pi_decision_record_id,
         },
     }
+    if training_profile.version == "2":
+        run_manifest.update(
+            {"schema_name": "ControllerRunManifest", "schema_version": "2.0"}
+        )
     (output_dir / "run_manifest.json").write_text(
         json.dumps(run_manifest, indent=2, sort_keys=True) + "\n"
     )
@@ -671,6 +720,10 @@ def run_controller(kind: str, argv: Sequence[str] | None = None) -> None:
         "authoritative_scientific_evidence": False,
         "failure_stage": failure_stage,
     }
+    if training_profile.version == "2":
+        run_result.update(
+            {"schema_name": "ControllerRunResult", "schema_version": "2.0"}
+        )
     (output_dir / "run_result.json").write_text(
         json.dumps(run_result, indent=2, sort_keys=True) + "\n"
     )
@@ -684,3 +737,44 @@ def run_controller(kind: str, argv: Sequence[str] | None = None) -> None:
             "OpenEvolve stopped before every requested proposal opportunity had "
             f"a terminal outcome ({terminal_count}/{args.iterations})"
         )
+
+
+_RUN_ENVIRONMENT_KEYS = (
+    "DISCOVERY_TRAINING_PROFILE",
+    "DISCOVERY_TRAINING_SEED",
+    "DISCOVERY_TRAIN_DEVICE",
+    "DISCOVERY_ALLOW_CPU_TRAINING",
+    "DISCOVERY_TRAINING_OUTPUT_ROOT",
+    "DISCOVERY_STUDY_ID",
+    "DISCOVERY_BLOCK_ID",
+    "DISCOVERY_RUN_ID",
+    "DISCOVERY_CONDITION_ID",
+    "DISCOVERY_LAYER_A_PROFILE",
+    "DISCOVERY_LAYER_A_CASES",
+    "DISCOVERY_ENGINEERING_PILOT",
+    "DISCOVERY_ELIGIBILITY_THRESHOLD",
+    "DISCOVERY_SCIENTIFIC_DECISION_RECORD",
+    _PARENT_CHANGE_ENFORCEMENT_ENV,
+    _INITIAL_ARCHITECTURE_HASH_ENV,
+    _ARCHITECTURE_REGISTRY_ENV,
+    _TERMINAL_LEDGER_ENV,
+    PROVIDER_ATTEMPT_LEDGER_ENV,
+    PROVIDER_ATTEMPT_HARNESS_ENV,
+    PROVIDER_ATTEMPT_ACTION_ENV,
+    _PARENT_ARCHITECTURE_HASH_ENV,
+    _INITIAL_EVALUATION_AUTH_ENV,
+)
+
+
+def run_controller(kind: str, argv: Sequence[str] | None = None) -> None:
+    """Run one controller without leaking run-local state into its parent."""
+
+    snapshot = {name: os.environ.get(name) for name in _RUN_ENVIRONMENT_KEYS}
+    try:
+        _run_controller_impl(kind, argv)
+    finally:
+        for name, value in snapshot.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value

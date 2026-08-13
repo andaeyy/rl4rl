@@ -8,6 +8,13 @@
 **Scientific unit:** one complete search run  
 **Benchmark role:** AdderBoard is a controlled synthetic testbed, not evidence of broad scientific invention
 
+**Execution amendment (August 9, 2026):** New remote runs use the separately
+versioned Modal/NVIDIA CUDA condition. Historical MPS profiles and receipts are
+preserved for reproduction and are not evidence of cross-device equivalence.
+Accelerator migration does not alter any causal estimand, budget ceiling,
+firewall, containment requirement, scientific blocker, or authorization gate
+in this amendment.
+
 ---
 
 # 1. Research claim
@@ -501,13 +508,15 @@ Do not launch the paid pilot until all items pass.
 The primary offline infrastructure now exists, but the confirmatory study is
 not launch-ready.
 
-1. Arbitrary Python is still not proven contained by an OS boundary on the real
-   MPS host. Static scanning and credential scrubbing remain defense in depth.
-2. The typed architecture IR and runtime probes exist, but a trusted
-   evaluator-owned interpreter is not connected to scientific evaluation
-   records.
-3. `full_train_v1` has not completed in an MPS-available process, and CPU smoke
-   results cannot satisfy this gate.
+1. Arbitrary Python is still not proven contained by an OS boundary on the
+   actual scientific execution condition. A Modal container, static scanning,
+   and credential scrubbing remain defense in depth, not proof.
+2. The trusted architecture IR interpreter and runtime probes are connected for
+   the native harnesses, but the primary C0-C3 scientific adapter remains on
+   the blocked legacy Python path.
+3. `full_train_cuda_v2` has not completed on the canonical Modal CUDA condition,
+   and CPU or engineering-smoke results cannot satisfy this gate. Historical
+   MPS evidence remains non-equivalent compatibility evidence.
 4. Layer B/C sources, counts, thresholds, custody, and release artifacts are
    not frozen. Smoke-scale profiles are rejected rather than silently reused.
 5. The reference corpus, independent reviewer roster, mechanism plan,
@@ -522,7 +531,7 @@ not launch-ready.
 8. The main study remains blocked until the paid pilot is reconstructed and its
    estimates are used to freeze the final power and analysis plan.
 9. Scientific receipts now reject truthiness and numeric coercion, cross-link
-   the study, protocol, mechanism, replication, analysis, MPS, and pilot
+   the study, protocol, mechanism, replication, analysis, accelerator, and pilot
    artifacts, and require explicit PI launch authorization. The external-anchor
    signature verifier and actual custodian receipt remain unimplemented.
 
@@ -530,7 +539,7 @@ Online shadow scoring, smoke-size scientific evaluation, native-controller
 confounding, descriptor-based novelty claims, rehashed randomization attacks,
 type-confused booleans and counts, active-state treatment tampering,
 canonical-cluster relabeling, indirect capability recovery, non-finite budget
-bypasses, checkpoint step coercion, and syntactic MPS receipts now have hard
+bypasses, checkpoint step coercion, and syntactic accelerator receipts now have hard
 regression coverage.
 
 ---

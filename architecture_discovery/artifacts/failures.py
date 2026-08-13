@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Any, FrozenSet
+from typing import Any
 
 from artifacts.records import content_sha256, require_identifier
 
@@ -25,9 +25,16 @@ class FailureClass(StrEnum):
     PROVIDER_TRANSIENT = "provider_transient"
     WORKER_CRASH = "worker_crash"
     MPS_DRIVER_FAILURE = "mps_driver_failure"
+    CUDA_DRIVER_FAILURE = "cuda_driver_failure"
+    CUDA_DETERMINISTIC_KERNEL_UNAVAILABLE = (
+        "cuda_deterministic_kernel_unavailable"
+    )
+    ACCELERATOR_CLEANUP_FAILURE = "accelerator_cleanup_failure"
     FILESYSTEM_IO = "filesystem_io"
     POWER_INTERRUPTION = "power_interruption"
     MPS_UNAVAILABLE = "mps_unavailable"
+    CUDA_UNAVAILABLE = "cuda_unavailable"
+    MODAL_INFRASTRUCTURE_FAILURE = "modal_infrastructure_failure"
     CONTAINMENT_UNAVAILABLE = "containment_unavailable"
 
 
@@ -41,18 +48,25 @@ _DOMAIN_BY_CLASS = {
     FailureClass.PROVIDER_TRANSIENT: FailureDomain.INFRASTRUCTURE,
     FailureClass.WORKER_CRASH: FailureDomain.INFRASTRUCTURE,
     FailureClass.MPS_DRIVER_FAILURE: FailureDomain.INFRASTRUCTURE,
+    FailureClass.CUDA_DRIVER_FAILURE: FailureDomain.INFRASTRUCTURE,
+    FailureClass.CUDA_DETERMINISTIC_KERNEL_UNAVAILABLE: FailureDomain.INFRASTRUCTURE,
+    FailureClass.ACCELERATOR_CLEANUP_FAILURE: FailureDomain.INFRASTRUCTURE,
     FailureClass.FILESYSTEM_IO: FailureDomain.INFRASTRUCTURE,
     FailureClass.POWER_INTERRUPTION: FailureDomain.INFRASTRUCTURE,
     FailureClass.MPS_UNAVAILABLE: FailureDomain.INFRASTRUCTURE,
+    FailureClass.CUDA_UNAVAILABLE: FailureDomain.INFRASTRUCTURE,
+    FailureClass.MODAL_INFRASTRUCTURE_FAILURE: FailureDomain.INFRASTRUCTURE,
     FailureClass.CONTAINMENT_UNAVAILABLE: FailureDomain.INFRASTRUCTURE,
 }
 
 
-DEFAULT_RERUNNABLE_INFRASTRUCTURE_CLASSES: FrozenSet[FailureClass] = frozenset(
+DEFAULT_RERUNNABLE_INFRASTRUCTURE_CLASSES: frozenset[FailureClass] = frozenset(
     {
         FailureClass.PROVIDER_TRANSIENT,
         FailureClass.WORKER_CRASH,
         FailureClass.MPS_DRIVER_FAILURE,
+        FailureClass.CUDA_DRIVER_FAILURE,
+        FailureClass.MODAL_INFRASTRUCTURE_FAILURE,
         FailureClass.FILESYSTEM_IO,
         FailureClass.POWER_INTERRUPTION,
     }
@@ -85,7 +99,7 @@ class FailureRecord:
         failure_class: FailureClass | str,
         stage: str,
         terminal: bool = True,
-    ) -> "FailureRecord":
+    ) -> FailureRecord:
         resolved_class = FailureClass(failure_class)
         identity = {
             "attempt_id": attempt_id,
@@ -115,7 +129,7 @@ class FailureRecord:
 
 @dataclass(frozen=True)
 class RerunPolicy:
-    rerunnable_classes: FrozenSet[FailureClass] = (
+    rerunnable_classes: frozenset[FailureClass] = (
         DEFAULT_RERUNNABLE_INFRASTRUCTURE_CLASSES
     )
     max_linked_attempts: int = 2
@@ -123,7 +137,11 @@ class RerunPolicy:
     schema_version: str = "1.0"
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "rerunnable_classes", frozenset(self.rerunnable_classes))
+        object.__setattr__(
+            self,
+            "rerunnable_classes",
+            frozenset(self.rerunnable_classes),
+        )
         if self.max_linked_attempts < 1:
             raise ValueError("max_linked_attempts must be positive")
         if any(
@@ -140,7 +158,9 @@ class RerunPolicy:
         return {
             "schema_name": self.schema_name,
             "schema_version": self.schema_version,
-            "rerunnable_classes": sorted(item.value for item in self.rerunnable_classes),
+            "rerunnable_classes": sorted(
+                item.value for item in self.rerunnable_classes
+            ),
             "max_linked_attempts": self.max_linked_attempts,
         }
 
@@ -205,7 +225,9 @@ def authorize_rerun(
     if failure.attempt_id != previous_attempt_id:
         raise RerunNotAuthorized("failure does not belong to the previous attempt")
     if failure.failure_domain is not FailureDomain.INFRASTRUCTURE:
-        raise RerunNotAuthorized("candidate and scientific failures remain ITT outcomes")
+        raise RerunNotAuthorized(
+            "candidate and scientific failures remain ITT outcomes"
+        )
     if failure.failure_class not in policy.rerunnable_classes:
         raise RerunNotAuthorized("infrastructure failure class was not preregistered")
     if attempt_number < 1 or attempt_number > policy.max_linked_attempts:

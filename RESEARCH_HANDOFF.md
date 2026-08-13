@@ -2,6 +2,13 @@
 
 Source audit and recommendations current to **August 2, 2026**.
 
+Execution amendment (August 9, 2026): new `architecture_discovery` remote runs
+target the versioned Modal/CUDA condition. Historical MPS records are retained,
+with no cross-device equivalence claim. This engineering migration does not
+resolve any literature, scientific-design, custody, or launch-authorization
+decision in this handoff; see `architecture_discovery/README.md` for the paid
+infrastructure approval boundary.
+
 ## Executive assessment
 
 The project is viable, but the paper should be positioned more narrowly than

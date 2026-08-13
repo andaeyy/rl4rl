@@ -1,17 +1,17 @@
 schema_name: scientific_readiness_evidence
-schema_version: "2"
+schema_version: "4"
 status: blocked
-updated_at_utc: "2026-08-08T00:36:21Z"
+updated_at_utc: "2026-08-10T12:47:19Z"
 note: >-
   Passing engineering tests does not authorize a paid pilot or main study. A
   gate is true only when its evidence identifies implemented, reproducible
-  behavior. The positive engineering levels below are dated local self-reports,
-  not externally attested receipts. Hardware, scientific-governance, and
-  external-custody gates remain deliberately false.
+  behavior. Modal CUDA is a new execution condition and is not treated as
+  equivalent to historical MPS evidence. Local migration checks, live CUDA
+  validation, scientific governance, and external custody are separate gates.
 
 engineering_evidence_provenance:
   authority: local_self_report
-  source_revision_bound: false
+  source_revision_bound: true
   externally_attested: false
   scientific_launch_authority: false
 
@@ -20,23 +20,45 @@ levels:
     passed: true
     evidence: common engine, evaluation firewall, scientific packages, immutable ledger, reconstruction, and reporting code
   unit_tested:
-    passed: true
-    evidence: local command PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -p no:cacheprovider -q completed successfully with all 421 collected tests passing on 2026-08-08 UTC; this result is not bound to a source revision or externally attested
-  offline_smoke_tested:
-    passed: true
-    evidence: a dated local C0-C3 synthetic run completed at outputs/development/autonomous_pilot_validation/offline_engine with assignment hash 24840bee5689841d2a1f452496c2ceb587324b2047ebe3024d731b8df4af6127; all four named controller surfaces passed bounded full-document Architecture IR checks; the no-search stdout result was not retained and is not claimed by this evidence level
-  mps_validated:
     passed: false
-    evidence: a live provider-backed one-opportunity Greedy canary and the four sequential 10-opportunity engineering runs under outputs/engineering_10x4 completed smoke_train_v1 on MPS with fallback disabled; all 40 opportunities terminated, all 44 seed/proposal trainings completed ten steps, and all runtime probes passed, but the artifacts are locally self-authored, all public smoke accuracies were 0.0, full_train_v1 has not completed, and engineering smoke cannot satisfy this scientific gate
+    evidence: pending a fresh create-only source-bound local unit-test receipt after the final infrastructure freeze
+    receipt_path: outputs/readiness/modal_only_final/unit_test_evidence_receipt.json
+    receipt_contract:
+      schema_name: LocalEngineeringEvidenceReceipt
+      schema_version: "1.0"
+      evidence_kind: unit_test_suite
+  offline_smoke_tested:
+    passed: false
+    evidence: pending a fresh create-only source-bound provider-free offline-smoke receipt after the final infrastructure freeze
+    receipt_path: outputs/readiness/modal_only_final/offline_smoke_evidence_receipt.json
+    receipt_contract:
+      schema_name: LocalEngineeringEvidenceReceipt
+      schema_version: "1.0"
+      evidence_kind: offline_smoke
+  accelerator_validated:
+    passed: false
+    evidence: a superseded live Tesla T4 environment diagnostic was hash-verified and downloaded, but no version-2 CUDA training receipt, checkpoint-resume proof, final same-image validation bundle, or cleanup receipt exists
   pilot_ready:
     passed: false
-    evidence: the host readiness audit remains blocked; the successful live IR-only MPS engineering canary and 10-by-4 mechanics run do not replace revision-bound test receipts, migration of the primary C0-C3 adapter, scientific decisions, frozen plans, or launch authorization
+    evidence: the host readiness audit remains blocked by pending live Modal receipts, migration of the primary C0-C3 scientific adapter, scientific decisions, frozen plans, custody, and launch authorization
   pilot_validated:
     passed: false
     evidence: the paid 10-by-4 run was explicitly non-scientific engineering work; no paid scientific pilot has run
   main_study_ready:
     passed: false
     evidence: pilot, frozen final analysis plan, and all launch gates are incomplete
+
+historical_evidence:
+  mps_engineering:
+    status: retained_non_authorizing
+    profile: smoke_train_v1
+    profile_version: "1"
+    profile_hash: 1a2b04bcb966f4189f90d6b8f6ef3aa8f83fb537f0f031004d0e58d69192cb61
+    evidence: >-
+      The 2026-08-08 live Greedy canary and four sequential 10-opportunity
+      engineering runs completed on MPS with fallback disabled. They remain
+      readable historical mechanics evidence; they do not validate CUDA,
+      full_train_cuda_v2, or scientific conclusions.
 
 gates:
   evaluator_owned_from_scratch_training:
@@ -53,11 +75,11 @@ gates:
     evidence: frozen configs, active run state, resource ledgers, claims, replication, outcomes, and receipts reject truthiness, fractional counts, and numeric-string coercion
   manifest_security_invariants:
     passed: true
-    evidence: readiness audit enforces Layer visibility/sealing, one-shot release, no CPU fallback, full_train_v1 identity, no size objective, and feedback-free no-search booleans
+    evidence: readiness audit enforces Layer visibility/sealing, one-shot release, no CPU fallback, full_train_cuda_v2 identity, deterministic CUDA settings, bounded Modal execution, no size objective, and feedback-free no-search booleans
   frozen_block_randomization:
     passed: false
     evidence: deterministic freeze tooling is implemented, but no scientific assignment table exists
-  sequential_mps_scheduler:
+  sequential_accelerator_scheduler:
     passed: true
     evidence: study/scheduling.py and exclusive-lease adversarial tests
   layer_a_b_c_firewall:
@@ -71,16 +93,89 @@ gates:
     evidence: explicit A/B/C counts of at least 10000 are required; scientific values remain unresolved
   strong_candidate_containment:
     passed: false
-    evidence: trusted IR execution is integrated for the four native harnesses, but the primary C0-C3 scientific engine still lacks a frozen IR-only candidate contract or candidate-bound macOS/MPS OS attestation
+    evidence: trusted IR execution and an IR-only candidate contract are integrated for the four native harnesses and the primary C0-C3 engine; this scientific gate remains false until the frozen executable StudySpec and canonical Modal full-profile validation bind that contract in an authorized pilot receipt
   transformer_runtime_validity:
     passed: true
     evidence: common/evaluator.py runs evaluator-owned runtime/metamorphic probes for interpreted IR candidates and retains a hash-linked Layer A runtime-validity artifact
-  full_profile_mps_validation:
+  full_profile_accelerator_validation:
     passed: false
-    evidence: full_train_v1 has not completed in an MPS-available process
-  mps_evidence_recorder_implemented:
+    evidence: full_train_cuda_v2 has not completed on the canonical Modal CUDA execution condition; an engineering smoke cannot satisfy this scientific gate
+  accelerator_evidence_recorder_implemented:
     passed: true
-    evidence: scripts/record_mps_validation.py hash-links and revalidates the full training summary, manifest, candidate source, device, fallback, containment, and exact step count
+    evidence: scripts/record_accelerator_validation.py binds versioned CUDA training artifacts, execution context, image source, requested and observed GPU, dependency lock, runtime telemetry, hashes, and cleanup; the historical MPS recorder remains available
+  modal_execution_boundary_implemented:
+    passed: true
+    evidence: >-
+      modal_app.py and modal_boundary.py define pinned, bounded, synchronous,
+      optional-SDK execution with a source allowlist, one Volume, one named
+      provider Secret, exact official endpoint/model hard pins, strict
+      downloaded provider-contract validation, and no deployed or detached
+      path; the launcher implements host-anchor, global run-reservation,
+      intent, process-start-marker, terminal, and aggregate-outcome schemas,
+      while modal_action_journal.py implements the held-lock global scanner,
+      launcher and readiness/final-sealer gates, immutable global rejection and
+      migration seals, and exact v1 action-orphan recovery contracts; the local
+      recovery CLI is provider-free, snapshot-read-only, crash-resumable, and
+      remains quarantined from final acceptance
+  modal_cuda_environment_validated:
+    passed: false
+    evidence: run modal-cuda-env-20260809-02 completed on a Tesla T4 and its artifacts passed remote and local hash verification, but exact-schema recorder and provider-boundary hardening occurred afterward and changed the baked source digest; the run is retained as superseded evidence and a fresh same-image environment run is required
+    receipt_path: null
+    receipt_sha256: null
+    selected_cohort_identity: null
+    receipt_contract:
+      schema_name: ModalCUDAEnvironmentValidationReceipt
+      schema_version: "2.0"
+  modal_artifact_round_trip_validated:
+    passed: false
+    evidence: the superseded environment diagnostic was committed, remotely verified, downloaded, and locally hash-verified; the required candidate-smoke round-trip receipt under the final shared image digest remains pending
+    receipt_path: null
+    receipt_sha256: null
+    selected_cohort_identity: null
+    receipt_contract:
+      schema_name: ModalArtifactRoundTripValidationReceipt
+      schema_version: "3.0"
+  modal_resource_cleanup_validated:
+    passed: false
+    evidence: >-
+      historical resource checks remain incomplete; the current contract
+      requires a source/image/cohort-bound snapshot-capture manifest created
+      while holding outputs/readiness/.modal_action.lock across all six reads,
+      migration lineage, exact paired ModalActionIntent/1.6 and
+      ModalActionAttemptReceipt/3.6 cohort sets transitively bound to
+      ModalRemoteRunReservation/1.2 and started-process
+      ModalLocalProcessStart/1.1 evidence, separately owned global rejection
+      terminals, ModalPriorCohortQuarantineAccounting/1.1 for real prior
+      cohorts, measured App billing distinct from unresolved or lagged
+      authorization reserves and conservative exposure or overage, separately
+      estimated retained storage, and preserved legacy usage exactly
+      $0.00643852; exact v1 recovered attempts remain quarantined and must be
+      closed, prior-accounted, and included in lineage before cleanup can pass
+    receipt_path: null
+    receipt_sha256: null
+    selected_cohort_identity: null
+    receipt_contract:
+      schema_name: ModalResourceCleanupValidationReceipt
+      schema_version: "4.0"
+  modal_migration_validation_bundle_validated:
+    passed: false
+    evidence: >-
+      awaiting one strict version-4 bundle bound to the explicit cohort roster
+      and ModalMigrationLineage/1.1, exactly eight primary and eight verifier
+      contexts, exact cohort intent/terminal pairing, every applicable
+      ProviderCanaryAggregateOutcomeReceipt/1.1, final and prior measured
+      App-compute attribution plus separately reported unresolved or lagged
+      authorization reserves, conservative exposure and overage, preserved
+      legacy usage, a separate retained-storage estimate, and a separately
+      labeled provider-response-usage cost estimate; the wired global scanner,
+      immutable rejection seal, exact recovery triplets, and final lineage must
+      all revalidate without unresolved or post-seal journal state
+    receipt_path: null
+    receipt_sha256: null
+    selected_cohort_identity: null
+    receipt_contract:
+      schema_name: ModalMigrationValidationBundleReceipt
+      schema_version: "4.0"
   frozen_populated_reference_corpus:
     passed: false
     evidence: corpus population and independent review are external scientific work

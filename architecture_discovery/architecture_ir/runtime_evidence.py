@@ -190,11 +190,17 @@ def probe_fresh_build(
     numpy_rng = np.random.get_state()
     torch_rng = torch.get_rng_state()
     mps_rng: torch.Tensor | None = None
+    cuda_rng: list[torch.Tensor] | None = None
     if hasattr(torch, "mps") and hasattr(torch.mps, "get_rng_state"):
         try:
             mps_rng = torch.mps.get_rng_state()
         except RuntimeError:
             mps_rng = None
+    if hasattr(torch, "cuda") and torch.cuda.is_available():
+        try:
+            cuda_rng = [state.cpu().clone() for state in torch.cuda.get_rng_state_all()]
+        except RuntimeError:
+            cuda_rng = None
     try:
         models = [
             _unwrap_model(builder(seed)),
@@ -210,6 +216,8 @@ def probe_fresh_build(
         torch.set_rng_state(torch_rng)
         if mps_rng is not None and hasattr(torch.mps, "set_rng_state"):
             torch.mps.set_rng_state(mps_rng)
+        if cuda_rng is not None and hasattr(torch, "cuda"):
+            torch.cuda.set_rng_state_all(cuda_rng)
 
     devices = {
         parameter.device.type

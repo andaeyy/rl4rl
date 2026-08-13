@@ -126,6 +126,9 @@ def reconstruct_run(store: RunArtifactStore) -> ReconstructedRun:
     context = store.context
     status = "initialized"
     budget_totals: dict[str, int | float] = {}
+    accelerator_kind: str | None = None
+    budget_schema_version = "1.0"
+    budget_events_seen = False
     ancestry: dict[str, tuple[str, ...]] = {}
     cluster_keys: set[str] = set()
     parent_history: list[tuple[str, ...]] = []
@@ -151,6 +154,39 @@ def reconstruct_run(store: RunArtifactStore) -> ReconstructedRun:
             ancestry[candidate_id] = parent_ids
         elif event.event_kind is EventKind.BUDGET:
             budget_totals = _update_budget(budget_totals, event)
+            raw_accelerator = payload.get("accelerator_kind")
+            if raw_accelerator is None:
+                if "accelerator_seconds" in budget_totals:
+                    raise ReconstructionError(
+                        "version-2 budget event lacks accelerator_kind"
+                    )
+                observed_accelerator = (
+                    "mps" if "mps_seconds" in budget_totals else None
+                )
+                observed_version = "1.0"
+            else:
+                observed_accelerator = str(raw_accelerator)
+                if not observed_accelerator or observed_accelerator != raw_accelerator:
+                    raise ReconstructionError(
+                        "budget accelerator_kind must be non-empty text"
+                    )
+                if "accelerator_seconds" not in budget_totals:
+                    raise ReconstructionError(
+                        "version-2 budget event lacks accelerator_seconds"
+                    )
+                if "mps_seconds" in budget_totals:
+                    raise ReconstructionError(
+                        "version-2 budget event contains legacy mps_seconds"
+                    )
+                observed_version = "2.0"
+            if accelerator_kind is not None and observed_accelerator != accelerator_kind:
+                raise ReconstructionError("budget accelerator_kind changed during the run")
+            if budget_totals and observed_accelerator is not None:
+                accelerator_kind = observed_accelerator
+            if budget_events_seen and budget_schema_version != observed_version:
+                raise ReconstructionError("budget schema version changed during the run")
+            budget_schema_version = observed_version
+            budget_events_seen = True
         elif event.event_kind is EventKind.PARENT_SELECTION:
             parent_history.append(_identifiers(payload, "selected_candidate_ids"))
         elif event.event_kind is EventKind.MECHANISM_CLUSTER:
@@ -319,6 +355,7 @@ def reconstruct_run(store: RunArtifactStore) -> ReconstructedRun:
         last_event_sha256=report.last_event_sha256,
         event_record_ids=tuple(event.record_id for event in report.events),
         budget_totals=dict(sorted(budget_totals.items())),
+        accelerator_kind=accelerator_kind,
         ancestry={key: ancestry[key] for key in sorted(ancestry)},
         qualifying_mechanism_cluster_keys=tuple(sorted(cluster_keys)),
         parent_selection_history=tuple(parent_history),
@@ -329,6 +366,7 @@ def reconstruct_run(store: RunArtifactStore) -> ReconstructedRun:
         failure_class=terminal_failure_class,
         integrity_findings=report.findings,
         outcome=outcome,
+        schema_version=budget_schema_version,
     )
 
 

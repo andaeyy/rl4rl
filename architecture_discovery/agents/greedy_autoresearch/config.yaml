@@ -6,18 +6,18 @@ reasoning_effort: high
 temperature: null
 top_p: null
 max_tokens: 16384
-timeout_seconds: 300
-retries: 2
-retry_delay_seconds: 3
+timeout_seconds: 180
+retries: 0
+retry_delay_seconds: 0
 candidate_path: common/initial_candidate.ir.json
 ledger_path: outputs/raw/greedy_autoresearch.jsonl
 artifact_dir: outputs/raw/greedy_artifacts
 training:
-  profile: full_train_v1
-  profile_version: "1"
+  profile: full_train_cuda_v2
+  profile_version: "2"
   task_adapter: fixed_addition_v1
   seed_derivation: sha256-v1
-  device: mps
+  device: cuda
   allow_cpu_for_tests: false
 acceptance:
   require_qualification: true

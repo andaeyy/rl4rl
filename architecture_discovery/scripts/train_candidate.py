@@ -13,7 +13,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from common.training_client import WorkerError, run_worker_job
-from common.training_config import TrainingSeedBundle, get_training_profile
+from common.training_config import PROFILES, TrainingSeedBundle, get_training_profile
 from common.trainer import validate_training_request
 
 
@@ -22,10 +22,12 @@ def main() -> None:
     parser.add_argument("--candidate", required=True)
     parser.add_argument(
         "--profile",
-        choices=("full_train_v1", "smoke_train_v1"),
+        choices=tuple(sorted(PROFILES)),
         required=True,
     )
-    parser.add_argument("--device", choices=("mps", "cpu"), required=True)
+    parser.add_argument(
+        "--device", choices=("cuda", "mps", "cpu"), required=True
+    )
     parser.add_argument("--seed", type=int, required=True)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--dry-run", action="store_true")

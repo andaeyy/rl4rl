@@ -29,6 +29,9 @@ class ScientificExecutionRequest:
     trusted_ir_interpreter: bool = False
     runtime_validity_passed: bool = False
     candidate_artifact_hash: str | None = None
+    # Profiles should bind this explicitly.  The compatibility path infers a
+    # non-CPU requested accelerator for older callers that predate this field.
+    required_accelerator: str | None = None
 
 
 @dataclass(frozen=True)
@@ -75,14 +78,57 @@ def assess_scientific_execution(
             audit_hash=audit.audit_hash,
         )
 
-    if request.requested_device.lower() != "mps":
-        blockers.append("scientific candidate training requires requested_device='mps'")
-    if not audit.mps_built or not audit.mps_available:
+    requested = _accelerator_kind(request.requested_device)
+    required_name = request.required_accelerator or request.requested_device
+    required = _accelerator_kind(required_name)
+    if requested is None:
         blockers.append(
-            "MPS is not both built and available in the audited execution environment"
+            f"unsupported requested accelerator {request.requested_device!r}"
         )
+    if required is None:
+        blockers.append(
+            f"unsupported scientific profile accelerator {required_name!r}"
+        )
+    elif required == "cpu":
+        blockers.append(
+            "scientific candidate training requires requested_device='mps' or "
+            "requested_device='cuda'; CPU execution or fallback is forbidden"
+        )
+    elif requested != required:
+        blockers.append(
+            f"scientific profile requires requested_device='{required}'"
+        )
+    if requested == "cpu" and required != "cpu":
+        blockers.append(
+            "scientific candidate training requires requested_device='mps' or "
+            "requested_device='cuda'; CPU execution or fallback is forbidden"
+        )
+
+    if required == "mps":
+        if not audit.accelerator_available("mps"):
+            blockers.append(
+                "MPS is not both built and available in the audited execution environment"
+            )
+    elif required == "cuda":
+        if not audit.accelerator_available("cuda"):
+            blockers.append(
+                "CUDA is not built, available, and backed by a visible device in the "
+                "audited execution environment"
+            )
+        requested_index = _cuda_device_index(request.requested_device)
+        if requested_index is not None and requested_index >= audit.cuda_device_count:
+            blockers.append(
+                f"requested CUDA device index {requested_index} is not visible in the "
+                "audited execution environment"
+            )
+
+    # Preserve the historical fail-closed rule even when a new backend is
+    # requested: a scientific worker must never inherit a silent MPS-to-CPU
+    # escape hatch.
     if audit.mps_fallback_requested:
-        blockers.append("PYTORCH_ENABLE_MPS_FALLBACK requests an untracked CPU fallback")
+        blockers.append(
+            "PYTORCH_ENABLE_MPS_FALLBACK requests an untracked CPU fallback"
+        )
 
     if request.candidate_format is CandidateFormat.ARBITRARY_PYTHON:
         unproven = [
@@ -121,3 +167,22 @@ def assess_scientific_execution(
         warnings=tuple(warnings),
         audit_hash=audit.audit_hash,
     )
+
+
+def _accelerator_kind(device: str) -> str | None:
+    normalized = device.strip().lower()
+    if normalized in {"cpu", "mps", "cuda"}:
+        return normalized
+    if normalized.startswith("cuda:"):
+        suffix = normalized.removeprefix("cuda:")
+        if suffix.isdigit():
+            return "cuda"
+    return None
+
+
+def _cuda_device_index(device: str) -> int | None:
+    normalized = device.strip().lower()
+    if normalized == "cuda" or not normalized.startswith("cuda:"):
+        return None
+    suffix = normalized.removeprefix("cuda:")
+    return int(suffix) if suffix.isdigit() else None

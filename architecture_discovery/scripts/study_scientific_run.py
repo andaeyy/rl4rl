@@ -28,16 +28,18 @@ from artifacts import (
     ImmutableStudyEventSink,
     RunArtifactStore,
 )
-from common.gpt56_sol import GPT56SolProfile
+from common.gpt56_sol import GPT56SolProfile, resolve_provider_endpoint
 from scripts.audit_scientific_readiness import audit_readiness
 from study.contracts import StudySpec
 from study.randomization import load_or_create_plan
 from study.runtime_adapters import (
+    ArchitectureIRProposalError,
     CandidateSourceStore,
     LayerACandidateEvaluator,
     MatchedCausalProposalGenerator,
+    canonicalize_architecture_ir,
 )
-from study.scheduling import NoPendingRuns, SequentialRunScheduler
+from study.scheduling import NoPendingRuns, SequentialAcceleratorScheduler
 from study.serialization import content_hash, create_json_exclusive, read_json
 
 
@@ -56,6 +58,11 @@ def _validated_runtime_contract(
 ) -> dict[str, object]:
     """Bind runtime values to the checked-in manifest and frozen PI ledger."""
 
+    if spec.budget.accelerator_kind != "cuda":
+        raise SystemExit(
+            "scientific runtime requires budget.accelerator_kind='cuda', got "
+            f"{spec.budget.accelerator_kind!r}"
+        )
     manifest = yaml.safe_load((ROOT / "experiment_manifest.yaml").read_text())
     decisions = yaml.safe_load((ROOT / "scientific_decisions.yaml").read_text())
     layer_a = manifest["evaluation"]["layer_a"]
@@ -139,6 +146,32 @@ def _validated_runtime_contract(
     }
 
 
+def _require_modal_full_profile_launch_contract() -> None:
+    """Stop before credentials until an explicit scientific Modal action exists.
+
+    The checked-in Modal surface intentionally exposes engineering canaries
+    only. A future full-profile action needs its own reviewed resource and cost
+    contract; this entrypoint must not reinterpret the current 300-second
+    canary bounds as authorization to train locally or remotely.
+    """
+
+    manifest = yaml.safe_load((ROOT / "experiment_manifest.yaml").read_text())
+    remote = manifest.get("remote_execution")
+    if not isinstance(remote, dict):
+        raise SystemExit("scientific Modal launch contract is missing")
+    if remote.get("provider") != "modal" or remote.get("mode") != "ephemeral_modal_run":
+        raise SystemExit("scientific execution must be Modal-only")
+    # There is deliberately no parser for a full-profile resource contract yet:
+    # inventing one in this engineering migration would let a manifest edit
+    # masquerade as reviewed launch authority. A future change must add and test
+    # that typed contract and a dedicated Modal action before this stop is removed.
+    raise SystemExit(
+        "scientific preflight passed, but no frozen full-profile Modal action "
+        "and separate resource contract are exposed; provider and training "
+        "remain blocked"
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--study-spec", type=Path, required=True)
@@ -152,6 +185,7 @@ def main() -> int:
     parser.add_argument("--replication-policy", type=Path)
     parser.add_argument("--research-protocol", type=Path)
     parser.add_argument("--mps-evidence", type=Path)
+    parser.add_argument("--accelerator-evidence", type=Path)
     arguments = parser.parse_args()
 
     readiness = audit_readiness(
@@ -162,6 +196,7 @@ def main() -> int:
         replication_policy=arguments.replication_policy,
         research_protocol=arguments.research_protocol,
         mps_evidence=arguments.mps_evidence,
+        accelerator_evidence=arguments.accelerator_evidence,
         study_spec=arguments.study_spec,
     )
     readiness_key = (
@@ -180,7 +215,17 @@ def main() -> int:
     )
     if not spec.scientific:
         raise SystemExit("study_scientific_run refuses a toy/non-scientific StudySpec")
-    initial_source = arguments.initial_candidate.resolve().read_text(encoding="utf-8")
+    raw_initial_source = arguments.initial_candidate.resolve().read_text(
+        encoding="utf-8"
+    )
+    try:
+        initial_source = canonicalize_architecture_ir(
+            raw_initial_source,
+            require_hypothesis=False,
+            allow_json_fence=False,
+        )
+    except ArchitectureIRProposalError as error:
+        raise SystemExit(f"initial candidate is not valid Architecture IR: {error}") from error
     runtime_contract = _validated_runtime_contract(
         spec,
         initial_source=initial_source,
@@ -193,11 +238,17 @@ def main() -> int:
         output_root=output_root,
         plan_path=study_root / "randomization_plan.json",
     )
-    scheduler = SequentialRunScheduler(
+    scheduler = SequentialAcceleratorScheduler(
         plan,
         state_path=study_root / "schedule_state.json",
-        lease_path=output_root / ".study_mps.lock",
+        lease_path=output_root / ".study_accelerator.lock",
+        accelerator_kind="cuda",
     )
+
+    # Assignment creation/validation above is cost-free. The next gate keeps the
+    # checked-in engineering-only Modal surface from falling through to a local
+    # provider client or local CUDA training path.
+    _require_modal_full_profile_launch_contract()
 
     api_key = _required_environment("DISCOVERY_API_KEY")
     api_base = _required_environment("DISCOVERY_API_BASE")
@@ -208,7 +259,16 @@ def main() -> int:
             "DISCOVERY_MODEL differs from the frozen generation contract: "
             f"{model!r} != {generation_contract['target_model']!r}"
         )
-    client = OpenAI(api_key=api_key, base_url=api_base, max_retries=0)
+    try:
+        endpoint = resolve_provider_endpoint(api_base, scientific=True)
+    except ValueError as error:
+        raise SystemExit(str(error)) from error
+    client = OpenAI(
+        api_key=api_key,
+        base_url=endpoint.base_url,
+        max_retries=0,
+        timeout=int(generation_contract["request_timeout_seconds"]),
+    )
     shared_system = "\n\n".join(
         (
             (ROOT / "common" / "prompts" / "shared_system.md").read_text(),
@@ -221,7 +281,7 @@ def main() -> int:
         except NoPendingRuns:
             break
         with claim as run:
-            run_root = Path(run.run_directory)
+            run_root = run.execution_directory
             source_store = CandidateSourceStore(run_root / "candidate_sources")
             source_store.register(spec.initial_candidate_id, initial_source)
             generation = GPT56SolProfile.resolve(
@@ -240,6 +300,7 @@ def main() -> int:
                 default_retry_delay_seconds=int(
                     generation_contract["retry_delay_seconds"]
                 ),
+                allow_environment_overrides=False,
             )
             generator = MatchedCausalProposalGenerator(
                 client=client,
@@ -257,8 +318,8 @@ def main() -> int:
                 initial_candidate_id=spec.initial_candidate_id,
                 source_store=source_store,
                 output_root=run_root,
-                training_profile="full_train_v1",
-                device="mps",
+                training_profile="full_train_cuda_v2",
+                device="cuda",
                 allow_cpu_for_tests=False,
                 evaluation_profile="scientific_layer_a_v1",
                 evaluation_case_count=int(runtime_contract["case_count"]),
@@ -287,14 +348,17 @@ def main() -> int:
                 run=run,
                 generator=generator,
                 evaluator=evaluator,
-                artifact_sink=ImmutableStudyEventSink(artifact_store),
-                # The scheduler holds the study-wide MPS lease for this run.
+                artifact_sink=ImmutableStudyEventSink(
+                    artifact_store,
+                    initial_candidate_source=initial_source,
+                ),
+                # The scheduler holds the study-wide accelerator lease.
                 evaluation_lease_path=None,
             ).execute()
 
     frozen_indexes = []
     for run in plan.runs:
-        store = RunArtifactStore.open(Path(run.run_directory) / "artifact_ledger")
+        store = RunArtifactStore.open(run.execution_directory / "artifact_ledger")
         frozen_index, _ = store.load_frozen_index("search_completion")
         frozen_indexes.append(frozen_index.to_dict())
     index_manifest = {

@@ -62,10 +62,10 @@ def _options(tmp_path: Path, *, iterations: int = 1) -> RunOptions:
         seed=3,
         output_dir=tmp_path / "run",
         initial_candidate=initial,
-        training_profile="smoke_train_v1",
+        training_profile="smoke_train_cuda_v2",
         evaluation_profile="smoke_eval_v1",
         evaluation_case_count=64,
-        device="mps",
+        device="cuda",
         allow_cpu_for_tests=False,
         pi_decision_record_id=None,
         eligibility_threshold=0.0,
@@ -147,6 +147,8 @@ def test_ten_ir_opportunities_use_ten_provider_calls_and_eleven_evaluations(tmp_
     assert len(evaluator.requests) == 11
     assert summary["proposal_opportunities_requested"] == 10
     assert summary["proposal_opportunities_terminal"] == 10
+    assert summary["lineage_path"] == "lineage.jsonl"
+    assert summary["incumbent_path"] == "incumbent.ir.json"
     records = _lineage(tmp_path / "run" / "lineage.jsonl")
     assert len(records) == 11
     assert [record["proposal_opportunity"] for record in records] == list(range(11))
@@ -155,10 +157,14 @@ def test_ten_ir_opportunities_use_ten_provider_calls_and_eleven_evaluations(tmp_
     assert not list((tmp_path / "run" / "artifacts").glob("*.py"))
 
     manifest = json.loads((tmp_path / "run" / "run_manifest.json").read_text())
+    assert manifest["schema_name"] == "ControllerRunManifest"
+    assert manifest["schema_version"] == "2.0"
+    assert summary["schema_name"] == "ControllerRunSummary"
+    assert summary["schema_version"] == "2.0"
     assert manifest["run_mode"] == "engineering_pilot"
-    assert manifest["training"]["profile"] == "smoke_train_v1"
+    assert manifest["training"]["profile"] == "smoke_train_cuda_v2"
     assert manifest["evaluation"]["profile"] == "smoke_eval_v1"
-    assert manifest["training"]["device"] == "mps"
+    assert manifest["training"]["device"] == "cuda"
     assert manifest["authoritative_scientific_evidence"] is False
     assert manifest["candidate_format"] == "architecture_tensor_graph@1.0"
     assert manifest["architecture_hash_schema"] == "architecture_executable_v2"
@@ -373,7 +379,7 @@ def test_injected_evaluator_requires_explicit_controller_only_boundary(tmp_path)
         )
 
 
-def test_cli_engineering_pilot_forces_smoke_profiles_and_mps(
+def test_cli_engineering_pilot_forces_smoke_profiles_and_cuda(
     tmp_path,
     monkeypatch,
     capsys,
@@ -408,9 +414,11 @@ def test_cli_engineering_pilot_forces_smoke_profiles_and_mps(
 
     assert len(captured) == 2
     assert all(option.engineering_pilot for option in captured)
-    assert all(option.training_profile == "smoke_train_v1" for option in captured)
+    assert all(
+        option.training_profile == "smoke_train_cuda_v2" for option in captured
+    )
     assert all(option.evaluation_profile == "smoke_eval_v1" for option in captured)
-    assert all(option.device == "mps" for option in captured)
+    assert all(option.device == "cuda" for option in captured)
     assert json.loads(capsys.readouterr().out) == {"ok": True}
 
 
@@ -455,7 +463,9 @@ def test_cli_scientific_mode_preserves_frozen_point99_threshold(
     run.main()
 
     assert all(not option.engineering_pilot for option in captured)
-    assert all(option.training_profile == "full_train_v1" for option in captured)
+    assert all(
+        option.training_profile == "full_train_cuda_v2" for option in captured
+    )
     assert all(option.evaluation_profile == "scientific_layer_a_v1" for option in captured)
     assert all(option.eligibility_threshold == 0.99 for option in captured)
     assert json.loads(capsys.readouterr().out) == {"ok": True}

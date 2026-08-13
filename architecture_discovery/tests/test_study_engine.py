@@ -1,12 +1,12 @@
 import json
-from pathlib import Path
 
 import pytest
 
-from study.contracts import ConditionId, StudySpec
+from study.contracts import ConditionId, RunState, StudySpec
 from study.engine import CommonStudyEngine, RunStateError
 from study.fakes import DeterministicFakeEvaluator, DeterministicFakeGenerator
 from study.randomization import generate_plan
+from study.serialization import content_hash
 
 
 def _run_for_condition(plan, condition_id: ConditionId):
@@ -125,7 +125,7 @@ def test_resume_reuses_stored_proposal_instead_of_calling_generator_again(tmp_pa
 
     with pytest.raises(RuntimeError, match="interruption"):
         engine.execute()
-    stored = Path(run.run_directory, "run_state.json").read_text()
+    stored = (run.execution_directory / "run_state.json").read_text()
     assert "OFFLINE PROPOSAL" in stored
     assert len(generator.calls) == 1
 
@@ -161,10 +161,62 @@ def test_resume_rejects_tampered_active_treatment_context(
     with pytest.raises(RuntimeError, match="interruption"):
         engine.execute()
 
-    state_path = Path(run.run_directory, "run_state.json")
+    state_path = run.execution_directory / "run_state.json"
     payload = json.loads(state_path.read_text(encoding="utf-8"))
     payload["active_opportunity"][field_name] = mutated_value
     state_path.write_text(json.dumps(payload), encoding="utf-8")
 
     with pytest.raises(RunStateError, match=message):
         engine.execute()
+
+
+def test_run_state_v2_persists_remote_call_and_artifact_location(tmp_path) -> None:
+    spec = StudySpec.toy(study_id="remote-run-state", proposal_opportunities=1)
+    run = _run_for_condition(generate_plan(spec, tmp_path), ConditionId.C0)
+    state = CommonStudyEngine(
+        study=spec,
+        run=run,
+        generator=DeterministicFakeGenerator(),
+        evaluator=DeterministicFakeEvaluator(),
+        evaluation_lease_path=tmp_path / "accelerator.lock",
+        remote_call_id="fc-run-state",
+        artifact_location="modal-volume:/study/run-state",
+    ).execute()
+
+    payload = json.loads((run.execution_directory / "run_state.json").read_text())
+    assert state.schema_version == "2.0"
+    assert payload["remote_call_id"] == "fc-run-state"
+    assert payload["artifact_location"] == "modal-volume:/study/run-state"
+    assert payload["ledger"]["schema_version"] == "2.0"
+    assert payload["ledger"]["accelerator_kind"] == "cpu"
+    assert payload["seed_evaluation"]["schema_version"] == "2.0"
+    assert not (tmp_path / "accelerator.lock").exists()
+
+
+def test_v1_run_state_round_trips_without_hash_or_field_rewrite() -> None:
+    legacy = {
+        "schema_name": "RunState",
+        "schema_version": "1.0",
+        "study_id": "study",
+        "block_id": "block",
+        "run_id": "run",
+        "condition_id": "C0",
+        "assignment_hash": "assignment",
+        "status": "running",
+        "initial_candidate_id": "seed",
+        "incumbent_id": "seed",
+        "portfolio_ids": ["seed"],
+        "seed_evaluation": None,
+        "next_opportunity": 1,
+        "active_opportunity": None,
+        "terminal_opportunities": [],
+        "ledger": {},
+        "state_revision": 0,
+        "created_at": "2026-08-08T00:00:00+00:00",
+        "updated_at": "2026-08-08T00:00:00+00:00",
+    }
+    restored = RunState.from_dict(legacy)
+    assert restored.remote_call_id is None
+    assert restored.artifact_location is None
+    assert restored.to_dict() == legacy
+    assert content_hash(restored.to_dict()) == content_hash(legacy)

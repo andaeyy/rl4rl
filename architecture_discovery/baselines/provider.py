@@ -13,9 +13,11 @@ import os
 from pathlib import Path
 from typing import Any, ClassVar
 
-from openevolve.utils.code_utils import apply_diff, extract_diffs
-
 from baselines.no_search import BackendResponse, NoSearchRequest
+from study.runtime_adapters import (
+    ArchitectureIRProposalError,
+    canonicalize_architecture_ir,
+)
 from study.serialization import content_hash
 
 
@@ -31,10 +33,11 @@ class OpenAIIndependentProposalBackend:
         frozen_base_source: str,
         request_log_root: str | Path,
     ) -> None:
-        if not frozen_base_source.strip():
-            raise ValueError("no-search backend requires a frozen base source")
         self.client = client
-        self.frozen_base_source = frozen_base_source
+        self.frozen_base_source = canonicalize_architecture_ir(
+            frozen_base_source,
+            require_hypothesis=False,
+        )
         self.request_log_root = Path(request_log_root).resolve()
         self.request_log_root.mkdir(parents=True, exist_ok=True)
 
@@ -42,8 +45,13 @@ class OpenAIIndependentProposalBackend:
         response = self.client.chat.completions.create(**request.model_input)
         response_text = response.choices[0].message.content or ""
         candidate_source = None
-        if extract_diffs(response_text):
-            candidate_source = apply_diff(self.frozen_base_source, response_text)
+        try:
+            candidate_source = canonicalize_architecture_ir(
+                response_text,
+                require_hypothesis=True,
+            )
+        except ArchitectureIRProposalError:
+            candidate_source = None
         usage = response.usage
         record = {
             "schema_name": "NoSearchProviderRecord",
@@ -75,4 +83,3 @@ class OpenAIIndependentProposalBackend:
             prompt_tokens=getattr(usage, "prompt_tokens", None),
             completion_tokens=getattr(usage, "completion_tokens", None),
         )
-

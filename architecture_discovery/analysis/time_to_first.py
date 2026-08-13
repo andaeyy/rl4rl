@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Iterable
 
-from analysis.outcomes import RunOutcome, RunOutcomeTable, RunTerminalStatus
+from analysis.outcomes import RunOutcomeTable, RunTerminalStatus
 from study.serialization import require_bool, require_int, require_str
 
 

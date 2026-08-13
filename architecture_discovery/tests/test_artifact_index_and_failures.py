@@ -7,6 +7,7 @@ from artifacts import (
     FailureClass,
     FailureDomain,
     FailureRecord,
+    ImmutableStudyEventSink,
     RerunNotAuthorized,
     RerunPolicy,
     RunArtifactStore,
@@ -95,9 +96,36 @@ def test_only_predeclared_infrastructure_failures_authorize_linked_reruns() -> N
 @pytest.mark.parametrize(
     "failure_class",
     [
+        FailureClass.CUDA_DRIVER_FAILURE,
+        FailureClass.MODAL_INFRASTRUCTURE_FAILURE,
+    ],
+)
+def test_transient_cuda_and_modal_infrastructure_failures_authorize_reruns(
+    failure_class: FailureClass,
+) -> None:
+    failure = FailureRecord.create(
+        attempt_id="attempt-original",
+        failure_class=failure_class,
+        stage="remote_training",
+    )
+    authorization = authorize_rerun(
+        assigned_run_id="assigned-run",
+        previous_attempt_id="attempt-original",
+        attempt_number=1,
+        failure=failure,
+        policy=RerunPolicy(),
+    )
+    assert authorization.triggering_failure_class is failure_class
+
+
+@pytest.mark.parametrize(
+    "failure_class",
+    [
         FailureClass.NONQUALIFYING_RESULT,
         FailureClass.PROPOSAL_PARSE,
         FailureClass.MPS_UNAVAILABLE,
+        FailureClass.CUDA_UNAVAILABLE,
+        FailureClass.CUDA_DETERMINISTIC_KERNEL_UNAVAILABLE,
         FailureClass.CONTAINMENT_UNAVAILABLE,
     ],
 )
@@ -141,3 +169,44 @@ def test_rerun_must_link_the_failure_attempt_and_obey_attempt_cap() -> None:
             failure=failure,
             policy=RerunPolicy(max_linked_attempts=2),
         )
+
+
+def test_historical_mps_failure_values_and_ids_remain_stable() -> None:
+    assert FailureClass("mps_driver_failure") is FailureClass.MPS_DRIVER_FAILURE
+    assert FailureClass("mps_unavailable") is FailureClass.MPS_UNAVAILABLE
+    driver_failure = FailureRecord.create(
+        attempt_id="attempt-legacy",
+        failure_class="mps_driver_failure",
+        stage="mps_driver",
+    )
+    unavailable_failure = FailureRecord.create(
+        attempt_id="attempt-legacy",
+        failure_class="mps_unavailable",
+        stage="mps_unavailable",
+    )
+    assert driver_failure.failure_id == "failure-7878a564a83fe0745a97076f"
+    assert unavailable_failure.failure_id == "failure-2f41d5b8e65d3e6277f374b9"
+
+
+@pytest.mark.parametrize(
+    ("stage", "expected"),
+    [
+        ("cuda_unavailable", FailureClass.CUDA_UNAVAILABLE),
+        (
+            "cuda_deterministic_kernel_unavailable",
+            FailureClass.CUDA_DETERMINISTIC_KERNEL_UNAVAILABLE,
+        ),
+        ("cudnn_driver_reset", FailureClass.CUDA_DRIVER_FAILURE),
+        ("modal_container_timeout", FailureClass.MODAL_INFRASTRUCTURE_FAILURE),
+        ("mps_unavailable", FailureClass.MPS_UNAVAILABLE),
+        ("mps_command_buffer", FailureClass.MPS_DRIVER_FAILURE),
+    ],
+)
+def test_study_sink_classifies_accelerator_and_modal_failures(
+    stage: str,
+    expected: FailureClass,
+) -> None:
+    assert (
+        ImmutableStudyEventSink._failure_class("infrastructure_failure", stage)
+        is expected
+    )

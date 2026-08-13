@@ -1,5 +1,3 @@
-from pathlib import Path
-
 import pytest
 
 from artifacts import (
@@ -40,7 +38,7 @@ def _fixture(tmp_path, *, study_id: str, opportunities: int = 2):
         run_seed=run.run_seed,
         assignment_sha256=run.assignment_hash,
     )
-    store = RunArtifactStore(Path(run.run_directory) / "immutable_artifacts", context)
+    store = RunArtifactStore(run.execution_directory / "immutable_artifacts", context)
     sink = ImmutableStudyEventSink(store)
     return study, run, store, sink
 
@@ -79,6 +77,20 @@ def test_instrumented_engine_maps_irreversible_transitions_and_freezes_indexes(
         EventKind.BUDGET,
         EventKind.PROMOTION,
     } <= kinds
+    training_events = [
+        event for event in report.events if event.event_kind is EventKind.TRAINING
+    ]
+    assert training_events
+    assert all(event.payload["accelerator_kind"] == "cpu" for event in training_events)
+    assert all("accelerator_seconds" in event.payload for event in training_events)
+    assert all("mps_seconds" not in event.payload for event in training_events)
+    budget_events = [
+        event for event in report.events if event.event_kind is EventKind.BUDGET
+    ]
+    assert budget_events
+    assert all(event.payload["accelerator_kind"] == "cpu" for event in budget_events)
+    assert all("accelerator_seconds" in event.payload["totals"] for event in budget_events)
+    assert all("mps_seconds" not in event.payload["totals"] for event in budget_events)
 
     search_pointer, search_index = store.load_frozen_index("search_completion")
     assert search_pointer.event_count == len(report.events)
@@ -93,6 +105,9 @@ def test_instrumented_engine_maps_irreversible_transitions_and_freezes_indexes(
 
     reconstructed = reconstruct_run(store)
     assert reconstructed.status == "completed"
+    assert reconstructed.schema_version == "2.0"
+    assert reconstructed.accelerator_kind == "cpu"
+    assert reconstructed.to_dict()["accelerator_kind"] == "cpu"
     assert reconstructed.budget_totals["proposal_opportunities"] == 2
     assert reconstructed.budget_totals["candidate_training_attempts"] == 3
     assert study.initial_candidate_id in reconstructed.ancestry
@@ -239,3 +254,29 @@ def test_sink_fails_closed_on_conflicting_transition_or_premature_final_freeze(
     )
     with pytest.raises(StudyEventSinkError, match="conflicts"):
         engine.execute()
+
+
+def test_sink_resource_bridge_preserves_v1_fields_and_normalizes_v2_fields() -> None:
+    common = {
+        "training_attempts": 1,
+        "training_steps": 4,
+        "training_examples": 16,
+        "evaluation_cases": 8,
+        "infrastructure_retries": 0,
+    }
+    legacy = ImmutableStudyEventSink._resource_payload(
+        {**common, "mps_seconds": 0.25}
+    )
+    active = ImmutableStudyEventSink._resource_payload(
+        {
+            **common,
+            "accelerator_kind": "cuda",
+            "accelerator_seconds": 0.25,
+        }
+    )
+    assert legacy == {**common, "mps_seconds": 0.25}
+    assert active == {
+        **common,
+        "accelerator_kind": "cuda",
+        "accelerator_seconds": 0.25,
+    }

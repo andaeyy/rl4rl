@@ -10,13 +10,12 @@ import json
 import os
 import socket
 import tempfile
-import traceback
-from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
-from common.task_adapter import DEFAULT_TASK
 from common.evaluation_profiles import evaluation_plan_from_dict
+from common.runtime_context import ExecutionContextV1
+from common.task_adapter import DEFAULT_TASK
 from common.trainer import (
     exclusive_training_lock,
     sha256_file,
@@ -68,11 +67,17 @@ def _resolve_job(job: dict[str, Any]):
     candidate = Path(job["candidate_path"]).resolve()
     if sha256_file(candidate) != str(job["candidate_source_hash"]):
         raise ValueError("candidate source hash changed before worker execution")
-    return profile, seeds, candidate
+    raw_context = job.get("execution_context")
+    execution_context = (
+        None
+        if raw_context is None
+        else ExecutionContextV1.from_dict(raw_context)
+    )
+    return profile, seeds, candidate, execution_context
 
 
 def run_job(job: dict[str, Any]) -> dict[str, Any]:
-    profile, seeds, candidate = _resolve_job(job)
+    profile, seeds, candidate, execution_context = _resolve_job(job)
     _deny_network()
     with exclusive_training_lock():
         training = train_candidate_in_process(
@@ -84,6 +89,7 @@ def run_job(job: dict[str, Any]) -> dict[str, Any]:
             allow_cpu_for_tests=bool(job["allow_cpu_for_tests"]),
             resume=job.get("resume"),
             task=DEFAULT_TASK,
+            execution_context=execution_context,
         )
         if job["mode"] == "train" or not training.success:
             return {
@@ -108,6 +114,7 @@ def run_job(job: dict[str, Any]) -> dict[str, Any]:
             evaluation_plan=evaluation_plan,
             context=evaluation_context,
             eligibility_threshold=float(job["eligibility_threshold"]),
+            artifact_root=job["output_dir"],
         )
         return {
             "kind": "search_evaluation",
@@ -124,7 +131,7 @@ def main(job_path: str, response_path: str) -> None:
         payload = {
             "kind": "worker_failure",
             "failure_stage": "worker_infrastructure",
-            "error": f"{type(error).__name__}: {error}"[:2_000],
-            "traceback": traceback.format_exc()[-8_000:],
+            "error_type": type(error).__name__,
+            "error": "candidate worker failed; details suppressed",
         }
     _atomic_response(response, payload)

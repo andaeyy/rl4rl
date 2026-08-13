@@ -361,7 +361,12 @@ class ResourceDisclosure:
         names = [item.name for item in self.quantities]
         if len(set(names)) != len(names):
             raise ValueError("resource quantity names must be unique")
-        required = {"mps_compute", "cpu_compute", "monetary_cost", "energy"}
+        required = {
+            "accelerator_compute",
+            "cpu_compute",
+            "monetary_cost",
+            "energy",
+        }
         if set(names) != required:
             raise ValueError(f"resource disclosure must contain {sorted(required)}")
         for value in (self.prompt_tokens, self.completion_tokens):

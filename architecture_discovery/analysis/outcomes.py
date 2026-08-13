@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Any, ClassVar, Iterable
+from typing import Any, Iterable
 
 from study.serialization import content_hash, require_int, require_str
 

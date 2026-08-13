@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any
 
-from study.serialization import require_int
+from study.serialization import require_int, require_str
 
 
 class BudgetExceeded(RuntimeError):
@@ -26,7 +26,26 @@ class OpportunityOutcome(StrEnum):
     INFRASTRUCTURE_FAILURE = "infrastructure_failure"
 
 
-@dataclass(frozen=True)
+def _require_accelerator_kind(value: object, field_name: str = "accelerator_kind") -> str:
+    resolved = require_str(value, field_name)
+    if not resolved or resolved != resolved.strip() or resolved != resolved.lower():
+        raise ValueError(
+            f"{field_name} must be a non-empty lowercase string without surrounding whitespace"
+        )
+    return resolved
+
+
+def _require_nonnegative_number(value: object, field_name: str) -> int | float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{field_name} must be numeric")
+    if not math.isfinite(value):
+        raise ValueError(f"{field_name} must be finite")
+    if value < 0:
+        raise ValueError(f"{field_name} must be non-negative")
+    return value
+
+
+@dataclass(frozen=True, init=False)
 class BudgetSpec:
     """Preregistered hard ceilings. No field is a model-size objective."""
 
@@ -38,13 +57,81 @@ class BudgetSpec:
     candidate_training_attempts: int
     training_steps: int
     training_examples: int
-    mps_seconds: float
+    accelerator_kind: str
+    accelerator_seconds: float
     evaluation_cases: int
     infrastructure_retries: int
     repair_attempts_per_opportunity: int = 1
     seed_evaluations: int = 1
     schema_name: str = field(default="BudgetSpec", init=False)
-    schema_version: str = field(default="1.0", init=False)
+    schema_version: str = field(default="2.0", init=False)
+
+    def __init__(
+        self,
+        proposal_opportunities: int,
+        provider_attempts_per_opportunity: int,
+        prompt_tokens: int,
+        completion_tokens: int,
+        repairs: int,
+        candidate_training_attempts: int,
+        training_steps: int,
+        training_examples: int,
+        evaluation_cases: int,
+        infrastructure_retries: int,
+        repair_attempts_per_opportunity: int = 1,
+        seed_evaluations: int = 1,
+        *,
+        accelerator_kind: str | None = None,
+        accelerator_seconds: float | None = None,
+        mps_seconds: float | None = None,
+    ) -> None:
+        """Create a v2 budget, accepting ``mps_seconds`` as a source-code alias.
+
+        Only ``from_dict`` creates a legacy v1 serialization view. Consequently,
+        newly constructed records never emit the deprecated field.
+        """
+
+        if mps_seconds is not None:
+            _require_nonnegative_number(mps_seconds, "mps_seconds")
+            if accelerator_kind is not None and accelerator_kind != "mps":
+                raise ValueError(
+                    "mps_seconds cannot be combined with a non-MPS accelerator_kind"
+                )
+            if (
+                accelerator_seconds is not None
+                and accelerator_seconds != mps_seconds
+            ):
+                raise ValueError(
+                    "mps_seconds and accelerator_seconds must agree when both are supplied"
+                )
+            accelerator_kind = "mps"
+            accelerator_seconds = mps_seconds
+        if accelerator_kind is None or accelerator_seconds is None:
+            raise ValueError(
+                "accelerator_kind and accelerator_seconds are required"
+            )
+
+        values = {
+            "proposal_opportunities": proposal_opportunities,
+            "provider_attempts_per_opportunity": provider_attempts_per_opportunity,
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "repairs": repairs,
+            "candidate_training_attempts": candidate_training_attempts,
+            "training_steps": training_steps,
+            "training_examples": training_examples,
+            "accelerator_kind": accelerator_kind,
+            "accelerator_seconds": accelerator_seconds,
+            "evaluation_cases": evaluation_cases,
+            "infrastructure_retries": infrastructure_retries,
+            "repair_attempts_per_opportunity": repair_attempts_per_opportunity,
+            "seed_evaluations": seed_evaluations,
+        }
+        for name, value in values.items():
+            object.__setattr__(self, name, value)
+        object.__setattr__(self, "schema_name", "BudgetSpec")
+        object.__setattr__(self, "schema_version", "2.0")
+        self.__post_init__()
 
     def __post_init__(self) -> None:
         integer_fields = (
@@ -69,10 +156,16 @@ class BudgetSpec:
             raise ValueError("provider_attempts_per_opportunity must be at least one")
         if self.seed_evaluations != 1:
             raise ValueError("primary C0-C3 runs require exactly one seed evaluation")
-        if not math.isfinite(self.mps_seconds):
-            raise ValueError("mps_seconds must be finite")
-        if self.mps_seconds < 0:
-            raise ValueError("mps_seconds must be non-negative")
+        _require_accelerator_kind(self.accelerator_kind)
+        _require_nonnegative_number(
+            self.accelerator_seconds, "accelerator_seconds"
+        )
+
+    @property
+    def mps_seconds(self) -> float:
+        """Deprecated source-code alias for pre-v2 consumers."""
+
+        return self.accelerator_seconds
 
     @classmethod
     def toy(cls, proposal_opportunities: int = 3) -> BudgetSpec:
@@ -87,14 +180,15 @@ class BudgetSpec:
             candidate_training_attempts=proposal_opportunities + 1,
             training_steps=(proposal_opportunities + 1) * 4,
             training_examples=(proposal_opportunities + 1) * 16,
-            mps_seconds=60.0,
+            accelerator_kind="cpu",
+            accelerator_seconds=60.0,
             evaluation_cases=(proposal_opportunities + 1) * 8,
             infrastructure_retries=proposal_opportunities,
             repair_attempts_per_opportunity=1,
         )
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        common = {
             "schema_name": self.schema_name,
             "schema_version": self.schema_version,
             "proposal_opportunities": self.proposal_opportunities,
@@ -105,7 +199,19 @@ class BudgetSpec:
             "candidate_training_attempts": self.candidate_training_attempts,
             "training_steps": self.training_steps,
             "training_examples": self.training_examples,
-            "mps_seconds": self.mps_seconds,
+        }
+        if self.schema_version == "1.0":
+            compute = {"mps_seconds": self.accelerator_seconds}
+        elif self.schema_version == "2.0":
+            compute = {
+                "accelerator_kind": self.accelerator_kind,
+                "accelerator_seconds": self.accelerator_seconds,
+            }
+        else:  # pragma: no cover - guarded at construction/loading boundaries
+            raise ValueError("unsupported BudgetSpec schema version")
+        return {
+            **common,
+            **compute,
             "evaluation_cases": self.evaluation_cases,
             "infrastructure_retries": self.infrastructure_retries,
             "repair_attempts_per_opportunity": self.repair_attempts_per_opportunity,
@@ -114,12 +220,54 @@ class BudgetSpec:
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> BudgetSpec:
-        fields = {
-            key: value
-            for key, value in payload.items()
-            if key not in {"schema_name", "schema_version"}
+        if payload.get("schema_name") != "BudgetSpec":
+            raise ValueError("expected BudgetSpec schema")
+        version = payload.get("schema_version")
+        common_fields = {
+            "schema_name",
+            "schema_version",
+            "proposal_opportunities",
+            "provider_attempts_per_opportunity",
+            "prompt_tokens",
+            "completion_tokens",
+            "repairs",
+            "candidate_training_attempts",
+            "training_steps",
+            "training_examples",
+            "evaluation_cases",
+            "infrastructure_retries",
+            "repair_attempts_per_opportunity",
+            "seed_evaluations",
         }
-        return cls(**fields)
+        if version == "1.0":
+            expected = common_fields | {"mps_seconds"}
+            if set(payload) != expected:
+                raise ValueError("BudgetSpec v1 has invalid fields")
+            result = cls(
+                **{
+                    key: value
+                    for key, value in payload.items()
+                    if key not in {"schema_name", "schema_version", "mps_seconds"}
+                },
+                mps_seconds=payload["mps_seconds"],
+            )
+            object.__setattr__(result, "schema_version", "1.0")
+            return result
+        if version == "2.0":
+            expected = common_fields | {
+                "accelerator_kind",
+                "accelerator_seconds",
+            }
+            if set(payload) != expected:
+                raise ValueError("BudgetSpec v2 has invalid fields")
+            return cls(
+                **{
+                    key: value
+                    for key, value in payload.items()
+                    if key not in {"schema_name", "schema_version"}
+                }
+            )
+        raise ValueError("unsupported BudgetSpec schema version")
 
 
 @dataclass
@@ -127,6 +275,7 @@ class BudgetLedger:
     """Mutable actuals with state-machine guards around proposal opportunities."""
 
     spec: BudgetSpec
+    accelerator_kind: str = ""
     seed_evaluations: int = 0
     proposal_opportunities: int = 0
     provider_attempts: int = 0
@@ -137,7 +286,7 @@ class BudgetLedger:
     candidate_training_attempts: int = 0
     training_steps: int = 0
     training_examples: int = 0
-    mps_seconds: float = 0.0
+    accelerator_seconds: float = 0.0
     evaluation_cases: int = 0
     repairs: int = 0
     infrastructure_retries: int = 0
@@ -147,9 +296,23 @@ class BudgetLedger:
     scientific_failures: int = 0
     infrastructure_failures: int = 0
     active_opportunity: int | None = None
+    schema_version: str = field(default="2.0", init=False)
     _provider_attempts_by_opportunity: dict[int, int] = field(default_factory=dict)
     _repairs_by_opportunity: dict[int, int] = field(default_factory=dict)
     _candidate_source_hashes: set[str] = field(default_factory=set)
+
+    def __post_init__(self) -> None:
+        if not self.accelerator_kind:
+            self.accelerator_kind = self.spec.accelerator_kind
+        _require_accelerator_kind(self.accelerator_kind)
+        if self.accelerator_kind != self.spec.accelerator_kind:
+            raise ValueError("ledger accelerator_kind differs from its frozen budget")
+
+    @property
+    def mps_seconds(self) -> float:
+        """Deprecated source-code alias for pre-v2 consumers."""
+
+        return self.accelerator_seconds
 
     @property
     def unique_candidate_sources(self) -> int:
@@ -185,14 +348,46 @@ class BudgetLedger:
             )
         setattr(self, field_name, updated)
 
+    def _resolve_accelerator_usage(
+        self,
+        *,
+        accelerator_kind: str | None,
+        accelerator_seconds: float | None,
+        mps_seconds: float | None,
+    ) -> tuple[str, int | float]:
+        if mps_seconds is not None:
+            _require_nonnegative_number(mps_seconds, "mps_seconds")
+            if accelerator_kind is not None or accelerator_seconds is not None:
+                raise ValueError(
+                    "mps_seconds cannot be combined with accelerator fields"
+                )
+            # The old argument was the sole compute counter. Preserve source
+            # compatibility while charging it to the frozen v2 accelerator kind.
+            return self.spec.accelerator_kind, mps_seconds
+        if accelerator_seconds is None:
+            raise ValueError("accelerator_seconds is required")
+        kind = (
+            self.spec.accelerator_kind
+            if accelerator_kind is None
+            else _require_accelerator_kind(accelerator_kind)
+        )
+        seconds = _require_nonnegative_number(
+            accelerator_seconds, "accelerator_seconds"
+        )
+        if kind != self.spec.accelerator_kind:
+            raise ValueError("accelerator_kind differs from the frozen budget")
+        return kind, seconds
+
     def record_seed_evaluation(
         self,
         *,
         training_attempts: int,
         training_steps: int,
         training_examples: int,
-        mps_seconds: float,
         evaluation_cases: int,
+        accelerator_kind: str | None = None,
+        accelerator_seconds: float | None = None,
+        mps_seconds: float | None = None,
     ) -> None:
         if self.active_opportunity is not None or self.proposal_opportunities:
             raise OpportunityStateError("seed evaluation must precede all proposals")
@@ -201,6 +396,8 @@ class BudgetLedger:
             attempts=training_attempts,
             steps=training_steps,
             examples=training_examples,
+            accelerator_kind=accelerator_kind,
+            accelerator_seconds=accelerator_seconds,
             mps_seconds=mps_seconds,
             require_active=False,
         )
@@ -218,9 +415,7 @@ class BudgetLedger:
             raise OpportunityStateError(
                 f"expected opportunity {expected}, received {index}"
             )
-        self._add(
-            "proposal_opportunities", 1, self.spec.proposal_opportunities
-        )
+        self._add("proposal_opportunities", 1, self.spec.proposal_opportunities)
         self.active_opportunity = index
         self._provider_attempts_by_opportunity.setdefault(index, 0)
         self._repairs_by_opportunity.setdefault(index, 0)
@@ -268,11 +463,20 @@ class BudgetLedger:
         attempts: int,
         steps: int,
         examples: int,
-        mps_seconds: float,
+        accelerator_kind: str | None = None,
+        accelerator_seconds: float | None = None,
+        mps_seconds: float | None = None,
         require_active: bool = True,
     ) -> None:
         if require_active:
             self._require_active()
+        kind, seconds = self._resolve_accelerator_usage(
+            accelerator_kind=accelerator_kind,
+            accelerator_seconds=accelerator_seconds,
+            mps_seconds=mps_seconds,
+        )
+        if kind != self.accelerator_kind:
+            raise ValueError("recorded accelerator differs from the ledger")
         self._add(
             "candidate_training_attempts",
             attempts,
@@ -280,7 +484,9 @@ class BudgetLedger:
         )
         self._add("training_steps", steps, self.spec.training_steps)
         self._add("training_examples", examples, self.spec.training_examples)
-        self._add("mps_seconds", mps_seconds, self.spec.mps_seconds)
+        self._add(
+            "accelerator_seconds", seconds, self.spec.accelerator_seconds
+        )
 
     def record_evaluation(self, cases: int, *, require_active: bool = True) -> None:
         if require_active:
@@ -300,9 +506,7 @@ class BudgetLedger:
     def record_infrastructure_retry(self, *, require_active: bool = True) -> None:
         if require_active:
             self._require_active()
-        self._add(
-            "infrastructure_retries", 1, self.spec.infrastructure_retries
-        )
+        self._add("infrastructure_retries", 1, self.spec.infrastructure_retries)
 
     def finish_opportunity(self, outcome: OpportunityOutcome) -> None:
         self._require_active()
@@ -322,9 +526,9 @@ class BudgetLedger:
         return self.active_opportunity
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        common = {
             "schema_name": "BudgetLedger",
-            "schema_version": "1.0",
+            "schema_version": self.schema_version,
             "spec": self.spec.to_dict(),
             "seed_evaluations": self.seed_evaluations,
             "proposal_opportunities": self.proposal_opportunities,
@@ -338,7 +542,19 @@ class BudgetLedger:
             "candidate_training_attempts": self.candidate_training_attempts,
             "training_steps": self.training_steps,
             "training_examples": self.training_examples,
-            "mps_seconds": self.mps_seconds,
+        }
+        if self.schema_version == "1.0":
+            compute = {"mps_seconds": self.accelerator_seconds}
+        elif self.schema_version == "2.0":
+            compute = {
+                "accelerator_kind": self.accelerator_kind,
+                "accelerator_seconds": self.accelerator_seconds,
+            }
+        else:  # pragma: no cover - guarded at loading boundaries
+            raise ValueError("unsupported BudgetLedger schema version")
+        return {
+            **common,
+            **compute,
             "evaluation_cases": self.evaluation_cases,
             "repairs": self.repairs,
             "infrastructure_retries": self.infrastructure_retries,
@@ -365,9 +581,54 @@ class BudgetLedger:
     def from_dict(cls, payload: dict[str, Any]) -> BudgetLedger:
         if payload.get("schema_name") != "BudgetLedger":
             raise ValueError("expected BudgetLedger schema")
-        if payload.get("schema_version") != "1.0":
+        version = payload.get("schema_version")
+        if version not in {"1.0", "2.0"}:
             raise ValueError("unsupported BudgetLedger schema version")
-        ledger = cls(spec=BudgetSpec.from_dict(payload["spec"]))
+        spec = BudgetSpec.from_dict(payload["spec"])
+        if version == "1.0":
+            if spec.schema_version != "1.0" or spec.accelerator_kind != "mps":
+                raise ValueError("BudgetLedger v1 requires a BudgetSpec v1 MPS budget")
+            compute_fields = {"mps_seconds"}
+            accelerator_kind = "mps"
+            accelerator_seconds = payload.get("mps_seconds", 0.0)
+        else:
+            compute_fields = {"accelerator_kind", "accelerator_seconds"}
+            accelerator_kind = payload.get("accelerator_kind")
+            accelerator_seconds = payload.get("accelerator_seconds", 0.0)
+        expected_fields = {
+            "schema_name",
+            "schema_version",
+            "spec",
+            "seed_evaluations",
+            "proposal_opportunities",
+            "provider_attempts",
+            "prompt_tokens",
+            "completion_tokens",
+            "unknown_provider_usage",
+            "parse_failures",
+            "unique_candidate_sources",
+            "candidate_source_hashes",
+            "candidate_training_attempts",
+            "training_steps",
+            "training_examples",
+            *compute_fields,
+            "evaluation_cases",
+            "repairs",
+            "infrastructure_retries",
+            "accepted",
+            "rejected",
+            "invalid",
+            "scientific_failures",
+            "infrastructure_failures",
+            "terminal_opportunities",
+            "active_opportunity",
+            "provider_attempts_by_opportunity",
+            "repairs_by_opportunity",
+        }
+        if set(payload) != expected_fields:
+            raise ValueError(f"BudgetLedger v{version[0]} has invalid fields")
+        ledger = cls(spec=spec, accelerator_kind=accelerator_kind)
+        ledger.schema_version = version
         scalar_fields = (
             "seed_evaluations",
             "proposal_opportunities",
@@ -379,7 +640,6 @@ class BudgetLedger:
             "candidate_training_attempts",
             "training_steps",
             "training_examples",
-            "mps_seconds",
             "evaluation_cases",
             "repairs",
             "infrastructure_retries",
@@ -391,28 +651,26 @@ class BudgetLedger:
             "active_opportunity",
         )
         for name in scalar_fields:
-            if name in payload:
-                setattr(ledger, name, payload[name])
+            setattr(ledger, name, payload[name])
+        ledger.accelerator_seconds = accelerator_seconds
         ledger._provider_attempts_by_opportunity = {
             int(key): require_int(value, "provider attempt count")
-            for key, value in payload.get(
-                "provider_attempts_by_opportunity", {}
-            ).items()
+            for key, value in payload["provider_attempts_by_opportunity"].items()
         }
         ledger._repairs_by_opportunity = {
             int(key): require_int(value, "repair count")
-            for key, value in payload.get("repairs_by_opportunity", {}).items()
+            for key, value in payload["repairs_by_opportunity"].items()
         }
-        candidate_hashes = payload.get("candidate_source_hashes", [])
+        candidate_hashes = payload["candidate_source_hashes"]
         if not isinstance(candidate_hashes, list) or any(
             not isinstance(value, str) or not value for value in candidate_hashes
         ):
             raise ValueError("candidate_source_hashes must be non-empty strings")
         ledger._candidate_source_hashes = set(candidate_hashes)
         ledger.validate()
-        if payload.get("unique_candidate_sources") != ledger.unique_candidate_sources:
+        if payload["unique_candidate_sources"] != ledger.unique_candidate_sources:
             raise ValueError("unique candidate-source count does not reconstruct")
-        if payload.get("terminal_opportunities") != ledger.terminal_opportunities:
+        if payload["terminal_opportunities"] != ledger.terminal_opportunities:
             raise ValueError("terminal opportunity count does not reconstruct")
         return ledger
 
@@ -443,10 +701,12 @@ class BudgetLedger:
                 raise ValueError(f"stored {name} cannot be negative")
         if self.active_opportunity is not None:
             require_int(self.active_opportunity, "active_opportunity")
-        if isinstance(self.mps_seconds, bool) or not isinstance(
-            self.mps_seconds, (int, float)
-        ):
-            raise ValueError("stored mps_seconds must be numeric")
+        _require_accelerator_kind(self.accelerator_kind)
+        if self.accelerator_kind != self.spec.accelerator_kind:
+            raise ValueError("stored accelerator_kind differs from its budget")
+        _require_nonnegative_number(
+            self.accelerator_seconds, "stored accelerator_seconds"
+        )
         if self.seed_evaluations > self.spec.seed_evaluations:
             raise ValueError("stored seed-evaluation count exceeds its ceiling")
         if self.proposal_opportunities > self.spec.proposal_opportunities:
@@ -464,7 +724,7 @@ class BudgetLedger:
             "candidate_training_attempts": self.spec.candidate_training_attempts,
             "training_steps": self.spec.training_steps,
             "training_examples": self.spec.training_examples,
-            "mps_seconds": self.spec.mps_seconds,
+            "accelerator_seconds": self.spec.accelerator_seconds,
             "evaluation_cases": self.spec.evaluation_cases,
             "repairs": self.spec.repairs,
             "infrastructure_retries": self.spec.infrastructure_retries,

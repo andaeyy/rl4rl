@@ -214,13 +214,13 @@ def test_preflight_runs_before_provider_configuration(monkeypatch, tmp_path):
                 "--iterations",
                 "1",
                 "--training-profile",
-                "smoke_train_v1",
+                "smoke_train_cuda_v2",
                 "--evaluation-profile",
                 "smoke_eval_v1",
                 "--evaluation-cases",
                 "64",
                 "--device",
-                "mps",
+                "cuda",
                 "--output-dir",
                 str(tmp_path / "fresh"),
             ],
@@ -274,13 +274,13 @@ def test_one_iteration_mock_controller_writes_two_candidate_budget_manifest(
             "--seed",
             "7",
             "--training-profile",
-            "full_train_v1",
+            "full_train_cuda_v2",
             "--evaluation-profile",
             "scientific_layer_a_v1",
             "--evaluation-cases",
             "10000",
             "--device",
-            "mps",
+            "cuda",
             "--output-dir",
             str(output),
         ],
@@ -290,8 +290,8 @@ def test_one_iteration_mock_controller_writes_two_candidate_budget_manifest(
     assert calls["iterations"] == 1
     assert manifest["candidate_budget"] == 2
     assert manifest["mutation_budget"] == 1
-    assert manifest["training"]["profile"] == "full_train_v1"
-    assert manifest["training"]["device"] == "mps"
+    assert manifest["training"]["profile"] == "full_train_cuda_v2"
+    assert manifest["training"]["device"] == "cuda"
     assert manifest["evaluation"]["profile"] == "scientific_layer_a_v1"
     assert manifest["evaluation"]["case_count"] == 10_000
     assert manifest["evidence_scope"] == "secondary_native_replication"
@@ -335,13 +335,13 @@ def test_smoke_profile_requires_explicit_engineering_pilot(monkeypatch, tmp_path
                 "--iterations",
                 "1",
                 "--training-profile",
-                "smoke_train_v1",
+                "smoke_train_cuda_v2",
                 "--evaluation-profile",
                 "smoke_eval_v1",
                 "--evaluation-cases",
                 "64",
                 "--device",
-                "mps",
+                "cuda",
                 "--output-dir",
                 str(tmp_path / "engineering-blocked"),
             ],
@@ -402,18 +402,24 @@ def test_ten_opportunity_engineering_pilot_is_provider_free_and_non_authoritativ
     assert calls["iterations"] == 10
     assert calls["constructor"]["initial_program_path"] == str(initial_ir)
     assert manifest["proposal_opportunities"] == 10
+    assert manifest["proposal_terminal_ledger"] == "proposal_terminal_outcomes.jsonl"
+    assert manifest["schema_name"] == "ControllerRunManifest"
+    assert manifest["schema_version"] == "2.0"
     assert manifest["candidate_budget"] == 11
     assert manifest["candidate_training_budget"] == 11
     assert manifest["parent_relative_architecture_change_required"] is True
     assert len(manifest["initial_architecture_hash"]) == 64
     assert manifest["architecture_hash_schema"] == "architecture_executable_v2"
     assert calls["parent_bound_worker_installed"] is True
-    assert manifest["maximum_provider_attempts"] == 30
+    assert manifest["maximum_provider_attempts"] == 10
+    assert manifest["provider_attempt_ledger"] == "provider_attempts.jsonl"
+    assert manifest["provider_attempt_schema"] == "ProviderAttemptRecord/1.0"
+    assert (output / "provider_attempts.jsonl").read_text(encoding="utf-8") == ""
     assert manifest["engineering_pilot"] is True
     assert manifest["evidence_scope"] == "exploratory_engineering_pilot"
     assert manifest["authoritative_scientific_evidence"] is False
-    assert manifest["training"]["profile"] == "smoke_train_v1"
-    assert manifest["training"]["device"] == "mps"
+    assert manifest["training"]["profile"] == "smoke_train_cuda_v2"
+    assert manifest["training"]["device"] == "cuda"
     assert manifest["training"]["allow_cpu_for_tests"] is False
     assert manifest["evaluation"]["profile"] == "smoke_eval_v1"
     assert manifest["evaluation"]["case_count"] == 64
@@ -434,6 +440,8 @@ def test_ten_opportunity_engineering_pilot_is_provider_free_and_non_authoritativ
     assert result["proposal_opportunities_requested"] == 10
     assert result["proposal_opportunities_completed"] == 10
     assert result["authoritative_scientific_evidence"] is False
+    assert result["schema_name"] == "ControllerRunResult"
+    assert result["schema_version"] == "2.0"
 
 
 def test_terminal_outcome_summary_counts_error_opportunities(monkeypatch, tmp_path):
@@ -513,7 +521,7 @@ def test_engineering_pilot_rejects_conflicting_profiles(tmp_path):
             [
                 "--engineering-pilot",
                 "--training-profile",
-                "full_train_v1",
+                "full_train_cuda_v2",
                 "--output-dir",
                 str(tmp_path / "conflict"),
             ],
@@ -548,13 +556,13 @@ def test_no_eligible_best_is_a_failed_run_without_best_artifact(monkeypatch, tmp
                 "--iterations",
                 "1",
                 "--training-profile",
-                "full_train_v1",
+                "full_train_cuda_v2",
                 "--evaluation-profile",
                 "scientific_layer_a_v1",
                 "--evaluation-cases",
                 "10000",
                 "--device",
-                "mps",
+                "cuda",
                 "--output-dir",
                 str(output),
             ],

@@ -23,7 +23,10 @@ def _quantity(name: str) -> QuantityDisclosure:
 def test_resource_disclosure_requires_compute_cost_and_energy() -> None:
     with pytest.raises(ValueError, match="resource disclosure"):
         ResourceDisclosure(
-            quantities=(_quantity("mps_compute"), _quantity("cpu_compute")),
+            quantities=(
+                _quantity("accelerator_compute"),
+                _quantity("cpu_compute"),
+            ),
             prompt_tokens=0,
             completion_tokens=0,
             provider_usage_complete=False,

@@ -11,6 +11,13 @@ from common.gpt56_sol import (
     resolve_provider_endpoint,
 )
 from common.openevolve_runner import _build_model_config
+from common.provider_attempts import (
+    PROVIDER_ATTEMPT_ACTION_ENV,
+    PROVIDER_ATTEMPT_HARNESS_ENV,
+    PROVIDER_ATTEMPT_LEDGER_ENV,
+    ProviderAttemptLedger,
+    load_provider_attempt_ledger,
+)
 
 
 def _profile(environ=None):
@@ -176,3 +183,74 @@ def test_openevolve_adapter_sends_the_same_effective_gpt56_fields():
     assert "temperature" not in captured
     assert "top_p" not in captured
     assert "max_tokens" not in captured
+
+
+def test_controlled_openevolve_transport_records_the_actual_sdk_attempt(
+    tmp_path,
+    monkeypatch,
+):
+    generation = GPT56SolProfile.resolve(
+        model=TARGET_MODEL,
+        seed=1,
+        default_reasoning_effort="high",
+        default_max_completion_tokens=16384,
+        default_timeout_seconds=300,
+        default_retries=0,
+        default_retry_delay_seconds=0,
+        environ={},
+    )
+    path = tmp_path / "provider_attempts.jsonl"
+    ProviderAttemptLedger.create(
+        path,
+        harness="openevolve_generic",
+        action="one_opportunity_engineering_canary",
+        controller_run_id="controller-run-1",
+        api_endpoint=OFFICIAL_OPENAI_API_BASE,
+        model=TARGET_MODEL,
+        environ={},
+    )
+    monkeypatch.setenv(PROVIDER_ATTEMPT_LEDGER_ENV, str(path))
+    monkeypatch.setenv(PROVIDER_ATTEMPT_HARNESS_ENV, "openevolve_generic")
+    monkeypatch.setenv(
+        PROVIDER_ATTEMPT_ACTION_ENV,
+        "one_opportunity_engineering_canary",
+    )
+    monkeypatch.setenv("DISCOVERY_RUN_ID", "controller-run-1")
+
+    adapter = OpenAILLM(
+        _build_model_config(
+            generation,
+            api_base=OFFICIAL_OPENAI_API_BASE,
+            api_key="offline-test-key",
+        )
+    )
+    response = SimpleNamespace(
+        id="chatcmpl-openevolve123",
+        _request_id="req_openevolve123",
+        usage=SimpleNamespace(
+            prompt_tokens=10,
+            completion_tokens=5,
+            total_tokens=15,
+        ),
+        choices=[SimpleNamespace(message=SimpleNamespace(content="offline response"))],
+    )
+    adapter.client = SimpleNamespace(
+        chat=SimpleNamespace(
+            completions=SimpleNamespace(create=lambda **_kwargs: response)
+        )
+    )
+
+    result = asyncio.run(
+        adapter.generate_with_context(
+            "system prompt",
+            [{"role": "user", "content": "Propose one architecture."}],
+        )
+    )
+
+    assert result == "offline response"
+    record = load_provider_attempt_ledger(path)[0]
+    assert record.harness == "openevolve_generic"
+    assert record.status == "success"
+    assert record.provider_response_id == "chatcmpl-openevolve123"
+    assert record.provider_request_id == "req_openevolve123"
+    assert record.total_tokens == 15

@@ -21,6 +21,14 @@ Read [RESEARCH_HANDOFF.md](RESEARCH_HANDOFF.md) before running new experiments.
 It contains the verified literature links, corrections to the inherited notes,
 paper-positioning advice, data requirements, and ordered next steps.
 
+The separate `architecture_discovery/` execution system is configured to use
+Modal with NVIDIA CUDA as the canonical backend for new remote engineering
+runs; its bounded live validation remains pending. Version-1 MPS artifacts
+remain historical compatibility evidence and are not treated as cross-device
+equivalents. No paid run or scientific launch is authorized by the migration.
+Start with the provider-free checks and approval gates in
+[architecture_discovery/README.md](architecture_discovery/README.md).
+
 ## Quick start
 
 Python 3.11 or newer and [uv](https://docs.astral.sh/uv/) are recommended.

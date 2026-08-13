@@ -13,6 +13,7 @@ outputs/candidate_training/
 outputs/development/
 outputs/engineering_canary/
 outputs/engineering_10x4/
+outputs/readiness/
 outputs/validation/
 outputs/.candidate_training.lock
 

@@ -168,10 +168,10 @@ def _options(tmp_path: Path, *, iterations: int = 1) -> RunOptions:
         seed=3,
         output_dir=tmp_path / "run",
         initial_candidate=initial,
-        training_profile="smoke_train_v1",
+        training_profile="smoke_train_cuda_v2",
         evaluation_profile="smoke_eval_v1",
         evaluation_case_count=64,
-        device="mps",
+        device="cuda",
         allow_cpu_for_tests=False,
         pi_decision_record_id=None,
         eligibility_threshold=0.0,
@@ -198,6 +198,8 @@ def test_ten_zero_accuracy_ir_opportunities_are_accounted_without_api_or_mps(tmp
     assert len(evaluator.requests) == 11
     assert summary["proposal_opportunities_requested"] == 10
     assert summary["proposal_opportunities_terminal"] == 10
+    assert summary["lineage_path"] == "lineage.jsonl"
+    assert summary["archive_path"] == "semantic_archive.json"
     records = _lineage(tmp_path / "run" / "lineage.jsonl")
     assert len(records) == 11
     assert [record["opportunity_index"] for record in records] == list(range(11))
@@ -206,10 +208,21 @@ def test_ten_zero_accuracy_ir_opportunities_are_accounted_without_api_or_mps(tmp
     assert not list((tmp_path / "run" / "artifacts").glob("*.py"))
 
     manifest = json.loads((tmp_path / "run" / "run_manifest.json").read_text())
+    assert manifest["schema_name"] == "ControllerRunManifest"
+    assert manifest["schema_version"] == "2.0"
+    assert summary["schema_name"] == "ControllerRunSummary"
+    assert summary["schema_version"] == "2.0"
+    archive = json.loads((tmp_path / "run" / "semantic_archive.json").read_text())
+    assert archive["schema_version"] == "2.0"
+    assert all(
+        not Path(cell["source_path"]).is_absolute()
+        and cell["source_path"].startswith("artifacts/")
+        for cell in archive["cells"]
+    )
     assert manifest["run_mode"] == "engineering_pilot"
-    assert manifest["training"]["profile"] == "smoke_train_v1"
+    assert manifest["training"]["profile"] == "smoke_train_cuda_v2"
     assert manifest["evaluation"]["profile"] == "smoke_eval_v1"
-    assert manifest["training"]["device"] == "mps"
+    assert manifest["training"]["device"] == "cuda"
     assert manifest["evaluation"]["eligibility_threshold"] == 0.0
     assert manifest["authoritative_scientific_evidence"] is False
     assert manifest["candidate_format"] == "architecture_tensor_graph@1.0"
@@ -450,6 +463,35 @@ def test_archive_parent_policy_uses_coverage_and_accuracy_not_category_order(tmp
     assert archive.select_parent().candidate_id == "candidate-first"
 
 
+def test_semantic_archive_v2_paths_are_relative_and_v1_shape_is_preserved(tmp_path):
+    root = tmp_path / "run"
+    candidate = root / "artifacts" / "first.ir.json"
+    candidate.parent.mkdir(parents=True)
+    view = _view("portable", score=0.6)
+
+    portable = FrozenSemanticArchive(serialization_root=root)
+    portable.consider(
+        candidate_id="candidate-portable",
+        lineage_record_id="lineage-portable",
+        source_path=candidate,
+        view=view,
+        opportunity=1,
+    )
+    legacy = FrozenSemanticArchive()
+    legacy.consider(
+        candidate_id="candidate-legacy",
+        lineage_record_id="lineage-legacy",
+        source_path=candidate,
+        view=view,
+        opportunity=1,
+    )
+
+    assert portable.to_dict()["schema_version"] == "2.0"
+    assert portable.to_dict()["cells"][0]["source_path"] == "artifacts/first.ir.json"
+    assert legacy.to_dict()["schema_version"] == "1"
+    assert legacy.to_dict()["cells"][0]["source_path"] == str(candidate)
+
+
 def test_injected_evaluator_requires_controller_only_test_boundary(tmp_path):
     with pytest.raises(PilotPreflightError, match="controller-only test double"):
         run_semantic_autoresearch(
@@ -459,7 +501,7 @@ def test_injected_evaluator_requires_controller_only_test_boundary(tmp_path):
         )
 
 
-def test_cli_engineering_pilot_forces_smoke_profiles_zero_threshold_and_mps(
+def test_cli_engineering_pilot_forces_smoke_profiles_zero_threshold_and_cuda(
     tmp_path,
     monkeypatch,
     capsys,
@@ -499,9 +541,11 @@ def test_cli_engineering_pilot_forces_smoke_profiles_zero_threshold_and_mps(
 
     assert len(captured) == 2
     assert all(option.engineering_pilot for option in captured)
-    assert all(option.training_profile == "smoke_train_v1" for option in captured)
+    assert all(
+        option.training_profile == "smoke_train_cuda_v2" for option in captured
+    )
     assert all(option.evaluation_profile == "smoke_eval_v1" for option in captured)
-    assert all(option.device == "mps" for option in captured)
+    assert all(option.device == "cuda" for option in captured)
     assert all(option.eligibility_threshold == 0.0 for option in captured)
     assert all(option.evaluation_case_count is None for option in captured)
     assert json.loads(capsys.readouterr().out) == {"ok": True}
@@ -553,7 +597,9 @@ def test_cli_scientific_mode_preserves_frozen_point99_threshold(
     semantic_run.main()
 
     assert all(not option.engineering_pilot for option in captured)
-    assert all(option.training_profile == "full_train_v1" for option in captured)
+    assert all(
+        option.training_profile == "full_train_cuda_v2" for option in captured
+    )
     assert all(option.evaluation_profile == "scientific_layer_a_v1" for option in captured)
     assert all(option.eligibility_threshold == 0.99 for option in captured)
     assert json.loads(capsys.readouterr().out) == {"ok": True}

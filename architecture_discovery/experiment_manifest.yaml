@@ -1,5 +1,5 @@
 schema_name: architecture_discovery_experiment_manifest
-schema_version: "2"
+schema_version: "3"
 
 study:
   name: valid_architecture_discovery_on_adderboard
@@ -32,6 +32,8 @@ primary_causal_design:
   transition_schedule: null
   primary_budget: null
   provider_attempt_limit_per_opportunity: null
+  provider_attempt_limit_status: unresolved_scientific_budget_decision
+  provider_attempt_accounting_status: typed_budget_accounting_integrated_live_transport_ledger_pending_scientific_launch_surface
   repair_limit_per_opportunity: null
 
 secondary_controls:
@@ -45,20 +47,130 @@ secondary_controls:
     adaptive_feedback: true
 
 machine:
-  model: MacBook Air Mac17,3
-  chip: Apple M5
-  memory_gb: 24
-  os: macOS 26.5.1
-  preferred_device: mps
+  execution_backend: modal
+  requested_gpu: NVIDIA T4
+  observed_gpu: null
+  preferred_device: cuda
   scientific_fallback_device: none
   engineering_test_device: cpu_with_explicit_flag_only
+  historical_local_host:
+    model: MacBook Air Mac17,3
+    chip: Apple M5
+    memory_gb: 24
+    os: macOS 26.5.1
+    preferred_device: mps
 
 runtime:
   python: "3.12"
-  environment: .venv
+  environment: /opt/architecture_discovery/.venv
   package_manager: uv
-  setup_selected_device: mps
-  setup_device_reason: apple_m5_mps_verified_outside_sandbox
+  setup_selected_device: cuda
+  setup_device_reason: canonical_modal_cuda_execution_condition
+  pytorch_enable_mps_fallback: false
+  cublas_workspace_config: ":4096:8"
+
+remote_execution:
+  provider: modal
+  profile: scalingintelligence
+  environment: main
+  app_name: rl4rl-architecture-discovery
+  app_module: modal_app.py
+  mode: ephemeral_modal_run
+  current_scope: engineering_validation_only
+  full_profile_action: not_exposed_pending_scientific_approval
+  future_full_profile_requires_separate_resource_contract: true
+  deployed_app: false
+  detached_calls: false
+  python: "3.12"
+  modal_version: 1.5.3
+  initial_gpu: T4
+  function_cpu_request_cores: 2.0
+  function_cpu_soft_limit_cores: 2.0
+  function_cpu_limit_kind: soft_throttle_threshold
+  function_memory_request_mib: 8192
+  function_memory_limit_mib: 8192
+  function_memory_limit_kind: hard
+  function_platform_compute_cost_ceiling_enforced: false
+  runtime_functions_preemptible: true
+  platform_preemption_restart_possible: true
+  logical_call_count_is_not_container_attempt_ceiling: true
+  function_region: null
+  image_build_cpu_request_cores: 2.0
+  image_build_cpu_soft_limit_cores: null
+  image_build_memory_request_mib: 8192
+  image_build_memory_limit_mib: null
+  image_build_region: null
+  image_build_subprocess_thread_limit: 2
+  image_build_resource_limits_exposed: false
+  image_build_platform_compute_cost_ceiling_enforced: false
+  modal_price_basis_schema: ModalPriceBasis/1.0
+  modal_price_basis_max_age_hours: 48
+  modal_cost_gate_scope: local_pre_popen_request_rate_and_one_gib_month_storage_estimate_not_platform_billing_cap
+  max_containers: 1
+  min_containers: 0
+  retries: 0
+  function_timeout_seconds: 300
+  controller_subprocess_timeout_seconds: 240
+  provider_request_timeout_seconds: 180
+  provider_attempt_finalization_reserve_seconds: 60
+  parallel_candidate_training: false
+  provider_canaries_sequential: true
+  engineering_canary_maximum_provider_attempts_per_harness: 1
+  four_harness_engineering_canary_maximum_provider_attempts: 4
+  provider_attempt_ledger_schema: ProviderAttemptRecord/1.0
+  provider_canary_approval_plan_schema: ProviderCanaryApprovalPlan/1.2
+  provider_canary_aggregate_outcome_schema: ProviderCanaryAggregateOutcomeReceipt/1.1
+  provider_canary_selector_schema: ModalProviderCanaryRunSelector/2.0
+  modal_local_host_anchor_schema: ModalLocalHostAnchor/1.0
+  modal_remote_run_reservation_schema: ModalRemoteRunReservation/1.2
+  modal_action_intent_schema: ModalActionIntent/1.6
+  modal_local_process_start_schema: ModalLocalProcessStart/1.1
+  modal_action_attempt_receipt_schema: ModalActionAttemptReceipt/3.6
+  modal_action_recovery_request_schema: ModalActionRecoveryRequest/1.0
+  modal_action_recovery_intent_schema: ModalActionRecoveryIntent/1.0
+  modal_action_recovery_host_containment_schema: ModalActionRecoveryHostContainment/1.0
+  modal_action_recovery_resolution_schema: ModalActionRecoveryResolution/1.0
+  modal_cleanup_snapshot_capture_manifest_schema: ModalCleanupSnapshotCaptureManifest/1.0
+  modal_migration_lineage_schema: ModalMigrationLineage/1.1
+  modal_prior_cohort_quarantine_accounting_schema: ModalPriorCohortQuarantineAccounting/1.1
+  modal_migration_cohort_roster_schema: ModalMigrationCohortRoster/4.0
+  modal_action_lock_path: outputs/readiness/.modal_action.lock
+  modal_action_lock_scope: launcher_recovery_snapshot_capture_prior_accounting_lineage_roster_resource_cleanup_migration_bundle_and_global_journal_scan
+  modal_global_action_journal_scanner_implemented: true
+  modal_global_action_journal_prelaunch_gate_wired: true
+  modal_action_orphan_recovery_status: operational_exact_v1_cli_scanner_validated
+  failed_provider_canary_retention: sanitized_provider_attempt_ledger_only
+  artifact_volume: rl4rl-architecture-artifacts
+  artifact_mount: /mnt/discovery
+  provider_secret: rl4rl-discovery-provider
+  image_source_manifest_schema: ModalImageSourceManifest/1.0
+  image_source_sha256: null
+  live_validation_status: pending_explicit_cost_approval
+
+modal_engineering_evidence:
+  live_evidence_authority: external_create_only_receipts
+  receipt_contracts:
+    modal_cuda_environment_validated:
+      receipt_path_template: outputs/readiness/modal_only_final/modal_live_cohorts/{source_tree_sha256}/{image_source_sha256}/{cohort_id}/components/modal_cuda_environment_validation_receipt.v2.0.json
+      receipt_contract:
+        schema_name: ModalCUDAEnvironmentValidationReceipt
+        schema_version: "2.0"
+    modal_artifact_round_trip_validated:
+      receipt_path_template: outputs/readiness/modal_only_final/modal_live_cohorts/{source_tree_sha256}/{image_source_sha256}/{cohort_id}/components/modal_artifact_round_trip_validation_receipt.v3.0.json
+      receipt_contract:
+        schema_name: ModalArtifactRoundTripValidationReceipt
+        schema_version: "3.0"
+    modal_resource_cleanup_validated:
+      receipt_path_template: outputs/readiness/modal_only_final/modal_live_cohorts/{source_tree_sha256}/{image_source_sha256}/{cohort_id}/components/modal_resource_cleanup_validation_receipt.v4.0.json
+      receipt_contract:
+        schema_name: ModalResourceCleanupValidationReceipt
+        schema_version: "4.0"
+    modal_migration_validation_bundle_validated:
+      receipt_path_template: outputs/readiness/modal_only_final/modal_live_cohorts/{source_tree_sha256}/{image_source_sha256}/{cohort_id}/components/modal_migration_validation_bundle_receipt.v4.0.json
+      receipt_contract:
+        schema_name: ModalMigrationValidationBundleReceipt
+        schema_version: "4.0"
+  remote_execution_image_source_sha256_null_reason: experiment_manifest_is_source_bound_and_embedding_its_derived_image_digest_would_create_a_self_reference_and_invalidate_the_live_cohort
 
 sources:
   adderboard:
@@ -73,8 +185,16 @@ sources:
     commit: 258c29b56fbff42da26bdf64cb42ba5b142e2903
     upstream_url: https://github.com/algorithmicsuperintelligence/openevolve.git
     upstream_commit: 411fb59c886c18704caaffb611e17cf9e7d824d2
-    patch: disable_implicit_openai_sdk_retries
-    patched_file_sha256: 4d775758e83b21678becf1759dd58bfe2b13976559caeae165a4b223de7446d7
+    patches:
+      provider_transport_single_shot_and_attempt_ledger:
+        files:
+          vendor/openevolve/openevolve/llm/openai.py: c01228a2a47b7d22096206e9f9da999dfb031fed728568583da6fbc667fec1d1
+          vendor_patches/openevolve_provider_attempt_ledger.patch: b0f731fa87fda394188dadc8fdab9c687b22c0a635eebef06d04cc4740017dc6
+      isolate_provider_key_from_process_pool_payload:
+        files:
+          vendor/openevolve/openevolve/process_parallel.py: d740466efc43d6f70f341bcf6d33701188edf215e2347f66febaa7d45ad10971
+          vendor/openevolve/tests/test_process_parallel.py: 65f7402c8caec92254eec677bccd709569e221dc43f4e81f48648e98137b3afe
+          vendor_patches/openevolve_process_isolation.patch: f39fa2a2ed50b7d22a28a5c5ce5547838f66b8445b2f17ad24f899a4e92560a8
 
 shared_generation:
   target_model: gpt-5.6-sol
@@ -86,9 +206,14 @@ shared_generation:
   temperature: null
   top_p: null
   max_completion_tokens: 16384
-  request_timeout_seconds: 300
-  retries: 2
-  retry_delay_seconds: 3
+  request_timeout_seconds: 180
+  retries: 0
+  retry_delay_seconds: 0
+  maximum_transport_attempts_per_provider_call: 1
+  successful_engineering_canary_attribution_requires:
+    - provider_response_id
+    - provider_request_id
+    - known_reconciled_token_usage
   request_seed: controller_seed_best_effort
   mutation_format: complete_architecture_ir_json
 
@@ -125,14 +250,14 @@ evaluation:
 training:
   candidate_initialization: from_scratch
   owner: trusted_evaluator
-  profile: full_train_v1
-  profile_version: "1"
-  profile_hash: 046034a7949f3563fc13dcb38df4b34e997cb5a1ffe6b90e755e2f44bfd9f06e
+  profile: full_train_cuda_v2
+  profile_version: "2"
+  profile_hash: fb245e5d7eedc85b9fb79788c4a372e71c376d2283633103fd393b0d9ca1f70f
   scientific: true
   task_adapter: fixed_addition_v1
   task_adapter_hash: 0663e4cc7a57a98661e7317331f708b69d1d2ac213be335b91098e47e0a06880
   seed_derivation: sha256-v1
-  device: mps
+  device: cuda
   dtype: float32
   max_optimizer_steps: 30000
   global_batch_size: 512
@@ -151,12 +276,16 @@ training:
   checkpoint_selection: higher_development_exact_match_then_lower_development_loss_then_earlier_step
   maximum_wall_seconds: 1800
   deterministic_algorithms: true
+  cudnn_deterministic: true
+  cudnn_benchmark: false
+  allow_tf32: false
+  cublas_workspace_config: ":4096:8"
   automatic_batch_size_reduction: false
   cpu_fallback: false
   parallel_candidate_training: false
   candidate_format_current: architecture_ir
   native_four_harness_candidate_format: architecture_ir
-  primary_causal_engine_candidate_format_status: legacy_python_generation_blocked_pending_ir_migration
+  primary_causal_engine_candidate_format_status: architecture_ir_only_contract_integrated_pending_scientific_authorization_and_canonical_modal_validation
   scientific_containment_required: true
   scientific_execution_boundary: trusted_ir_or_candidate_bound_os_boundary
   scientific_arbitrary_python_status: blocked_until_os_boundary_attested
@@ -164,13 +293,15 @@ training:
   resume_checkpoint_loading: weights_only_true
 
 engineering_smoke:
-  profile: smoke_train_v1
-  profile_version: "1"
-  profile_hash: 1a2b04bcb966f4189f90d6b8f6ef3aa8f83fb537f0f031004d0e58d69192cb61
+  profile: smoke_train_cuda_v2
+  profile_version: "2"
+  profile_hash: 2cd6ae5caae6704095290d5c9fb41e481e6535e279fe78a0c9fdf5befedca49e
   scientific: false
+  device: cuda
   max_optimizer_steps: 10
   global_batch_size: 16
   validation_examples: 24
+  checkpoint_interval: 5
   maximum_wall_seconds: 60
 
 artifacts_and_reconstruction:
@@ -182,6 +313,37 @@ artifacts_and_reconstruction:
   reproducibility_reporting: implemented_and_offline_tested
   external_chain_anchor: null
   external_signature_verifier_status: required_not_implemented
+  active_budget_schema: BudgetLedger/2.0
+  active_randomization_schema: RandomizationPlan/2.0
+  active_block_schema: BlockSpec/2.0
+  active_run_schema: RunSpec/2.0
+  active_training_manifest_schema: TrainingManifest/2.0
+  active_training_result_schema: TrainingResult/2.0
+  active_controller_manifest_schema: ControllerRunManifest/2.0
+  active_controller_summary_schema: ControllerRunSummary/2.0
+  active_controller_result_schema: ControllerRunResult/2.0
+  active_semantic_archive_schema: semantic_autoresearch_archive/2.0
+  active_compute_field: accelerator_seconds
+  active_compute_kind_field: accelerator_kind
+  active_path_contract: logical_project_or_run_relative_posix
+  serialize_executor_absolute_paths: false
+  historical_v1_absolute_path_reader: accepted_hash_stable
+  modal_execution_context_schema: ExecutionContext/1.0
+  remote_artifact_location: volume://rl4rl-architecture-artifacts/runs
+
+historical_mps_compatibility:
+  status: retained_read_only_compatible
+  cross_device_equivalence_claim: none
+  full_profile:
+    name: full_train_v1
+    version: "1"
+    hash: 046034a7949f3563fc13dcb38df4b34e997cb5a1ffe6b90e755e2f44bfd9f06e
+  smoke_profile:
+    name: smoke_train_v1
+    version: "1"
+    hash: 1a2b04bcb966f4189f90d6b8f6ef3aa8f83fb537f0f031004d0e58d69192cb61
+  legacy_compute_field: mps_seconds
+  historical_receipt_script: scripts/record_mps_validation.py
 
 scientific_evidence_status:
   frozen_research_protocol: required
@@ -189,7 +351,8 @@ scientific_evidence_status:
   reviewer_roster: required
   mechanism_plan: required
   replication_policy: required
-  full_mps_validation: required
+  full_accelerator_validation: required
+  historical_mps_validation: retained_non_authorizing_evidence
   pilot_evidence: required_before_main
   final_power_analysis_plan: required_after_pilot
   pi_pilot_launch_authorization: false

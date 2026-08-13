@@ -125,9 +125,9 @@ def evaluate_for_openevolve(program_path: str) -> EvaluationResult:
                 "OpenEvolve proposal duplicates an architecture already proposed "
                 "or evaluated in this run"
             )
-    profile = os.environ.get("DISCOVERY_TRAINING_PROFILE", "full_train_v1")
+    profile = os.environ.get("DISCOVERY_TRAINING_PROFILE", "full_train_cuda_v2")
     run_seed = int(os.environ.get("DISCOVERY_TRAINING_SEED", "1"))
-    device = os.environ.get("DISCOVERY_TRAIN_DEVICE", "mps")
+    device = os.environ.get("DISCOVERY_TRAIN_DEVICE", "cuda")
     allow_cpu = os.environ.get("DISCOVERY_ALLOW_CPU_TRAINING", "0") == "1"
     eligibility_threshold = float(
         os.environ.get("DISCOVERY_ELIGIBILITY_THRESHOLD", "0.99")

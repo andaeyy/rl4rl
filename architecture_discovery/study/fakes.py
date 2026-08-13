@@ -75,7 +75,8 @@ class DeterministicFakeEvaluator:
             training_attempts=1,
             training_steps=4,
             training_examples=16,
-            mps_seconds=0.001,
+            accelerator_kind="cpu",
+            accelerator_seconds=0.001,
             evaluation_cases=8,
         )
 
@@ -103,6 +104,7 @@ class DeterministicFakeEvaluator:
             training_attempts=1,
             training_steps=4,
             training_examples=16,
-            mps_seconds=0.001,
+            accelerator_kind="cpu",
+            accelerator_seconds=0.001,
             evaluation_cases=8,
         )

@@ -15,10 +15,12 @@ from evaluation.records import (
     RecordEnvelope,
     canonical_json,
     content_sha256,
+    require_bool,
     require_sha256,
     sha256_text,
     utc_now,
 )
+
 from sealed_eval.snapshot import FrozenRunSnapshot
 
 
@@ -37,6 +39,7 @@ class ConfirmationReleaseManifest:
     pi_release_record_id: str
 
     def validate(self) -> None:
+        require_bool(self.enabled, "release manifest enabled")
         for name in (
             "authorization_id",
             "candidate_id",
@@ -44,7 +47,13 @@ class ConfirmationReleaseManifest:
             "qualification_record_id",
             "pi_release_record_id",
         ):
-            if not getattr(self, name):
+            value = getattr(self, name)
+            if (
+                not isinstance(value, str)
+                or not value
+                or value != value.strip()
+                or any(character in value for character in ("/", "\\", "\x00"))
+            ):
                 raise ValueError(f"{name} is required")
         for name in (
             "frozen_candidate_sha256",
@@ -75,6 +84,9 @@ class ConfirmationMeasurements:
     metrics: tuple[tuple[str, float], ...] = ()
     complete: bool = True
 
+    def validate(self) -> None:
+        require_bool(self.complete, "confirmation measurements complete")
+
 
 class LayerCReleaseGate:
     """Persistently consume one authorization before Layer C can run."""
@@ -92,6 +104,7 @@ class LayerCReleaseGate:
         if not evaluation_plan.sealed or evaluation_plan.controller_visible:
             raise ValueError("Layer C evaluation must be sealed and controller-hidden")
         roots.validate()
+        require_bool(enabled, "Layer C release enabled")
         self._roots = roots
         self._plan = evaluation_plan
         self._enabled = enabled
@@ -108,14 +121,14 @@ class LayerCReleaseGate:
         snapshot: FrozenRunSnapshot,
         qualification: QualificationEvaluationRecord,
     ) -> ConfirmationAuthorizationReceipt:
-        if not self._enabled:
+        if self._enabled is not True:
             raise PermissionError("Layer C release is disabled")
         manifest.validate()
-        if not manifest.enabled:
+        if manifest.enabled is not True:
             raise PermissionError("release manifest is not enabled")
         if manifest.confirmation_plan_sha256 != self._plan.plan_hash:
             raise ValueError("release manifest references a different Layer C plan")
-        if not token:
+        if not isinstance(token, str) or not token:
             raise PermissionError("Layer C confirmation token cannot be empty")
         if sha256_text(token) != manifest.token_sha256:
             raise PermissionError("invalid Layer C confirmation token")
@@ -157,7 +170,9 @@ class LayerCReleaseGate:
                 0o600,
             )
         except FileExistsError as error:
-            raise PermissionError("Layer C authorization was already consumed") from error
+            raise PermissionError(
+                "Layer C authorization was already consumed"
+            ) from error
         with os.fdopen(descriptor, "wb") as handle:
             handle.write(marker_bytes)
             handle.flush()
@@ -181,7 +196,7 @@ class LayerCReleaseGate:
         measurements: ConfirmationMeasurements,
         envelope: RecordEnvelope,
     ) -> ConfirmationEvaluationRecord:
-        if not self._enabled:
+        if self._enabled is not True:
             raise PermissionError("Layer C release is disabled")
         manifest.validate()
         if receipt.authorization_id != manifest.authorization_id:
@@ -197,7 +212,8 @@ class LayerCReleaseGate:
             raise PermissionError("Layer C authorization has not been consumed")
         import hashlib
 
-        if hashlib.sha256(marker.read_bytes()).hexdigest() != receipt.consumption_marker_sha256:
+        marker_sha256 = hashlib.sha256(marker.read_bytes()).hexdigest()
+        if marker_sha256 != receipt.consumption_marker_sha256:
             raise PermissionError("Layer C authorization receipt is not authentic")
         snapshot.validate(require_completed=True)
         candidate = snapshot.candidate(manifest.candidate_id)
@@ -207,8 +223,9 @@ class LayerCReleaseGate:
             raise ValueError("Layer C qualification record was modified")
         if not qualification.evaluation_complete or not qualification.qualifies:
             raise PermissionError("Layer C requires a qualifying Layer B record")
+        measurements.validate()
         confirmed = (
-            measurements.complete
+            measurements.complete is True
             and measurements.exact_match_accuracy >= manifest.confirmation_threshold
         )
         record = ConfirmationEvaluationRecord(

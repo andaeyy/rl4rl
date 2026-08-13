@@ -15,7 +15,6 @@ import os
 import re
 import sys
 import tempfile
-import time
 import uuid
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass
@@ -55,6 +54,11 @@ from common.lineage_schema import CandidateRecord, append_record, text_hash, utc
 from common.public_evaluation import (
     PUBLIC_LAYER_A_SOURCE_ID,
     PUBLIC_LAYER_A_SOURCE_SHA256,
+)
+from common.provider_attempts import (
+    PROVIDER_ATTEMPT_LEDGER_FILENAME,
+    PROVIDER_ATTEMPT_SCHEMA,
+    ProviderAttemptLedger,
 )
 from common.task_adapter import DEFAULT_TASK
 from common.trainer import trusted_component_hashes, trusted_component_set_sha256
@@ -158,12 +162,22 @@ class ArchiveCandidate:
 class FrozenSemanticArchive:
     """Categorical coverage archive whose codes are never treated as fitness."""
 
-    def __init__(self, axes: Sequence[str] = FROZEN_DESCRIPTOR_AXES):
+    def __init__(
+        self,
+        axes: Sequence[str] = FROZEN_DESCRIPTOR_AXES,
+        *,
+        serialization_root: Path | None = None,
+    ):
         frozen = tuple(axes)
         if frozen != FROZEN_DESCRIPTOR_AXES:
             raise ValueError("semantic archive axes differ from the frozen descriptor order")
         self.axes = frozen
         self._cells: dict[tuple[int, ...], ArchiveCandidate] = {}
+        self._serialization_root = (
+            None
+            if serialization_root is None
+            else serialization_root.expanduser().resolve()
+        )
 
     @property
     def coverage(self) -> int:
@@ -258,13 +272,24 @@ class FrozenSemanticArchive:
         for candidate in sorted(
             self._cells.values(), key=lambda item: item.candidate_id
         ):
+            if self._serialization_root is None:
+                source_path = str(candidate.source_path)
+            else:
+                try:
+                    source_path = candidate.source_path.resolve().relative_to(
+                        self._serialization_root
+                    ).as_posix()
+                except ValueError as error:
+                    raise ValueError(
+                        "semantic archive candidate is outside its serialization root"
+                    ) from error
             cells.append(
                 {
                     "cell": self.cell_label(candidate.signature),
                     "signature": list(candidate.signature),
                     "candidate_id": candidate.candidate_id,
                     "lineage_record_id": candidate.lineage_record_id,
-                    "source_path": str(candidate.source_path),
+                    "source_path": source_path,
                     "search_score": candidate.search_score,
                     "public_accuracy": candidate.public_accuracy,
                     "discovered_opportunity": candidate.discovered_opportunity,
@@ -273,7 +298,9 @@ class FrozenSemanticArchive:
             )
         return {
             "schema_name": "semantic_autoresearch_archive",
-            "schema_version": "1",
+            "schema_version": (
+                "1" if self._serialization_root is None else "2.0"
+            ),
             "axes": list(self.axes),
             "coverage_cells": len(cells),
             "novelty_role": "exploratory_coverage_tiebreak_only",
@@ -292,9 +319,14 @@ class OpenAIProposalProvider:
         endpoint: ProviderEndpoint,
         generation: GPT56SolProfile,
     ):
+        if generation.retries != 0 or generation.retry_delay_seconds != 0:
+            raise PilotPreflightError(
+                "provider attempts are single-shot; retries and retry delay must be zero"
+            )
         self.endpoint = endpoint
         self.api_base = endpoint.base_url
         self.generation = generation
+        self._attempt_ledger: ProviderAttemptLedger | None = None
         self.client = OpenAI(
             api_key=api_key,
             base_url=endpoint.base_url,
@@ -308,25 +340,44 @@ class OpenAIProposalProvider:
         if not self.generation.model.strip():
             raise PilotPreflightError("provider model is empty")
 
+    def bind_attempt_ledger(
+        self,
+        output_dir: Path,
+        *,
+        run_id: str,
+        action: str,
+    ) -> None:
+        """Create the run's immutable attempt ledger before any request."""
+
+        if self._attempt_ledger is not None:
+            raise PilotPreflightError("provider attempt ledger is already bound")
+        self._attempt_ledger = ProviderAttemptLedger.create(
+            output_dir / PROVIDER_ATTEMPT_LEDGER_FILENAME,
+            harness=CONDITION,
+            action=action,
+            controller_run_id=run_id,
+            api_endpoint=self.endpoint.base_url,
+            model=self.generation.model,
+        )
+
     def generate(self, messages: Sequence[Mapping[str, str]]) -> ProposalResponse:
-        for attempt in range(self.generation.retries + 1):
-            try:
-                response = self.client.chat.completions.create(
-                    **self.generation.chat_completion_request(messages)
-                )
-                usage = response.usage
-                return ProposalResponse(
-                    text=response.choices[0].message.content or "",
-                    input_tokens=getattr(usage, "prompt_tokens", 0) if usage else 0,
-                    output_tokens=(
-                        getattr(usage, "completion_tokens", 0) if usage else 0
-                    ),
-                )
-            except Exception:
-                if attempt >= self.generation.retries:
-                    raise
-                time.sleep(self.generation.retry_delay_seconds)
-        raise RuntimeError("unreachable provider retry state")
+        if self._attempt_ledger is None:
+            raise PilotPreflightError(
+                "provider attempt ledger must be bound before generation"
+            )
+        request = self.generation.chat_completion_request(messages)
+        response = self._attempt_ledger.record_call(
+            request,
+            lambda: self.client.chat.completions.create(**request),
+        )
+        usage = response.usage
+        return ProposalResponse(
+            text=response.choices[0].message.content or "",
+            input_tokens=getattr(usage, "prompt_tokens", 0) if usage else 0,
+            output_tokens=(
+                getattr(usage, "completion_tokens", 0) if usage else 0
+            ),
+        )
 
     def manifest_fields(self) -> Mapping[str, object]:
         return {
@@ -666,9 +717,12 @@ def _validate_options(
             "training and evaluation profiles must both be scientific or both be engineering"
         )
     if options.engineering_pilot:
-        if training.name != "smoke_train_v1" or evaluation.name != "smoke_eval_v1":
+        if (
+            training.name != "smoke_train_cuda_v2"
+            or evaluation.name != "smoke_eval_v1"
+        ):
             raise ValueError(
-                "engineering pilot requires smoke_train_v1 and smoke_eval_v1"
+                "engineering pilot requires smoke_train_cuda_v2 and smoke_eval_v1"
             )
         if options.pi_decision_record_id is not None:
             raise ValueError("engineering pilot cannot claim a PI decision record")
@@ -681,19 +735,21 @@ def _validate_options(
         raise ValueError(
             "engineering profiles require the explicit --engineering-pilot mode"
         )
-    if options.device not in {"mps", "cpu"}:
-        raise ValueError("device must be 'mps' or explicit engineering-test 'cpu'")
+    if options.device not in {"cuda", "mps", "cpu"}:
+        raise ValueError("device must be 'cuda', 'mps', or engineering-test 'cpu'")
     if (
         options.engineering_pilot
-        and options.device != "mps"
+        and options.device != training.device_requirement
         and not allow_injected_cpu_test
     ):
         raise ValueError(
-            "provider-backed engineering pilots require device='mps'; CPU is "
+            "provider-backed engineering pilots require device='cuda'; CPU is "
             "reserved for explicit injected unit-test evaluators"
         )
-    if training.scientific and options.device != "mps":
-        raise ValueError("scientific training requires device='mps'")
+    if training.scientific and options.device != training.device_requirement:
+        raise ValueError(
+            f"scientific training requires device={training.device_requirement!r}"
+        )
     if options.device == "cpu" and not options.allow_cpu_for_tests:
         raise ValueError("CPU requires allow_cpu_for_tests")
     if training.scientific and options.allow_cpu_for_tests:
@@ -847,6 +903,16 @@ def run_semantic_autoresearch(
     provider.preflight()
 
     output_dir = _prepare_fresh_output(requested_output)
+    if isinstance(provider, OpenAIProposalProvider):
+        provider.bind_attempt_ledger(
+            output_dir,
+            run_id=run_id,
+            action=(
+                "one_opportunity_engineering_canary"
+                if options.engineering_pilot
+                else "scientific_replication"
+            ),
+        )
     artifacts = output_dir / "artifacts"
     artifacts.mkdir()
     _snapshot_prompt_protocol(
@@ -875,7 +941,9 @@ def run_semantic_autoresearch(
         condition_id="native-semantic-autoresearch",
     )
     seen_evaluation_record_ids: set[str] = set()
-    archive = FrozenSemanticArchive()
+    archive = FrozenSemanticArchive(
+        serialization_root=(output_dir if training.version == "2" else None)
+    )
     component_hashes = trusted_component_hashes()
     manifest = {
         "run_id": run_id,
@@ -883,6 +951,7 @@ def run_semantic_autoresearch(
         "seed": options.seed,
         "candidate_budget": options.iterations + 1,
         "mutation_budget": options.iterations,
+        "maximum_provider_attempts": options.iterations,
         "candidate_training_budget": options.iterations + 1,
         "max_ir_bytes": options.max_ir_bytes,
         "candidate_format": "architecture_tensor_graph@1.0",
@@ -959,6 +1028,17 @@ def run_semantic_autoresearch(
             "parameter_count_role": "descriptive_metadata_only",
         },
     }
+    if isinstance(provider, OpenAIProposalProvider):
+        manifest.update(
+            {
+                "provider_attempt_ledger": PROVIDER_ATTEMPT_LEDGER_FILENAME,
+                "provider_attempt_schema": PROVIDER_ATTEMPT_SCHEMA,
+            }
+        )
+    if training.version == "2":
+        manifest.update(
+            {"schema_name": "ControllerRunManifest", "schema_version": "2.0"}
+        )
     _atomic_json(output_dir / "run_manifest.json", manifest)
     _atomic_json(archive_path, archive.to_dict())
 
@@ -1336,10 +1416,20 @@ def run_semantic_autoresearch(
         "proposal_opportunities_requested": options.iterations,
         "proposal_opportunities_terminal": completed,
         "semantic_archive_cells": archive.coverage,
-        "lineage_path": str(ledger),
-        "archive_path": str(archive_path),
+        "lineage_path": (
+            str(ledger) if training.version == "1" else ledger.name
+        ),
+        "archive_path": (
+            str(archive_path)
+            if training.version == "1"
+            else archive_path.name
+        ),
         "scientific_novelty_claim": False,
     }
+    if training.version == "2":
+        summary.update(
+            {"schema_name": "ControllerRunSummary", "schema_version": "2.0"}
+        )
     _atomic_json(output_dir / "run_summary.json", summary)
     return summary
 
@@ -1401,7 +1491,7 @@ def main() -> None:
         "--engineering-pilot",
         action="store_true",
         help=(
-            "run an exploratory IR-only MPS canary; forces smoke_train_v1 and "
+            "run an exploratory IR-only CUDA canary; forces smoke_train_cuda_v2 and "
             "smoke_eval_v1 and never creates authoritative scientific evidence"
         ),
     )
@@ -1414,16 +1504,18 @@ def main() -> None:
         choices=CONTROLLER_EVALUATION_PROFILES,
     )
     parser.add_argument("--evaluation-cases", type=_positive_int)
-    parser.add_argument("--device", choices=("mps", "cpu"))
+    parser.add_argument("--device", choices=("cuda", "mps", "cpu"))
     parser.add_argument("--allow-cpu-for-tests", action="store_true")
     parser.add_argument("--pi-decision-record-id")
     arguments = parser.parse_args()
 
     if arguments.engineering_pilot and arguments.training_profile not in {
         None,
-        "smoke_train_v1",
+        "smoke_train_cuda_v2",
     }:
-        parser.error("--engineering-pilot forces --training-profile smoke_train_v1")
+        parser.error(
+            "--engineering-pilot forces --training-profile smoke_train_cuda_v2"
+        )
     if arguments.engineering_pilot and arguments.evaluation_profile not in {
         None,
         "smoke_eval_v1",
@@ -1433,7 +1525,7 @@ def main() -> None:
         parser.error("--engineering-pilot cannot claim a PI decision record")
 
     training_profile = (
-        "smoke_train_v1"
+        "smoke_train_cuda_v2"
         if arguments.engineering_pilot
         else arguments.training_profile or config["training"]["profile"]
     )

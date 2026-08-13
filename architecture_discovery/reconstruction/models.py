@@ -18,6 +18,7 @@ class ReconstructedRun:
     last_event_sha256: str
     event_record_ids: tuple[str, ...]
     budget_totals: Mapping[str, int | float]
+    accelerator_kind: str | None
     ancestry: Mapping[str, tuple[str, ...]]
     qualifying_mechanism_cluster_keys: tuple[str, ...]
     parent_selection_history: tuple[tuple[str, ...], ...]
@@ -29,14 +30,14 @@ class ReconstructedRun:
     integrity_findings: tuple[IntegrityFinding, ...]
     outcome: RunOutcome | None
     schema_name: str = "ReconstructedRun"
-    schema_version: str = "1.0"
+    schema_version: str = "2.0"
 
     @property
     def reconstruction_sha256(self) -> str:
         return content_sha256(self.to_dict())
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload = {
             "schema_name": self.schema_name,
             "schema_version": self.schema_version,
             "context": self.context.to_dict(),
@@ -65,6 +66,11 @@ class ReconstructedRun:
             "integrity_findings": [item.to_dict() for item in self.integrity_findings],
             "outcome": None if self.outcome is None else self.outcome.to_dict(),
         }
+        if self.schema_version == "2.0":
+            payload["accelerator_kind"] = self.accelerator_kind
+        elif self.schema_version != "1.0":
+            raise ValueError("unsupported ReconstructedRun schema version")
+        return payload
 
     def analysis_ready_rows(self) -> tuple[dict[str, Any], ...]:
         """Return zero or one run-level rows, never candidate-level pseudo-replicates."""

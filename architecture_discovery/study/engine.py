@@ -24,7 +24,7 @@ from study.interfaces import (
     RetryableEvaluationError,
     RetryableProviderError,
 )
-from study.scheduling import MPSLease
+from study.scheduling import AcceleratorLease
 from study.serialization import (
     atomic_write_json,
     content_hash,
@@ -32,6 +32,7 @@ from study.serialization import (
     read_json,
     require_bool,
     require_int,
+    require_str,
 )
 
 
@@ -50,6 +51,8 @@ class CommonStudyEngine:
         generator: ProposalGenerator,
         evaluator: CandidateEvaluator,
         evaluation_lease_path: str | Path | None = None,
+        remote_call_id: str | None = None,
+        artifact_location: str | None = None,
     ) -> None:
         if run.study_id != study.study_id:
             raise ValueError("run and study identifiers differ")
@@ -60,11 +63,21 @@ class CommonStudyEngine:
         self.run = run
         self.generator = generator
         self.evaluator = evaluator
-        self.run_directory = Path(run.run_directory)
+        self.run_directory = run.execution_directory
         self.state_path = self.run_directory / "run_state.json"
         self.evaluation_lease_path = (
             None if evaluation_lease_path is None else Path(evaluation_lease_path)
         )
+        for field_name, value in (
+            ("remote_call_id", remote_call_id),
+            ("artifact_location", artifact_location),
+        ):
+            if value is not None:
+                require_str(value, field_name)
+                if not value:
+                    raise ValueError(f"{field_name} cannot be empty")
+        self.remote_call_id = remote_call_id
+        self.artifact_location = artifact_location
 
     def execute(self) -> RunState:
         self._prepare_directory()
@@ -77,7 +90,8 @@ class CommonStudyEngine:
                 training_attempts=seed_result.training_attempts,
                 training_steps=seed_result.training_steps,
                 training_examples=seed_result.training_examples,
-                mps_seconds=seed_result.mps_seconds,
+                accelerator_kind=seed_result.accelerator_kind,
+                accelerator_seconds=seed_result.accelerator_seconds,
                 evaluation_cases=seed_result.evaluation_cases,
             )
             for _ in range(seed_result.infrastructure_retries):
@@ -113,6 +127,10 @@ class CommonStudyEngine:
     def _load_or_initialize(self) -> tuple[RunState, BudgetLedger]:
         if self.state_path.exists():
             state = RunState.from_dict(read_json(self.state_path))
+            if self.remote_call_id is None:
+                self.remote_call_id = state.remote_call_id
+            if self.artifact_location is None:
+                self.artifact_location = state.artifact_location
             ledger = BudgetLedger.from_dict(state.ledger)
             self._validate_state(state, ledger)
             return state, ledger
@@ -132,6 +150,8 @@ class CommonStudyEngine:
             active_opportunity=None,
             terminal_opportunities=[],
             ledger=ledger.to_dict(),
+            remote_call_id=self.remote_call_id,
+            artifact_location=self.artifact_location,
         )
         self._persist(state, ledger)
         return state, ledger
@@ -143,6 +163,8 @@ class CommonStudyEngine:
             self.run.run_id,
             self.run.condition.condition_id.value,
             self.run.assignment_hash,
+            self.remote_call_id,
+            self.artifact_location,
         )
         actual = (
             state.study_id,
@@ -150,6 +172,8 @@ class CommonStudyEngine:
             state.run_id,
             state.condition_id,
             state.assignment_hash,
+            state.remote_call_id,
+            state.artifact_location,
         )
         if actual != expected:
             raise RunStateError("stored state belongs to a different frozen assignment")
@@ -247,7 +271,13 @@ class CommonStudyEngine:
     def _evaluation_lease(self) -> ContextManager[Any]:
         if self.evaluation_lease_path is None:
             return nullcontext()
-        return MPSLease(self.evaluation_lease_path, run_id=self.run.run_id)
+        return AcceleratorLease(
+            self.evaluation_lease_path,
+            run_id=self.run.run_id,
+            accelerator_kind=self.study.budget.accelerator_kind,
+            remote_call_id=self.remote_call_id,
+            artifact_location=self.artifact_location,
+        )
 
     def _evaluate_seed(self) -> EvaluationResult:
         with self._evaluation_lease():
@@ -416,7 +446,8 @@ class CommonStudyEngine:
                     attempts=evaluation.training_attempts,
                     steps=evaluation.training_steps,
                     examples=evaluation.training_examples,
-                    mps_seconds=evaluation.mps_seconds,
+                    accelerator_kind=evaluation.accelerator_kind,
+                    accelerator_seconds=evaluation.accelerator_seconds,
                 )
                 ledger.record_evaluation(evaluation.evaluation_cases)
                 for _ in range(evaluation.infrastructure_retries):

@@ -7,7 +7,6 @@ import json
 from dataclasses import asdict, dataclass
 from typing import Any
 
-
 SEED_DERIVATION_METHOD = "sha256-v1"
 CHECKPOINT_SELECTION_RULE = (
     "higher_development_exact_match_then_lower_development_loss_then_earlier_step"
@@ -48,7 +47,7 @@ class TrainingProfile:
     dtype: str
     deterministic_algorithms: bool
     device_requirement: str
-    mps_memory_fraction: float | None
+    accelerator_memory_fraction: float | None
     scientific: bool
     optimizer: str = "AdamW"
     num_workers: int = 0
@@ -60,10 +59,35 @@ class TrainingProfile:
     automatic_batch_size_reduction: bool = False
     cpu_fallback: bool = False
     checkpoint_selection_rule: str = CHECKPOINT_SELECTION_RULE
+    cudnn_deterministic: bool = True
+    cudnn_benchmark: bool = False
+    allow_tf32: bool = False
+    cublas_workspace_config: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return the versioned profile payload used for identity hashing.
+
+        Version-1 MPS profiles retain their exact historical key set. Adding
+        CUDA fields to this dataclass must not silently change their hashes.
+        """
+
+        payload = asdict(self)
+        if self.version == "1":
+            payload["mps_memory_fraction"] = payload.pop(
+                "accelerator_memory_fraction"
+            )
+            for field_name in (
+                "cudnn_deterministic",
+                "cudnn_benchmark",
+                "allow_tf32",
+                "cublas_workspace_config",
+            ):
+                payload.pop(field_name)
+        return payload
 
     @property
     def profile_hash(self) -> str:
-        return stable_hash(asdict(self))
+        return stable_hash(self.to_dict())
 
     def validate(self) -> None:
         if self.optimizer != "AdamW":
@@ -80,6 +104,27 @@ class TrainingProfile:
             raise ValueError("Phase-1 profiles require uncompiled float32 training")
         if self.automatic_batch_size_reduction or self.cpu_fallback:
             raise ValueError("automatic batch reduction and CPU fallback are forbidden")
+        if self.device_requirement not in {"mps", "cuda"}:
+            raise ValueError("training profiles require either MPS or CUDA")
+        if self.accelerator_memory_fraction is not None and not (
+            0.0 < self.accelerator_memory_fraction <= 1.0
+        ):
+            raise ValueError(
+                "accelerator_memory_fraction must be in the interval (0, 1]"
+            )
+        if self.device_requirement == "cuda":
+            if not self.deterministic_algorithms:
+                raise ValueError("CUDA profiles require deterministic algorithms")
+            if not self.cudnn_deterministic or self.cudnn_benchmark:
+                raise ValueError(
+                    "CUDA profiles require deterministic cuDNN with benchmarking off"
+                )
+            if self.allow_tf32:
+                raise ValueError("the frozen float32 CUDA profile forbids TF32")
+            if self.cublas_workspace_config not in {":4096:8", ":16:8"}:
+                raise ValueError(
+                    "deterministic CUDA requires a supported CUBLAS workspace config"
+                )
 
 
 @dataclass(frozen=True)
@@ -90,7 +135,7 @@ class TrainingSeedBundle:
     dataloader_seed: int
 
     @classmethod
-    def from_run_seed(cls, run_seed: int) -> "TrainingSeedBundle":
+    def from_run_seed(cls, run_seed: int) -> TrainingSeedBundle:
         return cls(
             model_initialization_seed=derive_seed(run_seed, "model_initialization"),
             training_data_seed=derive_seed(run_seed, "training_data"),
@@ -125,10 +170,12 @@ class TrainingResult:
     best_development_loss: float
     final_training_loss: float
     train_seconds: float
-    peak_mps_allocated_bytes: int | None
-    current_mps_allocated_bytes: int | None
-    driver_mps_allocated_bytes: int | None
-    recommended_mps_memory_bytes: int | None
+    accelerator_kind: str
+    peak_accelerator_allocated_bytes: int | None
+    current_accelerator_allocated_bytes: int | None
+    reserved_accelerator_allocated_bytes: int | None
+    accelerator_total_memory_bytes: int | None
+    accelerator_fingerprint: dict[str, Any]
     parameter_count_metadata: int
     checkpoint_path: str
     checkpoint_sha256: str
@@ -137,9 +184,55 @@ class TrainingResult:
     scientific: bool
     hardware_matched: bool
     cleanup_completed: bool
+    schema_name: str = "TrainingResult"
+    schema_version: str = "2.0"
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        payload = asdict(self)
+        if self.schema_version == "1.0":
+            payload.pop("schema_name")
+            payload.pop("schema_version")
+            payload.pop("accelerator_kind")
+            payload.pop("accelerator_fingerprint")
+            payload["peak_mps_allocated_bytes"] = payload.pop(
+                "peak_accelerator_allocated_bytes"
+            )
+            payload["current_mps_allocated_bytes"] = payload.pop(
+                "current_accelerator_allocated_bytes"
+            )
+            payload["driver_mps_allocated_bytes"] = payload.pop(
+                "reserved_accelerator_allocated_bytes"
+            )
+            payload["recommended_mps_memory_bytes"] = payload.pop(
+                "accelerator_total_memory_bytes"
+            )
+        return payload
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> TrainingResult:
+        values = dict(payload)
+        if "peak_mps_allocated_bytes" in values:
+            values["peak_accelerator_allocated_bytes"] = values.pop(
+                "peak_mps_allocated_bytes"
+            )
+            values["current_accelerator_allocated_bytes"] = values.pop(
+                "current_mps_allocated_bytes"
+            )
+            values["reserved_accelerator_allocated_bytes"] = values.pop(
+                "driver_mps_allocated_bytes"
+            )
+            values["accelerator_total_memory_bytes"] = values.pop(
+                "recommended_mps_memory_bytes"
+            )
+            values["accelerator_kind"] = str(values.get("device", "mps"))
+            values["accelerator_fingerprint"] = {}
+            values["schema_name"] = "TrainingResult"
+            values["schema_version"] = "1.0"
+        if values.get("schema_name", "TrainingResult") != "TrainingResult":
+            raise ValueError("training result has an unsupported schema name")
+        if values.get("schema_version", "2.0") not in {"1.0", "2.0"}:
+            raise ValueError("training result has an unsupported schema version")
+        return cls(**values)
 
 
 FULL_TRAIN_V1 = TrainingProfile(
@@ -162,7 +255,7 @@ FULL_TRAIN_V1 = TrainingProfile(
     dtype="float32",
     deterministic_algorithms=True,
     device_requirement="mps",
-    mps_memory_fraction=None,
+    accelerator_memory_fraction=None,
     scientific=True,
 )
 
@@ -186,13 +279,67 @@ SMOKE_TRAIN_V1 = TrainingProfile(
     dtype="float32",
     deterministic_algorithms=True,
     device_requirement="mps",
-    mps_memory_fraction=None,
+    accelerator_memory_fraction=None,
     scientific=False,
+)
+
+FULL_TRAIN_CUDA_V2 = TrainingProfile(
+    name="full_train_cuda_v2",
+    version="2",
+    max_steps=30_000,
+    global_batch_size=512,
+    microbatch_size=None,
+    gradient_accumulation_steps=1,
+    peak_learning_rate=0.001,
+    adamw_betas=(0.9, 0.98),
+    weight_decay=0.1,
+    warmup_steps=300,
+    scheduler="cosine_decay_to_zero",
+    gradient_clip_norm=1.0,
+    validation_interval=1_000,
+    validation_examples=2_000,
+    checkpoint_interval=1_000,
+    maximum_wall_seconds=1_800,
+    dtype="float32",
+    deterministic_algorithms=True,
+    device_requirement="cuda",
+    accelerator_memory_fraction=None,
+    scientific=True,
+    cublas_workspace_config=":4096:8",
+)
+
+SMOKE_TRAIN_CUDA_V2 = TrainingProfile(
+    name="smoke_train_cuda_v2",
+    version="2",
+    max_steps=10,
+    global_batch_size=16,
+    microbatch_size=None,
+    gradient_accumulation_steps=1,
+    peak_learning_rate=0.001,
+    adamw_betas=(0.9, 0.98),
+    weight_decay=0.1,
+    warmup_steps=2,
+    scheduler="cosine_decay_to_zero",
+    gradient_clip_norm=1.0,
+    validation_interval=10,
+    validation_examples=24,
+    # The bounded Modal resume smoke retains the first nonterminal checkpoint
+    # and must prove that a resumed optimizer advances beyond it.
+    checkpoint_interval=5,
+    maximum_wall_seconds=60,
+    dtype="float32",
+    deterministic_algorithms=True,
+    device_requirement="cuda",
+    accelerator_memory_fraction=None,
+    scientific=False,
+    cublas_workspace_config=":4096:8",
 )
 
 PROFILES = {
     FULL_TRAIN_V1.name: FULL_TRAIN_V1,
     SMOKE_TRAIN_V1.name: SMOKE_TRAIN_V1,
+    FULL_TRAIN_CUDA_V2.name: FULL_TRAIN_CUDA_V2,
+    SMOKE_TRAIN_CUDA_V2.name: SMOKE_TRAIN_CUDA_V2,
 }
 
 

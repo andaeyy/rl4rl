@@ -21,7 +21,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from common.evaluation_profiles import EVALUATION_PROFILES
-from common.training_config import FULL_TRAIN_V1
+from common.training_config import FULL_TRAIN_CUDA_V2, FULL_TRAIN_V1
 from containment.audit import audit_runtime
 from evaluation.dependency_audit import assert_controller_dependencies_clean
 from mechanism.plans import load_frozen_mechanism_plan
@@ -33,6 +33,19 @@ from research_ledger.protocol import load_frozen_protocol
 from study.contracts import ConditionSpec, StudySpec
 from study.randomization import RandomizationPlan
 from study.serialization import read_json
+from scripts.record_accelerator_validation import (
+    validate_accelerator_validation_evidence,
+)
+from scripts.record_local_engineering_evidence import (
+    LOCAL_ENGINEERING_RECEIPT_CONTRACTS,
+    current_local_engineering_receipt_path,
+    validate_local_engineering_freeze_receipt,
+    validate_local_engineering_receipt,
+)
+from scripts.record_modal_readiness import (
+    MODAL_READINESS_RECEIPT_CONTRACTS,
+    validate_modal_readiness_gate_record,
+)
 
 
 @dataclass(frozen=True)
@@ -119,7 +132,7 @@ def _valid_utc_timestamp(value: object) -> bool:
 def _decision_issues(decisions: Any) -> list[str]:
     if not isinstance(decisions, dict):
         return ["decision ledger must be a mapping"]
-    expected_root = {
+    common_root = {
         "schema_name",
         "schema_version",
         "status",
@@ -129,14 +142,41 @@ def _decision_issues(decisions: Any) -> list[str]:
         *_DECISION_SECTIONS,
     }
     issues: list[str] = []
+    version = decisions.get("schema_version")
+    expected_root = (
+        common_root | {"schema_migration"}
+        if version == "2"
+        else common_root
+    )
     if set(decisions) != expected_root:
         issues.append(
-            "decision ledger root fields differ from the frozen v1 schema"
+            f"decision ledger root fields differ from the frozen v{version} schema"
         )
     if decisions.get("schema_name") != "scientific_decision_ledger":
         issues.append("decision ledger schema_name is invalid")
-    if decisions.get("schema_version") != "1":
+    if version not in {"1", "2"}:
         issues.append("decision ledger schema_version is invalid")
+    if version == "2":
+        migration = decisions.get("schema_migration")
+        expected_migration = {
+            "from_version": "1",
+            "active_replacements": {
+                "containment.mps_resource_limits": (
+                    "containment.accelerator_resource_limits"
+                ),
+                "containment.mps_evidence_custody_rule": (
+                    "containment.accelerator_evidence_custody_rule"
+                ),
+            },
+            "compatibility": (
+                "historical version-1 ledgers remain readable and hash-stable"
+            ),
+            "equivalence_claim": (
+                "Modal CUDA is a new execution condition, not an MPS-equivalent condition"
+            ),
+        }
+        if migration != expected_migration:
+            issues.append("schema_migration does not match the frozen v1-to-v2 migration")
     if decisions.get("status") != "approved":
         issues.append("decision ledger status must be 'approved'")
     for section in _DECISION_SECTIONS:
@@ -290,6 +330,7 @@ def audit_readiness(
     replication_policy: Path | None = None,
     research_protocol: Path | None = None,
     mps_evidence: Path | None = None,
+    accelerator_evidence: Path | None = None,
     study_spec: Path | None = None,
 ) -> dict[str, Any]:
     results: list[GateResult] = []
@@ -415,15 +456,21 @@ def audit_readiness(
         (root / "readiness_evidence.yaml").read_text(encoding="utf-8")
     )
     manifest_hash = _sha256_canonical(manifest)
+    active_accelerator_manifest = bool(
+        isinstance(manifest, dict) and manifest.get("schema_version") == "3"
+    )
+    active_training_profile = (
+        FULL_TRAIN_CUDA_V2 if active_accelerator_manifest else FULL_TRAIN_V1
+    )
 
     def manifest_security_invariants() -> str:
         if not isinstance(manifest, dict):
             raise ValueError("experiment manifest must be a mapping")
         if manifest.get("schema_name") != "architecture_discovery_experiment_manifest":
             raise ValueError("experiment manifest schema_name is invalid")
-        if manifest.get("schema_version") != "2":
+        if manifest.get("schema_version") not in {"2", "3"}:
             raise ValueError("experiment manifest schema_version is invalid")
-        expected_values = {
+        expected_values: dict[str, Any] = {
             "study.parameter_count_role": "descriptive_metadata_only",
             "evaluation.parameter_count_in_fitness": False,
             "evaluation.internet_access_during_runs": False,
@@ -433,17 +480,167 @@ def audit_readiness(
             "evaluation.layer_c.controller_visible": False,
             "evaluation.layer_c.sealed": True,
             "evaluation.layer_c.one_shot_release": True,
-            "training.profile": FULL_TRAIN_V1.name,
-            "training.profile_version": FULL_TRAIN_V1.version,
-            "training.profile_hash": FULL_TRAIN_V1.profile_hash,
+            "training.profile": active_training_profile.name,
+            "training.profile_version": active_training_profile.version,
+            "training.profile_hash": active_training_profile.profile_hash,
             "training.scientific": True,
-            "training.device": "mps",
+            "training.device": active_training_profile.device_requirement,
             "training.cpu_fallback": False,
             "training.parallel_candidate_training": False,
             "engineering_smoke.scientific": False,
             "secondary_controls.no_search.adaptive_feedback": False,
             "shared_generation.target_model": "gpt-5.6-sol",
         }
+        if active_accelerator_manifest:
+            expected_values.update(
+                {
+                    "machine.execution_backend": "modal",
+                    "machine.preferred_device": "cuda",
+                    "machine.scientific_fallback_device": "none",
+                    "runtime.python": "3.12",
+                    "runtime.setup_selected_device": "cuda",
+                    "runtime.pytorch_enable_mps_fallback": False,
+                    "runtime.cublas_workspace_config": ":4096:8",
+                    "training.deterministic_algorithms": True,
+                    "training.cudnn_deterministic": True,
+                    "training.cudnn_benchmark": False,
+                    "training.allow_tf32": False,
+                    "training.cublas_workspace_config": ":4096:8",
+                    "remote_execution.provider": "modal",
+                    "remote_execution.profile": "scalingintelligence",
+                    "remote_execution.app_name": "rl4rl-architecture-discovery",
+                    "remote_execution.app_module": "modal_app.py",
+                    "remote_execution.mode": "ephemeral_modal_run",
+                    "remote_execution.deployed_app": False,
+                    "remote_execution.detached_calls": False,
+                    "remote_execution.python": "3.12",
+                    "remote_execution.initial_gpu": "T4",
+                    "remote_execution.function_cpu_request_cores": 2.0,
+                    "remote_execution.function_cpu_soft_limit_cores": 2.0,
+                    "remote_execution.function_cpu_limit_kind": (
+                        "soft_throttle_threshold"
+                    ),
+                    "remote_execution.function_memory_request_mib": 8192,
+                    "remote_execution.function_memory_limit_mib": 8192,
+                    "remote_execution.function_memory_limit_kind": "hard",
+                    "remote_execution.function_platform_compute_cost_ceiling_enforced": (
+                        False
+                    ),
+                    "remote_execution.runtime_functions_preemptible": True,
+                    "remote_execution.platform_preemption_restart_possible": True,
+                    "remote_execution.logical_call_count_is_not_container_attempt_ceiling": (
+                        True
+                    ),
+                    "remote_execution.function_region": None,
+                    "remote_execution.image_build_cpu_request_cores": 2.0,
+                    "remote_execution.image_build_cpu_soft_limit_cores": None,
+                    "remote_execution.image_build_memory_request_mib": 8192,
+                    "remote_execution.image_build_memory_limit_mib": None,
+                    "remote_execution.image_build_region": None,
+                    "remote_execution.image_build_subprocess_thread_limit": 2,
+                    "remote_execution.image_build_resource_limits_exposed": (
+                        False
+                    ),
+                    "remote_execution.image_build_platform_compute_cost_ceiling_enforced": (
+                        False
+                    ),
+                    "remote_execution.modal_price_basis_schema": (
+                        "ModalPriceBasis/1.0"
+                    ),
+                    "remote_execution.modal_price_basis_max_age_hours": 48,
+                    "remote_execution.modal_cost_gate_scope": (
+                        "local_pre_popen_request_rate_and_one_gib_month_storage_"
+                        "estimate_not_platform_billing_cap"
+                    ),
+                    "remote_execution.provider_canary_aggregate_outcome_schema": (
+                        "ProviderCanaryAggregateOutcomeReceipt/1.1"
+                    ),
+                    "remote_execution.modal_local_host_anchor_schema": (
+                        "ModalLocalHostAnchor/1.0"
+                    ),
+                    "remote_execution.modal_remote_run_reservation_schema": (
+                        "ModalRemoteRunReservation/1.2"
+                    ),
+                    "remote_execution.modal_action_intent_schema": (
+                        "ModalActionIntent/1.6"
+                    ),
+                    "remote_execution.modal_local_process_start_schema": (
+                        "ModalLocalProcessStart/1.1"
+                    ),
+                    "remote_execution.modal_action_attempt_receipt_schema": (
+                        "ModalActionAttemptReceipt/3.6"
+                    ),
+                    "remote_execution.modal_action_recovery_request_schema": (
+                        "ModalActionRecoveryRequest/1.0"
+                    ),
+                    "remote_execution.modal_action_recovery_intent_schema": (
+                        "ModalActionRecoveryIntent/1.0"
+                    ),
+                    "remote_execution.modal_action_recovery_host_containment_schema": (
+                        "ModalActionRecoveryHostContainment/1.0"
+                    ),
+                    "remote_execution.modal_action_recovery_resolution_schema": (
+                        "ModalActionRecoveryResolution/1.0"
+                    ),
+                    "remote_execution.modal_prior_cohort_quarantine_accounting_schema": (
+                        "ModalPriorCohortQuarantineAccounting/1.1"
+                    ),
+                    "remote_execution.modal_action_lock_path": (
+                        "outputs/readiness/.modal_action.lock"
+                    ),
+                    "remote_execution.modal_action_lock_scope": (
+                        "launcher_recovery_snapshot_capture_prior_accounting_lineage_"
+                        "roster_resource_cleanup_migration_bundle_and_global_"
+                        "journal_scan"
+                    ),
+                    "remote_execution.modal_global_action_journal_scanner_implemented": (
+                        True
+                    ),
+                    "remote_execution.modal_global_action_journal_prelaunch_gate_wired": (
+                        True
+                    ),
+                    "remote_execution.modal_action_orphan_recovery_status": (
+                        "operational_exact_v1_cli_scanner_validated"
+                    ),
+                    "remote_execution.max_containers": 1,
+                    "remote_execution.min_containers": 0,
+                    "remote_execution.retries": 0,
+                    "remote_execution.function_timeout_seconds": 300,
+                    "remote_execution.parallel_candidate_training": False,
+                    "remote_execution.provider_canaries_sequential": True,
+                    "remote_execution.artifact_volume": (
+                        "rl4rl-architecture-artifacts"
+                    ),
+                    "remote_execution.artifact_mount": "/mnt/discovery",
+                    "artifacts_and_reconstruction.active_budget_schema": (
+                        "BudgetLedger/2.0"
+                    ),
+                    "artifacts_and_reconstruction.active_training_result_schema": (
+                        "TrainingResult/2.0"
+                    ),
+                    "artifacts_and_reconstruction.active_compute_field": (
+                        "accelerator_seconds"
+                    ),
+                    "artifacts_and_reconstruction.active_compute_kind_field": (
+                        "accelerator_kind"
+                    ),
+                    "historical_mps_compatibility.status": (
+                        "retained_read_only_compatible"
+                    ),
+                    "historical_mps_compatibility.cross_device_equivalence_claim": (
+                        "none"
+                    ),
+                    "historical_mps_compatibility.full_profile.name": (
+                        FULL_TRAIN_V1.name
+                    ),
+                    "historical_mps_compatibility.full_profile.version": (
+                        FULL_TRAIN_V1.version
+                    ),
+                    "historical_mps_compatibility.full_profile.hash": (
+                        FULL_TRAIN_V1.profile_hash
+                    ),
+                }
+            )
 
         def lookup(path: str) -> Any:
             value: Any = manifest
@@ -457,6 +654,15 @@ def audit_readiness(
         for path, expected in expected_values.items():
             observed = lookup(path)
             if type(expected) is bool and type(observed) is not bool:
+                mismatches[path] = {"expected": expected, "observed": observed}
+            elif (
+                isinstance(expected, int)
+                and not isinstance(expected, bool)
+                and (
+                    not isinstance(observed, int)
+                    or isinstance(observed, bool)
+                )
+            ):
                 mismatches[path] = {"expected": expected, "observed": observed}
             elif observed != expected:
                 mismatches[path] = {"expected": expected, "observed": observed}
@@ -482,6 +688,54 @@ def audit_readiness(
         return f"experiment_manifest.yaml sha256={manifest_hash}"
 
     results.append(_gate("manifest_security_invariants", manifest_security_invariants))
+
+    if active_accelerator_manifest:
+        def modal_cuda_configuration() -> str:
+            remote = manifest.get("remote_execution")
+            if not isinstance(remote, dict):
+                raise ValueError("active manifest lacks remote_execution")
+            if remote.get("provider") != "modal":
+                raise ValueError("active remote execution provider is not Modal")
+            if manifest.get("training", {}).get("device") != "cuda":
+                raise ValueError("active scientific training device is not CUDA")
+            if (
+                remote.get("max_containers"),
+                remote.get("min_containers"),
+                remote.get("retries"),
+                remote.get("function_timeout_seconds"),
+            ) != (1, 0, 0, 300):
+                raise ValueError("Modal execution bounds differ from the frozen limits")
+            if remote.get("parallel_candidate_training") is not False:
+                raise ValueError("Modal candidate training is not sequential")
+            for relative in (
+                "modal_app.py",
+                "modal_boundary.py",
+                "common/runtime_context.py",
+                "scripts/record_accelerator_validation.py",
+            ):
+                if not (root / relative).is_file():
+                    raise FileNotFoundError(root / relative)
+            return (
+                "Modal/CUDA execution is configured for one T4, one container, "
+                "zero retries, and a 300-second timeout"
+            )
+
+        results.append(
+            _gate("modal_cuda_execution_configured", modal_cuda_configuration)
+        )
+        for modal_gate_name in MODAL_READINESS_RECEIPT_CONTRACTS:
+            results.append(
+                _gate(
+                    modal_gate_name,
+                    lambda gate_name=modal_gate_name: (
+                        validate_modal_readiness_gate_record(
+                            evidence_ledger,
+                            gate_name,
+                            root=root,
+                        )
+                    ),
+                )
+            )
 
     def launch_authorization(*, phase: str) -> str:
         launch = decisions.get("launch_authorization", {})
@@ -541,6 +795,7 @@ def audit_readiness(
     def frozen_executable_contract() -> str:
         spec = load_executable_spec()
         comparisons = {
+            "accelerator_kind": ("cuda", spec.budget.accelerator_kind),
             "portfolio_size_k": (
                 decisions["treatment"]["portfolio_size_k"],
                 spec.portfolio_size,
@@ -643,21 +898,22 @@ def audit_readiness(
             else ("required OS boundary controls are not proven",),
         )
     )
-    mps_ready = bool(
-        hasattr(torch.backends, "mps")
-        and torch.backends.mps.is_built()
-        and torch.backends.mps.is_available()
-    )
-    results.append(
-        GateResult(
-            "mps_available_no_fallback",
-            mps_ready and not containment.mps_fallback_requested,
-            f"built={containment.mps_built}, available={containment.mps_available}",
-            ()
-            if mps_ready and not containment.mps_fallback_requested
-            else ("MPS is unavailable or fallback is requested",),
+    if not active_accelerator_manifest:
+        mps_ready = bool(
+            hasattr(torch.backends, "mps")
+            and torch.backends.mps.is_built()
+            and torch.backends.mps.is_available()
         )
-    )
+        results.append(
+            GateResult(
+                "mps_available_no_fallback",
+                mps_ready and not containment.mps_fallback_requested,
+                f"built={containment.mps_built}, available={containment.mps_available}",
+                ()
+                if mps_ready and not containment.mps_fallback_requested
+                else ("MPS is unavailable or fallback is requested",),
+            )
+        )
     results.append(
         GateResult(
             "trusted_ir_interpreter",
@@ -955,7 +1211,82 @@ def audit_readiness(
                 )
         return f"{evidence_path} summary={payload['training_summary_hash']}"
 
-    results.append(_gate("full_profile_mps_validation", mps_validation))
+    historical_mps_gate_name: str | None = None
+    if not active_accelerator_manifest or mps_evidence is not None:
+        historical_mps_gate_name = "full_profile_mps_validation"
+        results.append(_gate(historical_mps_gate_name, mps_validation))
+    else:
+        historical_mps_gate_name = "historical_mps_evidence_compatibility"
+        recorder = root / "scripts" / "record_mps_validation.py"
+        results.append(
+            GateResult(
+                historical_mps_gate_name,
+                recorder.is_file(),
+                str(recorder),
+                ()
+                if recorder.is_file()
+                else ("historical MPS evidence reader/recorder is missing",),
+            )
+        )
+
+    accelerator_evidence_gate_name: str | None = None
+    if active_accelerator_manifest:
+        accelerator_evidence_gate_name = "full_profile_accelerator_validation"
+        active_evidence_path = (
+            accelerator_evidence
+            or root
+            / "outputs"
+            / "readiness"
+            / "full_train_cuda_v2_accelerator_evidence.json"
+        )
+
+        def accelerator_validation() -> str:
+            payload = validate_accelerator_validation_evidence(
+                active_evidence_path
+            )
+            expected = {
+                "training_profile_name": FULL_TRAIN_CUDA_V2.name,
+                "training_profile_version": FULL_TRAIN_CUDA_V2.version,
+                "training_profile_hash": FULL_TRAIN_CUDA_V2.profile_hash,
+                "execution_backend": "modal",
+                "requested_gpu_kind": "cuda",
+                "observed_gpu_kind": "cuda",
+                "success": True,
+                "scientific": True,
+                "hardware_matched": True,
+                "unsupported_operation_fallback": False,
+                "cleanup_completed": True,
+                "steps_completed": FULL_TRAIN_CUDA_V2.max_steps,
+            }
+            mismatches = {
+                field: {"expected": value, "observed": payload.get(field)}
+                for field, value in expected.items()
+                if payload.get(field) != value
+                or (type(value) is bool and type(payload.get(field)) is not bool)
+            }
+            if mismatches:
+                raise ValueError(
+                    f"accelerator validation evidence mismatch: {mismatches}"
+                )
+            manifest_image_hash = manifest.get("remote_execution", {}).get(
+                "image_source_sha256"
+            )
+            if (
+                manifest_image_hash is not None
+                and manifest_image_hash != payload["image_source_hash"]
+            ):
+                raise ValueError(
+                    "accelerator evidence image source differs from the manifest"
+                )
+            return (
+                f"{active_evidence_path} summary="
+                f"{payload['training_summary_hash']} gpu="
+                f"{payload['observed_gpu_name']}"
+            )
+
+        results.append(
+            _gate(accelerator_evidence_gate_name, accelerator_validation)
+        )
     results.append(
         GateResult(
             "artifact_reconstruction_implementation",
@@ -1144,7 +1475,7 @@ def audit_readiness(
             "decision_ledger_sha256": decisions_hash,
             "manifest_sha256": manifest_hash,
             "provider_model": "gpt-5.6-sol",
-            "training_profile_hash": FULL_TRAIN_V1.profile_hash,
+            "training_profile_hash": active_training_profile.profile_hash,
         }
         link_mismatches = {
             field: {"expected": expected, "observed": payload.get(field)}
@@ -1192,8 +1523,17 @@ def audit_readiness(
         if not isinstance(levels, dict):
             raise ValueError("readiness evidence lacks level records")
         record = levels.get(level_name)
-        if not isinstance(record, dict) or set(record) != {"passed", "evidence"}:
-            raise ValueError(f"readiness level {level_name} has an invalid schema")
+        active_local_contract = (
+            evidence_ledger.get("schema_version") in {"3", "4"}
+            and level_name in LOCAL_ENGINEERING_RECEIPT_CONTRACTS
+        )
+        expected_fields = {"passed", "evidence"}
+        if active_local_contract:
+            expected_fields |= {"receipt_path", "receipt_contract"}
+        if not isinstance(record, dict) or set(record) != expected_fields:
+            raise ValueError(
+                f"readiness level {level_name} has an invalid exact schema"
+            )
         if type(record["passed"]) is not bool or record["passed"] is not True:
             raise ValueError(f"readiness level {level_name} is not passed")
         if not isinstance(record["evidence"], str) or not record["evidence"].strip():
@@ -1205,9 +1545,43 @@ def audit_readiness(
             raise ValueError("engineering evidence authority is invalid")
         if provenance.get("source_revision_bound") is not True:
             raise ValueError("engineering evidence is not bound to a source revision")
+        if active_local_contract:
+            contract = LOCAL_ENGINEERING_RECEIPT_CONTRACTS[level_name]
+            if record["receipt_contract"] != contract["receipt_contract"]:
+                raise ValueError(
+                    f"readiness level {level_name} receipt contract drifted"
+                )
+            expected_receipt = current_local_engineering_receipt_path(
+                level_name,
+                root=root,
+            ).as_posix()
+            if record["receipt_path"] != expected_receipt:
+                if record["receipt_path"] is None:
+                    raise FileNotFoundError(
+                        f"readiness level {level_name} receipt path is pending"
+                    )
+                raise ValueError(
+                    f"readiness level {level_name} receipt path drifted"
+                )
+            receipt_path = root / expected_receipt
+            return validate_local_engineering_receipt(
+                level_name,
+                receipt_path,
+                root=root,
+            )
+        # Preserve historical schema-v1/v2 semantics for old readiness ledgers.
         if provenance.get("externally_attested") is not True:
             raise ValueError("engineering evidence is not externally attested")
         return record["evidence"]
+
+    results.append(
+        _gate(
+            "local_engineering_freeze_validated",
+            lambda: (
+                f"{validate_local_engineering_freeze_receipt(root=root)}"
+            ),
+        )
+    )
 
     results.append(
         _gate(
@@ -1222,45 +1596,105 @@ def audit_readiness(
         )
     )
 
+    if active_accelerator_manifest:
+        def external_scientific_attestation() -> str:
+            provenance = evidence_ledger.get("engineering_evidence_provenance")
+            if not isinstance(provenance, dict) or set(provenance) != {
+                "authority",
+                "source_revision_bound",
+                "externally_attested",
+                "scientific_launch_authority",
+            }:
+                raise ValueError("external evidence provenance schema is invalid")
+            if type(provenance["externally_attested"]) is not bool:
+                raise ValueError("externally_attested must be boolean")
+            if provenance["externally_attested"] is not True:
+                raise ValueError("scientific evidence lacks external attestation")
+            if type(provenance["scientific_launch_authority"]) is not bool:
+                raise ValueError("scientific_launch_authority must be boolean")
+            if provenance["scientific_launch_authority"] is not True:
+                raise ValueError("external attestation has no launch authority")
+            return "external scientific evidence attestation and authority recorded"
+
+        results.append(
+            _gate(
+                "external_scientific_evidence_attestation",
+                external_scientific_attestation,
+            )
+        )
+
     by_name = {result.gate: result for result in results}
     main_only_gates = {
         "frozen_analysis_and_power_plan",
         "scientific_pilot_completed",
         "main_launch_authorization",
     }
+    compatibility_only_gates = (
+        {historical_mps_gate_name}
+        if active_accelerator_manifest and historical_mps_gate_name is not None
+        else set()
+    )
     pilot_ready = all(
         result.passed
         for result in results
-        if result.gate not in main_only_gates
+        if result.gate not in main_only_gates | compatibility_only_gates
     )
-    main_ready = all(result.passed for result in results)
+    main_ready = all(
+        result.passed
+        for result in results
+        if result.gate not in compatibility_only_gates
+    )
     passed_count = sum(result.passed for result in results)
+    readiness_levels = {
+        "infrastructure_implemented": all(
+            by_name[name].passed
+            for name in (
+                "common_c0_c3_engine",
+                "evaluation_and_novelty_firewall",
+                "artifact_reconstruction_implementation",
+                "artifact_ledger_integrated",
+                "reproducibility_reporting_implementation",
+                *(
+                    ("modal_cuda_execution_configured",)
+                    if active_accelerator_manifest
+                    else ()
+                ),
+            )
+        ),
+        "unit_tested": by_name["recorded_unit_test_evidence"].passed,
+        "offline_smoke_tested": by_name[
+            "recorded_offline_smoke_evidence"
+        ].passed,
+        "accelerator_validated": (
+            by_name[accelerator_evidence_gate_name].passed
+            if accelerator_evidence_gate_name is not None
+            else False
+        ),
+        "pilot_ready": pilot_ready,
+        "pilot_validated": by_name["scientific_pilot_completed"].passed,
+        "main_study_ready": main_ready,
+    }
+    if active_accelerator_manifest:
+        readiness_levels["modal_infrastructure_validated"] = all(
+            by_name[gate_name].passed
+            for gate_name in MODAL_READINESS_RECEIPT_CONTRACTS
+        )
+    else:
+        # Preserve the version-1/version-2 report reader exactly.  Schema v3
+        # intentionally drops this stale active-readiness label and retains MPS
+        # only as historical compatibility evidence.
+        readiness_levels["mps_validated"] = (
+            by_name["full_profile_mps_validation"].passed
+            if "full_profile_mps_validation" in by_name
+            else False
+        )
     payload = {
         "schema_name": "ScientificReadinessAudit",
         "schema_version": "1.0",
         "ready": main_ready,
         "pilot_ready": pilot_ready,
         "main_study_ready": main_ready,
-        "readiness_levels": {
-            "infrastructure_implemented": all(
-                by_name[name].passed
-                for name in (
-                    "common_c0_c3_engine",
-                    "evaluation_and_novelty_firewall",
-                    "artifact_reconstruction_implementation",
-                    "artifact_ledger_integrated",
-                    "reproducibility_reporting_implementation",
-                )
-            ),
-            "unit_tested": by_name["recorded_unit_test_evidence"].passed,
-            "offline_smoke_tested": by_name[
-                "recorded_offline_smoke_evidence"
-            ].passed,
-            "mps_validated": by_name["full_profile_mps_validation"].passed,
-            "pilot_ready": pilot_ready,
-            "pilot_validated": by_name["scientific_pilot_completed"].passed,
-            "main_study_ready": main_ready,
-        },
+        "readiness_levels": readiness_levels,
         "decision_ledger_sha256": decisions_hash,
         "passed_gate_count": passed_count,
         "total_gate_count": len(results),
@@ -1282,6 +1716,7 @@ def main() -> int:
     parser.add_argument("--replication-policy", type=Path)
     parser.add_argument("--research-protocol", type=Path)
     parser.add_argument("--mps-evidence", type=Path)
+    parser.add_argument("--accelerator-evidence", type=Path)
     parser.add_argument("--study-spec", type=Path)
     parser.add_argument("--json-output", type=Path)
     arguments = parser.parse_args()
@@ -1293,6 +1728,7 @@ def main() -> int:
         replication_policy=arguments.replication_policy,
         research_protocol=arguments.research_protocol,
         mps_evidence=arguments.mps_evidence,
+        accelerator_evidence=arguments.accelerator_evidence,
         study_spec=arguments.study_spec,
     )
     rendered = json.dumps(report, indent=2, sort_keys=True) + "\n"

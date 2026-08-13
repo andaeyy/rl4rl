@@ -10,7 +10,6 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import time
 import uuid
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass
@@ -50,6 +49,11 @@ from common.lineage_schema import CandidateRecord, append_record, text_hash, utc
 from common.public_evaluation import (
     PUBLIC_LAYER_A_SOURCE_ID,
     PUBLIC_LAYER_A_SOURCE_SHA256,
+)
+from common.provider_attempts import (
+    PROVIDER_ATTEMPT_LEDGER_FILENAME,
+    PROVIDER_ATTEMPT_SCHEMA,
+    ProviderAttemptLedger,
 )
 from common.task_adapter import DEFAULT_TASK
 from common.trainer import trusted_component_hashes, trusted_component_set_sha256
@@ -136,9 +140,14 @@ class OpenAIProposalProvider:
         endpoint: ProviderEndpoint,
         generation: GPT56SolProfile,
     ) -> None:
+        if generation.retries != 0 or generation.retry_delay_seconds != 0:
+            raise PilotPreflightError(
+                "provider attempts are single-shot; retries and retry delay must be zero"
+            )
         self.endpoint = endpoint
         self.api_base = endpoint.base_url
         self.generation = generation
+        self._attempt_ledger: ProviderAttemptLedger | None = None
         self.client = OpenAI(
             api_key=api_key,
             base_url=endpoint.base_url,
@@ -152,32 +161,44 @@ class OpenAIProposalProvider:
         if not self.generation.model.strip():
             raise PilotPreflightError("provider model is empty")
 
+    def bind_attempt_ledger(
+        self,
+        output_dir: Path,
+        *,
+        run_id: str,
+        action: str,
+    ) -> None:
+        """Create the run's immutable attempt ledger before any request."""
+
+        if self._attempt_ledger is not None:
+            raise PilotPreflightError("provider attempt ledger is already bound")
+        self._attempt_ledger = ProviderAttemptLedger.create(
+            output_dir / PROVIDER_ATTEMPT_LEDGER_FILENAME,
+            harness=CONDITION,
+            action=action,
+            controller_run_id=run_id,
+            api_endpoint=self.endpoint.base_url,
+            model=self.generation.model,
+        )
+
     def generate(self, messages: Sequence[Mapping[str, str]]) -> ProposalResponse:
-        for attempt in range(self.generation.retries + 1):
-            try:
-                response = self.client.chat.completions.create(
-                    **self.generation.chat_completion_request(messages)
-                )
-                usage = response.usage
-                return ProposalResponse(
-                    text=response.choices[0].message.content or "",
-                    input_tokens=(
-                        getattr(usage, "prompt_tokens", 0) if usage else 0
-                    ),
-                    output_tokens=(
-                        getattr(usage, "completion_tokens", 0) if usage else 0
-                    ),
-                )
-            except Exception:
-                if attempt >= self.generation.retries:
-                    raise
-                print(
-                    "provider request failed; retrying "
-                    f"({attempt + 1}/{self.generation.retries})",
-                    file=sys.stderr,
-                )
-                time.sleep(self.generation.retry_delay_seconds)
-        raise RuntimeError("unreachable provider retry state")
+        if self._attempt_ledger is None:
+            raise PilotPreflightError(
+                "provider attempt ledger must be bound before generation"
+            )
+        request = self.generation.chat_completion_request(messages)
+        response = self._attempt_ledger.record_call(
+            request,
+            lambda: self.client.chat.completions.create(**request),
+        )
+        usage = response.usage
+        return ProposalResponse(
+            text=response.choices[0].message.content or "",
+            input_tokens=getattr(usage, "prompt_tokens", 0) if usage else 0,
+            output_tokens=(
+                getattr(usage, "completion_tokens", 0) if usage else 0
+            ),
+        )
 
     def manifest_fields(self) -> Mapping[str, object]:
         return {
@@ -402,9 +423,12 @@ def _validate_options(
             "training and evaluation profiles must both be scientific or both be engineering"
         )
     if options.engineering_pilot:
-        if training.name != "smoke_train_v1" or evaluation.name != "smoke_eval_v1":
+        if (
+            training.name != "smoke_train_cuda_v2"
+            or evaluation.name != "smoke_eval_v1"
+        ):
             raise ValueError(
-                "engineering pilot requires smoke_train_v1 and smoke_eval_v1"
+                "engineering pilot requires smoke_train_cuda_v2 and smoke_eval_v1"
             )
         if options.pi_decision_record_id is not None:
             raise ValueError("engineering pilot cannot claim a PI decision record")
@@ -417,19 +441,21 @@ def _validate_options(
         raise ValueError(
             "engineering profiles require the explicit --engineering-pilot mode"
         )
-    if options.device not in {"mps", "cpu"}:
-        raise ValueError("device must be 'mps' or explicit engineering-test 'cpu'")
+    if options.device not in {"cuda", "mps", "cpu"}:
+        raise ValueError("device must be 'cuda', 'mps', or engineering-test 'cpu'")
     if (
         options.engineering_pilot
-        and options.device != "mps"
+        and options.device != training.device_requirement
         and not allow_injected_cpu_test
     ):
         raise ValueError(
-            "provider-backed engineering pilots require device='mps'; CPU is "
+            "provider-backed engineering pilots require device='cuda'; CPU is "
             "reserved for explicit injected unit-test evaluators"
         )
-    if training.scientific and options.device != "mps":
-        raise ValueError("scientific training requires device='mps'")
+    if training.scientific and options.device != training.device_requirement:
+        raise ValueError(
+            f"scientific training requires device={training.device_requirement!r}"
+        )
     if options.device == "cpu" and not options.allow_cpu_for_tests:
         raise ValueError("CPU requires allow_cpu_for_tests")
     if training.scientific and options.allow_cpu_for_tests:
@@ -615,6 +641,16 @@ def run_greedy_autoresearch(
     provider.preflight()
 
     output_dir = _prepare_fresh_output(requested_output)
+    if isinstance(provider, OpenAIProposalProvider):
+        provider.bind_attempt_ledger(
+            output_dir,
+            run_id=run_id,
+            action=(
+                "one_opportunity_engineering_canary"
+                if options.engineering_pilot
+                else "scientific_replication"
+            ),
+        )
     artifacts = output_dir / "artifacts"
     artifacts.mkdir()
     training_root = output_dir / "candidate_training"
@@ -664,6 +700,7 @@ def run_greedy_autoresearch(
         "seed": options.seed,
         "candidate_budget": options.iterations + 1,
         "mutation_budget": options.iterations,
+        "maximum_provider_attempts": options.iterations,
         "candidate_training_budget": options.iterations + 1,
         "initial_candidate_is_evaluated": True,
         "candidate_format": "architecture_tensor_graph@1.0",
@@ -720,6 +757,17 @@ def run_greedy_autoresearch(
         "evidence_scope": "secondary_native_replication",
         "authoritative_scientific_evidence": False,
     }
+    if isinstance(provider, OpenAIProposalProvider):
+        manifest.update(
+            {
+                "provider_attempt_ledger": PROVIDER_ATTEMPT_LEDGER_FILENAME,
+                "provider_attempt_schema": PROVIDER_ATTEMPT_SCHEMA,
+            }
+        )
+    if training.version == "2":
+        manifest.update(
+            {"schema_name": "ControllerRunManifest", "schema_version": "2.0"}
+        )
     _atomic_json(output_dir / "run_manifest.json", manifest)
 
     seed_lineage_id = "lineage-" + text_hash(f"{run_id}|lineage|0")
@@ -1076,10 +1124,20 @@ def run_greedy_autoresearch(
         "condition": CONDITION,
         "proposal_opportunities_requested": options.iterations,
         "proposal_opportunities_terminal": completed,
-        "lineage_path": str(ledger),
-        "incumbent_path": str(incumbent_path),
+        "lineage_path": (
+            str(ledger) if training.version == "1" else ledger.name
+        ),
+        "incumbent_path": (
+            str(incumbent_path)
+            if training.version == "1"
+            else incumbent_path.name
+        ),
         "authoritative_scientific_evidence": False,
     }
+    if training.version == "2":
+        summary.update(
+            {"schema_name": "ControllerRunSummary", "schema_version": "2.0"}
+        )
     _atomic_json(output_dir / "run_summary.json", summary)
     return summary
 
@@ -1140,7 +1198,7 @@ def main() -> None:
         "--engineering-pilot",
         action="store_true",
         help=(
-            "run an exploratory IR-only MPS canary; forces smoke_train_v1 and "
+            "run an exploratory IR-only CUDA canary; forces smoke_train_cuda_v2 and "
             "smoke_eval_v1 and never creates authoritative scientific evidence"
         ),
     )
@@ -1150,16 +1208,18 @@ def main() -> None:
         choices=tuple(sorted(EVALUATION_PROFILES)),
     )
     parser.add_argument("--evaluation-cases", type=_positive_int)
-    parser.add_argument("--device", choices=("mps", "cpu"))
+    parser.add_argument("--device", choices=("cuda", "mps", "cpu"))
     parser.add_argument("--allow-cpu-for-tests", action="store_true")
     parser.add_argument("--scientific-decision-record")
     arguments = parser.parse_args()
 
     if arguments.engineering_pilot and arguments.training_profile not in {
         None,
-        "smoke_train_v1",
+        "smoke_train_cuda_v2",
     }:
-        parser.error("--engineering-pilot forces --training-profile smoke_train_v1")
+        parser.error(
+            "--engineering-pilot forces --training-profile smoke_train_cuda_v2"
+        )
     if arguments.engineering_pilot and arguments.evaluation_profile not in {
         None,
         "smoke_eval_v1",
@@ -1172,7 +1232,7 @@ def main() -> None:
     if configured_candidate != DEFAULT_INITIAL_CANDIDATE.resolve():
         parser.error("configured candidate_path differs from the trusted initial IR")
     training_profile = (
-        "smoke_train_v1"
+        "smoke_train_cuda_v2"
         if arguments.engineering_pilot
         else arguments.training_profile or str(config["training"]["profile"])
     )

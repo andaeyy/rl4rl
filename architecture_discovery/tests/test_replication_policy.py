@@ -3,12 +3,10 @@ from dataclasses import replace
 
 import pytest
 
-from replication.clean_room import CleanRoomReimplementationRecord
 from replication.fakes import toy_clean_room_record, toy_replication_policy
 from replication.policy import (
     FailurePolicy,
     ReplicationPolicy,
-    ReplicationSeed,
     freeze_replication_policy,
     load_frozen_replication_policy,
 )

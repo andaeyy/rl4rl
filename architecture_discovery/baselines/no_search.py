@@ -9,11 +9,13 @@ candidate-history, transition, repair, or evaluation fields.
 from __future__ import annotations
 
 import hashlib
+import json
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import ClassVar, Protocol, runtime_checkable
 
 from study.budget import BudgetSpec
-from study.interfaces import ProposalContext, ProposalResult
+from study.interfaces import ProposalContext, ProposalResult, RetryableProviderError
 from study.serialization import content_hash
 
 
@@ -172,7 +174,14 @@ class NoSearchProposalGenerator:
             request_id=opportunity.request_id,
             model_input=self.provider_visible_input,
         )
-        response = self._backend.complete(request)
+        try:
+            response = self._backend.complete(request)
+        except RetryableProviderError:
+            raise
+        except Exception as error:
+            raise RetryableProviderError(
+                f"no-search provider attempt failed: {type(error).__name__}"
+            ) from error
         return ProposalResult(
             response_text=response.response_text,
             candidate_source=response.candidate_source,
@@ -191,17 +200,92 @@ class DeterministicFakeBackend:
 
     is_test_double: ClassVar[bool] = True
 
-    def __init__(self, *, prompt_tokens: int = 23, completion_tokens: int = 17) -> None:
+    def __init__(
+        self,
+        *,
+        prompt_tokens: int = 23,
+        completion_tokens: int = 17,
+        candidate_ir: str | None = None,
+    ) -> None:
         if prompt_tokens < 0 or completion_tokens < 0:
             raise ValueError("fake token counts cannot be negative")
         self.prompt_tokens = prompt_tokens
         self.completion_tokens = completion_tokens
         self.requests: list[NoSearchRequest] = []
+        if candidate_ir is None:
+            source = (
+                Path(__file__).resolve().parents[1]
+                / "common"
+                / "initial_candidate.ir.json"
+            ).read_text(encoding="utf-8")
+        else:
+            source = candidate_ir
+        try:
+            payload = json.loads(source)
+        except (TypeError, json.JSONDecodeError) as error:
+            raise ValueError("fake no-search candidate must be JSON") from error
+        if not isinstance(payload, dict) or (
+            payload.get("schema_name") != "architecture_tensor_graph"
+            or payload.get("schema_version") != "1.0"
+        ):
+            raise ValueError(
+                "fake no-search candidate must be architecture_tensor_graph v1.0"
+            )
+        nodes = payload.get("nodes")
+        edges = payload.get("edges")
+        if not isinstance(nodes, list) or not all(
+            isinstance(item, dict) and isinstance(item.get("node_id"), str)
+            for item in nodes
+        ):
+            raise ValueError("fake no-search candidate has invalid nodes")
+        if not isinstance(edges, list) or not all(
+            isinstance(item, dict)
+            and all(
+                key in item
+                for key in ("source", "target", "target_port", "kind")
+            )
+            for item in edges
+        ):
+            raise ValueError("fake no-search candidate has invalid edges")
+        payload["nodes"] = sorted(nodes, key=lambda item: item["node_id"])
+        payload["edges"] = sorted(
+            edges,
+            key=lambda item: (
+                item["target"],
+                item["target_port"],
+                item["source"],
+                item["kind"],
+            ),
+        )
+        self._candidate_source = json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+
+    @property
+    def candidate_source(self) -> str:
+        """Canonical provider-free seed document used by the smoke path."""
+
+        return self._candidate_source
 
     def complete(self, request: NoSearchRequest) -> BackendResponse:
         self.requests.append(request)
         digest = hashlib.sha256(request.request_id.encode("utf-8")).hexdigest()[:16]
-        source = f"# offline deterministic no-search fixture {digest}\n"
+        payload = json.loads(self._candidate_source)
+        payload["graph_id"] = f"offline_no_search_{digest}"
+        metadata = dict(payload["metadata"])
+        metadata["mechanism_hypothesis"] = (
+            f"offline deterministic no-search fixture {digest}"
+        )
+        payload["metadata"] = metadata
+        source = json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
         return BackendResponse(
             response_text=source,
             candidate_source=source,
