@@ -51,6 +51,93 @@ do not expose `full_train_cuda_v2`. A future full-profile entrypoint requires
 resolved scientific gates, a separate resource/timeout contract, and separate
 operator approval.
 
+### What to run next: bounded exploratory Modal pilot
+
+The repository now includes a separate `exploratory_non_scientific` lane. It
+uses one block with one opportunity per C0-C3, a single provider attempt, zero
+provider/Modal retries, the CUDA-only `exploratory_train_cuda_v2` profile, and
+explicit Modal/provider cost ceilings. It is for plumbing, hypothesis
+generation, and learning how the search behaves; it is not a ranking run and
+does not change `scientific_decisions.yaml` or unlock `study_scientific_run.py`.
+
+After the teammate bootstrap above, run the cost-free preflight (it reads no
+provider secret and makes no network call):
+
+```bash
+.venv/bin/python exploratory_pilot.py preflight \
+  --run-id exploratory-team-20260815-01 --print-approval
+```
+
+The first live action must still be launched through `scripts/launch_modal.py`
+and requires a fresh local freeze, current Modal price basis, provider price
+basis, candidate-resume preflight receipt, and a checked-in approval plan. The
+approval text is intentionally explicit:
+
+```text
+I approve exactly one provider-backed Modal exploratory_c0c3_pilot for run/cohort exploratory-team-20260815-01, with a $0.25 Modal cap and $0.25 provider cap, zero retries, provider access, and stop after first success or failure.
+```
+
+Once those receipt paths and hashes have been produced by the existing
+readiness workflow, the bounded launch shape is:
+
+```bash
+.venv/bin/python scripts/launch_modal.py \
+  --action exploratory_c0c3_pilot \
+  --run-id exploratory-team-20260815-01 \
+  --cohort-id exploratory-team-20260815-01 \
+  --expected-image-source-sha256 "$APPROVED_IMAGE_SOURCE_SHA256" \
+  --outer-cli-timeout-seconds 1200 \
+  --modal-cost-cap-usd "$APPROVED_MODAL_ACTION_CAP_USD" \
+  --modal-price-basis-path "$MODAL_PRICE_BASIS_PATH" \
+  --modal-price-basis-sha256 "$MODAL_PRICE_BASIS_SHA256" \
+  --provider-approved \
+  --provider-cost-cap-usd 0.25 \
+  --provider-approval-plan-path "$EXPLORATORY_PROVIDER_PLAN" \
+  --approval-plan-sha256 "$EXPLORATORY_PROVIDER_PLAN_SHA256" \
+  --provider-price-basis-path "$PROVIDER_PRICE_BASIS_PATH" \
+  --provider-price-basis-sha256 "$PROVIDER_PRICE_BASIS_SHA256" \
+  --candidate-resume-preflight-receipt-path "$PREFLIGHT_PATH" \
+  --candidate-resume-preflight-receipt-sha256 "$PREFLIGHT_SHA256" \
+  --approved
+```
+
+The launcher refuses missing approval, stale price bases, nonzero retries, a
+stale source/image freeze, or a missing predecessor receipt before starting
+Modal. After success, use the existing separately approved `download` action
+to retrieve the Volume run, then run `exploratory_pilot.py verify` against the
+downloaded `exploratory-<RUN_ID>` directory. Finish with the existing
+read-only inventory/cleanup command from the Modal readiness runbook; cleanup
+is never implicit.
+
+Create the provider approval plan after the current source/image/cohort values
+are known, without reading the provider Secret:
+
+```bash
+.venv/bin/python exploratory_pilot.py approval-plan \
+  --source-tree-sha256 SOURCE_TREE_SHA256 \
+  --image-source-sha256 IMAGE_SOURCE_SHA256 \
+  --cohort-id exploratory-team-20260815-01 \
+  --output outputs/readiness/exploratory_provider_approval_plan.json
+```
+
+For a completely provider-free end-to-end check, use a fresh output directory:
+
+```bash
+.venv/bin/python exploratory_pilot.py fake-run \
+  --output-dir /private/tmp/rl4rl-exploratory-fake \
+  --run-id exploratory-local-fake-1
+.venv/bin/python exploratory_pilot.py verify \
+  --run-directory /private/tmp/rl4rl-exploratory-fake/exploratory-exploratory-local-fake-1 \
+  --run-id exploratory-exploratory-local-fake-1
+```
+
+The verifier checks the content-addressed artifact manifest and rejects any
+tampering. It expects the required summary, randomization/assignment plan,
+sanitized provider-attempt ledger, candidate-source index, training/evaluation
+summary, terminal receipt, and cost ceiling records. After an approved live
+run, use the existing `download` action and then run the same local verifier;
+perform cleanup/inventory only with a separate explicit approval.
+
 Historical MPS evidence is retained unchanged. A one-opportunity Greedy canary
 and the paid 10-by-4 mechanics pilot completed sequentially on MPS on 2026-08-08
 UTC. Public smoke accuracy was 0.0 throughout. Those artifacts remain useful

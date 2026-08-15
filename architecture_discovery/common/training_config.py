@@ -335,11 +335,40 @@ SMOKE_TRAIN_CUDA_V2 = TrainingProfile(
     cublas_workspace_config=":4096:8",
 )
 
+# Deliberately tiny CUDA-only profile for the exploratory Modal lane.  This is
+# useful for plumbing and hypothesis generation, but it is never a scientific
+# ranking profile and must not be used to unlock the formal study gates.
+EXPLORATORY_TRAIN_CUDA_V2 = TrainingProfile(
+    name="exploratory_train_cuda_v2",
+    version="2",
+    max_steps=25,
+    global_batch_size=16,
+    microbatch_size=None,
+    gradient_accumulation_steps=1,
+    peak_learning_rate=0.001,
+    adamw_betas=(0.9, 0.98),
+    weight_decay=0.1,
+    warmup_steps=2,
+    scheduler="cosine_decay_to_zero",
+    gradient_clip_norm=1.0,
+    validation_interval=25,
+    validation_examples=24,
+    checkpoint_interval=25,
+    maximum_wall_seconds=120,
+    dtype="float32",
+    deterministic_algorithms=True,
+    device_requirement="cuda",
+    accelerator_memory_fraction=None,
+    scientific=False,
+    cublas_workspace_config=":4096:8",
+)
+
 PROFILES = {
     FULL_TRAIN_V1.name: FULL_TRAIN_V1,
     SMOKE_TRAIN_V1.name: SMOKE_TRAIN_V1,
     FULL_TRAIN_CUDA_V2.name: FULL_TRAIN_CUDA_V2,
     SMOKE_TRAIN_CUDA_V2.name: SMOKE_TRAIN_CUDA_V2,
+    EXPLORATORY_TRAIN_CUDA_V2.name: EXPLORATORY_TRAIN_CUDA_V2,
 }
 
 

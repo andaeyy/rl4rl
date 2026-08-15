@@ -1,0 +1,23 @@
+schema_name: exploratory_modal_pilot
+schema_version: "1"
+mode: exploratory_non_scientific
+scientific: false
+blocks: 1
+proposal_opportunities: 1
+provider_attempts_per_opportunity: 1
+repair_attempts_per_opportunity: 1
+provider_retries: 0
+modal_retries: 0
+sequential_accelerator_leases: 1
+training_profile: exploratory_train_cuda_v2
+evaluation_profile: smoke_eval_v1
+evaluation_cases: 24
+device: cuda
+maximum_wall_seconds: 240
+modal_cost_cap_usd: "0.25"
+provider_cost_cap_usd: "0.25"
+maximum_artifact_bytes: 268435456
+notes:
+  - exploratory plumbing and hypothesis generation only
+  - never use for final architecture ranking or scientific claims
+  - formal scientific gates remain unchanged and may remain blocked

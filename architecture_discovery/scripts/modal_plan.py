@@ -25,6 +25,7 @@ from modal_boundary import (  # noqa: E402
     VOLUME_MOUNT_PATH,
     VOLUME_NAME,
     build_image_source_manifest,
+    function_spec,
 )
 
 
@@ -95,6 +96,16 @@ def build_plan(project_root: str | Path = ROOT) -> dict[str, Any]:
                 "volume_mount_path": spec.volume_mount_path,
             }
             for name, spec in FUNCTION_SPECS.items()
+        },
+        "exploratory_function": {
+            "name": function_spec("exploratory_c0c3_pilot").name,
+            "gpu": function_spec("exploratory_c0c3_pilot").gpu,
+            "provider_secret": function_spec("exploratory_c0c3_pilot").provider_secret,
+            "runtime_network_blocked": False,
+            "retries": function_spec("exploratory_c0c3_pilot").retries,
+            "timeout_seconds": function_spec("exploratory_c0c3_pilot").timeout_seconds,
+            "max_containers": function_spec("exploratory_c0c3_pilot").max_containers,
+            "mode": "exploratory_non_scientific",
         },
         "remote_calls_started": 0,
     }

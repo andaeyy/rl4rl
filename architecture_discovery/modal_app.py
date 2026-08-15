@@ -88,6 +88,7 @@ from modal_boundary import (
     verify_artifact_manifest,
     volume_artifact_uri,
     write_artifact_manifest,
+    function_spec,
 )
 from modal_image_build import install_image_dependencies
 from scripts.launch_modal import (
@@ -126,6 +127,7 @@ PROVIDER_FREE_NETWORK_PROBE_FUNCTIONS = frozenset(
         "checkpoint_resume",
     }
 )
+PROVIDER_ACTIONS = frozenset({"canary", "canaries", "exploratory_c0c3_pilot"})
 # Cloudflare's public anycast HTTPS address is intentionally routable.  A
 # documentation-only TEST-NET address could time out even when egress worked
 # and would therefore be incapable of distinguishing Modal's network block.
@@ -1383,7 +1385,7 @@ def _execute_new_run(
     manifest_filename: str = "artifact_manifest.json",
     scan_provider_credential: bool | None = None,
 ) -> dict[str, Any]:
-    required_scan = FUNCTION_SPECS[function_name].provider_secret
+    required_scan = function_spec(function_name).provider_secret
     if scan_provider_credential is None:
         scan_provider_credential = required_scan
     if scan_provider_credential is not required_scan:
@@ -1411,23 +1413,33 @@ def _execute_new_run(
         success_result = {"success": True, **result}
         if scan_provider_credential:
             _reject_provider_credential_payload(success_result)
-            harness = function_name.removeprefix("canary_")
-            if harness not in CANARY_ORDER:
-                raise RemoteActionError(
-                    "provider action is not a frozen engineering canary"
+            if function_name.startswith("canary_"):
+                harness = function_name.removeprefix("canary_")
+                if harness not in CANARY_ORDER:
+                    raise RemoteActionError(
+                        "provider action is not a frozen engineering canary"
+                    )
+                # Import only inside an executing provider function.  The validator
+                # is provider-free and reads the private off-Volume tree before the
+                # credential scanner snapshots any bytes for publication.
+                from scripts.validate_engineering_canaries import (
+                    validate_private_canary_staging,
                 )
-            # Import only inside an executing provider function.  The validator
-            # is provider-free and reads the private off-Volume tree before the
-            # credential scanner snapshots any bytes for publication.
-            from scripts.validate_engineering_canaries import (
-                validate_private_canary_staging,
-            )
 
-            validate_private_canary_staging(
-                action_directory / "controller",
-                harness=harness,
-                execution_context=context,
-            )
+                validate_private_canary_staging(
+                    action_directory / "controller",
+                    harness=harness,
+                    execution_context=context,
+                )
+            elif function_name == "exploratory_c0c3_pilot":
+                from exploratory_pilot import verify_exploratory_staging
+
+                verify_exploratory_staging(
+                    action_directory / "exploratory",
+                    run_id=run_id,
+                )
+            else:
+                raise RemoteActionError("provider action has no staging validator")
         _publish_staged_artifacts(
             action_directory,
             run_directory,
@@ -1456,34 +1468,44 @@ def _execute_new_run(
                 _purge_provider_credential_files(action_directory)
             except RemoteActionError as scan_error:
                 error = scan_error
+            failure_result = {
+                "success": False,
+                "error_type": type(error).__name__,
+            }
             try:
-                failure_result = {
-                    "success": False,
-                    "error_type": type(error).__name__,
-                }
-                _publish_failed_provider_attempt_ledger(
-                    action_directory,
-                    run_directory,
-                    harness=function_name.removeprefix("canary_"),
-                    context=context,
-                    reserved_artifacts=(
-                        (
-                            "remote_action_failure.json",
-                            _json_bytes(
-                                {
-                                    "error_type": type(error).__name__,
-                                    "message": (
-                                        "remote action failed; details suppressed"
-                                    ),
-                                }
+                if function_name.startswith("canary_"):
+                    _publish_failed_provider_attempt_ledger(
+                        action_directory,
+                        run_directory,
+                        harness=function_name.removeprefix("canary_"),
+                        context=context,
+                        reserved_artifacts=(
+                            (
+                                "remote_action_failure.json",
+                                _json_bytes(
+                                    {
+                                        "error_type": type(error).__name__,
+                                        "message": (
+                                            "remote action failed; details suppressed"
+                                        ),
+                                    }
+                                ),
+                            ),
+                            (
+                                "remote_action_result.json",
+                                _json_bytes(failure_result),
                             ),
                         ),
-                        (
-                            "remote_action_result.json",
-                            _json_bytes(failure_result),
+                    )
+                else:
+                    _publish_staged_artifacts(
+                        action_directory,
+                        run_directory,
+                        scan_provider_credential=True,
+                        reserved_artifacts=(
+                            ("remote_action_result.json", _json_bytes(failure_result)),
                         ),
-                    ),
-                )
+                    )
             except RemoteActionError as ledger_error:
                 error = ledger_error
         failure_result = {
@@ -2403,7 +2425,7 @@ def _require_local_action_approvals(
             "remote action refused: --expected-image-source-sha256 must equal "
             "the approved local Modal plan hash"
         )
-    if action in _PROVIDER_CANARY_ACTIONS and not provider_approved:
+    if action in PROVIDER_ACTIONS and not provider_approved:
         raise SystemExit(
             "provider action refused: obtain separate provider-cost approval, "
             "then pass --provider-approved"
@@ -2603,6 +2625,32 @@ def _canary_action(
     return {
         "mode": "one_opportunity_engineering_canary",
         "harness": harness,
+        **_run_command(
+            command,
+            context=context,
+            provider=True,
+            requested_device="cuda",
+        ),
+    }
+
+
+def _exploratory_c0c3_pilot_action(
+    run_directory: Path,
+    context: ExecutionContextV1,
+):
+    command = [
+        sys.executable,
+        str(REMOTE_PROJECT_ROOT / "exploratory_pilot.py"),
+        "--output-dir",
+        str(run_directory / "exploratory"),
+        "--run-id",
+        context.run_id,
+        "--provider",
+    ]
+    return {
+        "mode": "exploratory_non_scientific",
+        "training_profile": "exploratory_train_cuda_v2",
+        "scientific": False,
         **_run_command(
             command,
             context=context,
@@ -3033,7 +3081,7 @@ def _capture_artifact_verifier_directory(
 
 
 def _function_options(name: str) -> dict[str, Any]:
-    spec = FUNCTION_SPECS[name]
+    spec = function_spec(name)
     options: dict[str, Any] = {
         "image": IMAGE,
         "volumes": {str(VOLUME_MOUNT_PATH): ARTIFACT_VOLUME},
@@ -3054,7 +3102,7 @@ def _function_options(name: str) -> dict[str, Any]:
 
 
 def _provider_variant(function):
-    """Attach the provider Secret only when an approved canary is invoked.
+    """Attach the provider Secret only when an approved provider action runs.
 
     Modal loads every statically registered Function dependency when starting an
     ephemeral App. Keeping the Secret out of the decorator dependency graph lets
@@ -3107,6 +3155,15 @@ else:
         seed: int = 1,
     ) -> dict[str, Any]:
         return _resume_action(source_run_id, run_id, seed=seed)
+
+    @app.function(**_function_options("exploratory_c0c3_pilot"))
+    def exploratory_c0c3_pilot(run_id: str) -> dict[str, Any]:
+        return _execute_new_run(
+            "exploratory_c0c3_pilot",
+            run_id,
+            _exploratory_c0c3_pilot_action,
+            scan_provider_credential=True,
+        )
 
     @app.function(**_function_options("canary_greedy_autoresearch"))
     def canary_greedy_autoresearch(
@@ -3307,6 +3364,11 @@ else:
             result = invoke_synchronously(
                 checkpoint_resume,
                 source_run_id=selected_source_run_id,
+                run_id=selected_run_id,
+            )
+        elif action == "exploratory_c0c3_pilot":
+            result = invoke_synchronously(
+                _provider_variant(exploratory_c0c3_pilot),
                 run_id=selected_run_id,
             )
         elif action in _PROVIDER_CANARY_ACTIONS:

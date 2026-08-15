@@ -61,7 +61,6 @@ from modal_action_journal import (  # noqa: E402
 )
 from modal_boundary import (  # noqa: E402
     CANARY_ORDER,
-    FUNCTION_SPECS,
     FUNCTION_TIMEOUT_SECONDS,
     IMAGE_BUILD_COMMAND_TIMEOUT_SECONDS,
     IMAGE_BUILD_CPU_REQUEST_CORES,
@@ -89,6 +88,7 @@ from modal_boundary import (  # noqa: E402
     safe_relative_path,
     validate_provider_canary_aggregate_outcome_receipt,
     validate_run_id,
+    function_spec,
 )
 from scripts import record_modal_readiness as modal_readiness  # noqa: E402
 from scripts.openevolve_patch_bundle import (  # noqa: E402
@@ -148,7 +148,9 @@ _LEGACY_RESERVED_REMOTE_RUN_IDS = frozenset({"modal-cuda-env-20260809-02"})
 _OFFICIAL_OPENAI_PRICE_URL = re.compile(
     r"\Ahttps://(?:platform\.)?openai\.com/[^\s]*\Z"
 )
-_PROVIDER_ACTIONS = frozenset({"canary", "canaries"})
+_PROVIDER_ACTIONS = frozenset(
+    {"canary", "canaries", "exploratory_c0c3_pilot"}
+)
 _VERIFIER_ACTIONS = frozenset({"download", "verify"})
 _SOURCE_PRODUCING_ACTIONS = frozenset(
     {
@@ -168,6 +170,7 @@ _ACTIONS = frozenset(
         "candidate-smoke",
         "checkpoint-resume",
         "cuda-environment",
+        "exploratory_c0c3_pilot",
         "download",
         "offline-smoke",
         "verify",
@@ -195,6 +198,7 @@ _ACTION_PREDECESSOR_ARGUMENTS = {
     "checkpoint-resume": ("artifact_round_trip",),
     "canary": ("candidate_resume_preflight",),
     "canaries": ("candidate_resume_preflight",),
+    "exploratory_c0c3_pilot": ("candidate_resume_preflight",),
     "download": (),
     "verify": (),
 }
@@ -630,7 +634,7 @@ def modal_resource_profile(action: str, harness: str = "") -> dict[str, Any]:
         function_names = [action.replace("-", "_")]
     runtime_calls: list[dict[str, Any]] = []
     for function_name in function_names:
-        spec = FUNCTION_SPECS[function_name]
+        spec = function_spec(function_name)
         runtime_calls.append(
             {
                 "function_name": function_name,
@@ -2657,7 +2661,21 @@ def _validate_provider_approval_inputs(
         arguments.provider_approval_plan_path,
         "provider_approval_plan_path",
     )
-    plan_sha256 = verify_provider_canary_approval_plan(plan)
+    if (
+        arguments.action == "exploratory_c0c3_pilot"
+        and isinstance(plan, dict)
+        and plan.get("schema_name") == "ExploratoryModalProviderApprovalPlan"
+    ):
+        plan_unsigned = dict(plan)
+        plan_sha256 = plan_unsigned.pop("approval_plan_sha256", None)
+        if (
+            not isinstance(plan_sha256, str)
+            or _SHA256.fullmatch(plan_sha256) is None
+            or canonical_sha256(plan_unsigned) != plan_sha256
+        ):
+            raise ValueError("exploratory provider approval plan SHA-256 does not reconstruct")
+    else:
+        plan_sha256 = verify_provider_canary_approval_plan(plan)
     if plan_sha256 != arguments.approval_plan_sha256:
         raise ValueError("approved provider plan SHA-256 differs from its file")
     expected_plan = build_provider_canary_approval_plan(
@@ -2706,6 +2724,45 @@ def _validate_provider_approval_inputs(
     if price_file_sha256 != arguments.provider_price_basis_sha256:
         raise ValueError("provider price-basis SHA-256 differs from its file")
     input_rate, output_rate, request_fee = _validate_price_basis(price_basis)
+
+    if arguments.action == "exploratory_c0c3_pilot":
+        if plan.get("schema_name") != "ExploratoryModalProviderApprovalPlan":
+            raise ValueError("exploratory provider approval plan has the wrong schema")
+        if (
+            plan.get("schema_version") != "1"
+            or plan.get("action") != arguments.action
+            or plan.get("source_tree_sha256") != identity.source_tree_sha256
+            or plan.get("image_source_sha256") != image_source_sha256
+            or plan.get("cohort_id") != identity.cohort_id
+            or plan.get("training_profile") != "exploratory_train_cuda_v2"
+            or plan.get("provider_attempts") != 4
+            or plan.get("retries") != 0
+        ):
+            raise ValueError("exploratory provider approval plan is not current")
+        maximum_completion_tokens = plan.get("maximum_completion_tokens")
+        if type(maximum_completion_tokens) is not int or maximum_completion_tokens <= 0:
+            raise ValueError("exploratory provider token ceiling is invalid")
+        required_cost_bound = (
+            Decimal(32_768) * input_rate / Decimal(1_000_000)
+            + Decimal(maximum_completion_tokens) * output_rate / Decimal(1_000_000)
+            + request_fee
+        ) * Decimal(plan["provider_attempts"])
+        approved_provider_cap = _canonical_decimal_amount(
+            arguments.provider_cost_cap_usd,
+            "provider_cost_cap_usd",
+            require_positive=True,
+        )
+        if approved_provider_cap < required_cost_bound:
+            raise ValueError(
+                "exploratory provider cap is below its source-bound token ceiling"
+            )
+        return {
+            "provider_cost_cap_usd": arguments.provider_cost_cap_usd,
+            "provider_approval_plan_path": arguments.provider_approval_plan_path,
+            "approval_plan_sha256": plan_sha256,
+            "provider_price_basis_path": arguments.provider_price_basis_path,
+            "provider_price_basis_sha256": price_file_sha256,
+        }
 
     harnesses = plan["harnesses"]
     if not isinstance(harnesses, list):
@@ -3208,6 +3265,7 @@ def _validate_source_action_intent(
         "checkpoint-resume": ["modal_artifact_round_trip_validated"],
         "canary": ["candidate_resume_preflight_validated"],
         "canaries": ["candidate_resume_preflight_validated"],
+        "exploratory_c0c3_pilot": ["candidate_resume_preflight_validated"],
     }[payload["action"]]
     expected_predecessor_gates = [
         *LOCAL_ENGINEERING_FREEZE_GATES,

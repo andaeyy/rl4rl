@@ -304,6 +304,24 @@ engineering_smoke:
   checkpoint_interval: 5
   maximum_wall_seconds: 60
 
+exploratory_modal_pilot:
+  mode: exploratory_non_scientific
+  action: exploratory_c0c3_pilot
+  preset: configs/exploratory_modal_pilot.yaml
+  scientific: false
+  blocks: 1
+  proposal_opportunities: 1
+  provider_attempts_per_opportunity: 1
+  provider_retries: 0
+  modal_retries: 0
+  training_profile: exploratory_train_cuda_v2
+  evaluation_profile: smoke_eval_v1
+  device: cuda
+  maximum_wall_seconds: 240
+  modal_cost_cap_usd: "0.25"
+  provider_cost_cap_usd: "0.25"
+  final_ranking_allowed: false
+
 artifacts_and_reconstruction:
   event_ledger: append_only_hash_chained
   candidate_and_response_storage: content_addressed

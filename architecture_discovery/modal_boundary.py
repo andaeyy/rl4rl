@@ -67,6 +67,7 @@ MODAL_ACTIONS = frozenset(
         "candidate-smoke",
         "checkpoint-resume",
         "cuda-environment",
+        "exploratory_c0c3_pilot",
         "download",
         "offline-smoke",
         "verify",
@@ -155,6 +156,7 @@ _ALLOWED_ROOT_FILES = (
     "modal_app.py",
     "modal_boundary.py",
     "modal_image_build.py",
+    "exploratory_pilot.py",
     "pyproject.toml",
     "scientific_decisions.yaml",
     "uv.lock",
@@ -169,6 +171,7 @@ IMAGE_SOURCE_DIRECTORIES = (
     "audits",
     "baselines",
     "common",
+    "configs",
     "containment",
     "evaluation",
     "mechanism",
@@ -311,6 +314,19 @@ FUNCTION_SPECS: Mapping[str, FunctionSpec] = {
     ),
     "artifact_verify": FunctionSpec("artifact_verify", None, False),
 }
+
+# Kept outside ``FUNCTION_SPECS`` for backward-compatible plan/receipt schemas:
+# the historical provider-name roster is intentionally immutable.  The
+# exploratory lane has its own explicit provider-bearing function contract.
+EXPLORATORY_FUNCTION_SPEC = FunctionSpec(
+    "exploratory_c0c3_pilot", GPU_TYPE, True
+)
+
+
+def function_spec(name: str) -> FunctionSpec:
+    if name == EXPLORATORY_FUNCTION_SPEC.name:
+        return EXPLORATORY_FUNCTION_SPEC
+    return FUNCTION_SPECS[name]
 
 
 @dataclass(frozen=True)
@@ -691,7 +707,9 @@ def build_modal_cli_command(
         raise ValueError("first CUDA environment run ID must equal the cohort ID")
     if type(provider_approved) is not bool:
         raise TypeError("Modal CLI provider approval must be boolean")
-    if provider_approved is not (action in {"canary", "canaries"}):
+    if provider_approved is not (
+        action in {"canary", "canaries", "exploratory_c0c3_pilot"}
+    ):
         raise ValueError("Modal CLI provider approval differs from its action")
 
     root = Path(os.path.abspath(os.fspath(project_root)))
