@@ -32,6 +32,7 @@ from architecture_ir import encode_graph_json, validate_ir_candidate_json
 from architecture_ir.codec import MAX_IR_JSON_BYTES
 from architecture_ir.graph import ARCHITECTURE_HASH_SCHEMA
 from common.architecture_dedup import ArchitectureHashRegistry
+from common.evolution_run import EVOLUTION_INPUT_BYTES_PER_REQUEST
 
 from common.descriptor_schema import CATEGORY_CODES, SEMANTIC_METRIC_NAMES
 from common.evaluation_profiles import (
@@ -144,6 +145,7 @@ class RunOptions:
     pi_decision_record_id: str | None
     eligibility_threshold: float
     engineering_pilot: bool = False
+    modal_evolution_run: bool = False
     max_ir_bytes: int = 40_000
 
 
@@ -318,6 +320,7 @@ class OpenAIProposalProvider:
         api_key: str,
         endpoint: ProviderEndpoint,
         generation: GPT56SolProfile,
+        input_bytes_ceiling: int | None = None,
     ):
         if generation.retries != 0 or generation.retry_delay_seconds != 0:
             raise PilotPreflightError(
@@ -326,6 +329,7 @@ class OpenAIProposalProvider:
         self.endpoint = endpoint
         self.api_base = endpoint.base_url
         self.generation = generation
+        self.input_bytes_ceiling = input_bytes_ceiling
         self._attempt_ledger: ProviderAttemptLedger | None = None
         self.client = OpenAI(
             api_key=api_key,
@@ -366,6 +370,20 @@ class OpenAIProposalProvider:
                 "provider attempt ledger must be bound before generation"
             )
         request = self.generation.chat_completion_request(messages)
+        if self.input_bytes_ceiling is not None:
+            request_bytes = len(
+                json.dumps(
+                    request,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=True,
+                    allow_nan=False,
+                ).encode("utf-8")
+            )
+            if request_bytes > self.input_bytes_ceiling:
+                raise PilotPreflightError(
+                    "evolution request exceeds its pre-transport input-byte ceiling"
+                )
         response = self._attempt_ledger.record_call(
             request,
             lambda: self.client.chat.completions.create(**request),
@@ -908,7 +926,9 @@ def run_semantic_autoresearch(
             output_dir,
             run_id=run_id,
             action=(
-                "one_opportunity_engineering_canary"
+                "evolution_run"
+                if options.modal_evolution_run
+                else "one_opportunity_engineering_canary"
                 if options.engineering_pilot
                 else "scientific_replication"
             ),
@@ -1034,6 +1054,11 @@ def run_semantic_autoresearch(
                 "provider_attempt_ledger": PROVIDER_ATTEMPT_LEDGER_FILENAME,
                 "provider_attempt_schema": PROVIDER_ATTEMPT_SCHEMA,
             }
+        )
+    if options.modal_evolution_run:
+        manifest["modal_evolution_run"] = True
+        manifest["provider_input_bytes_per_request_ceiling"] = (
+            EVOLUTION_INPUT_BYTES_PER_REQUEST
         )
     if training.version == "2":
         manifest.update(
@@ -1446,6 +1471,7 @@ def _provider_from_environment(
     seed: int,
     *,
     scientific: bool,
+    modal_evolution_run: bool = False,
 ) -> ProposalProvider:
     values = {
         "DISCOVERY_API_KEY": os.environ.get("DISCOVERY_API_KEY"),
@@ -1468,7 +1494,7 @@ def _provider_from_environment(
             default_timeout_seconds=int(config["timeout_seconds"]),
             default_retries=int(config["retries"]),
             default_retry_delay_seconds=int(config["retry_delay_seconds"]),
-            allow_environment_overrides=not scientific,
+            allow_environment_overrides=(not scientific and not modal_evolution_run),
         )
     except ValueError as error:
         raise SystemExit(str(error)) from error
@@ -1476,6 +1502,9 @@ def _provider_from_environment(
         api_key=str(values["DISCOVERY_API_KEY"]),
         endpoint=endpoint,
         generation=generation,
+        input_bytes_ceiling=(
+            EVOLUTION_INPUT_BYTES_PER_REQUEST if modal_evolution_run else None
+        ),
     )
 
 
@@ -1507,6 +1536,11 @@ def main() -> None:
     parser.add_argument("--device", choices=("cuda", "mps", "cpu"))
     parser.add_argument("--allow-cpu-for-tests", action="store_true")
     parser.add_argument("--pi-decision-record-id")
+    parser.add_argument(
+        "--modal-evolution-run",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
     arguments = parser.parse_args()
 
     if arguments.engineering_pilot and arguments.training_profile not in {
@@ -1523,6 +1557,10 @@ def main() -> None:
         parser.error("--engineering-pilot forces --evaluation-profile smoke_eval_v1")
     if arguments.engineering_pilot and arguments.pi_decision_record_id:
         parser.error("--engineering-pilot cannot claim a PI decision record")
+    if arguments.modal_evolution_run and (
+        not arguments.engineering_pilot or arguments.seed != 1
+    ):
+        parser.error("--modal-evolution-run requires seed 1 and --engineering-pilot")
 
     training_profile = (
         "smoke_train_cuda_v2"
@@ -1574,6 +1612,7 @@ def main() -> None:
             else float(config["evaluation"]["eligibility_threshold"])
         ),
         engineering_pilot=arguments.engineering_pilot,
+        modal_evolution_run=arguments.modal_evolution_run,
     )
     try:
         _preflight_default_evaluator(options)
@@ -1583,6 +1622,7 @@ def main() -> None:
         config,
         arguments.seed,
         scientific=get_training_profile(training_profile).scientific,
+        modal_evolution_run=arguments.modal_evolution_run,
     )
     try:
         summary = run_semantic_autoresearch(options, provider=provider)

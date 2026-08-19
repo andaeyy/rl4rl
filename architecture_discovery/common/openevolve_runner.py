@@ -14,6 +14,7 @@ from pathlib import Path
 import yaml
 from openevolve.config import LLMModelConfig, load_config
 from openevolve.controller import OpenEvolve
+from openevolve.llm.openai import OpenAILLM
 from openevolve.process_parallel import (
     SerializableResult,
     _run_iteration_worker as _VENDOR_RUN_ITERATION_WORKER,
@@ -53,6 +54,11 @@ from common.trainer import (
     validate_training_request,
 )
 from common.training_config import PROFILES, TrainingSeedBundle, get_training_profile
+from modal_boundary import (
+    OPENEVOLVE_60_ACTION,
+    OPENEVOLVE_60_INPUT_BYTES_PER_REQUEST,
+    OPENEVOLVE_60_ITERATIONS,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -281,7 +287,11 @@ def _require_fresh_output(path: Path) -> None:
 
 
 def _build_model_config(
-    generation: GPT56SolProfile, *, api_base: str, api_key: str
+    generation: GPT56SolProfile,
+    *,
+    api_base: str,
+    api_key: str,
+    bounded_input: bool = False,
 ) -> LLMModelConfig:
     """Translate the shared profile into OpenEvolve's model configuration."""
 
@@ -298,7 +308,36 @@ def _build_model_config(
         retry_delay=generation.retry_delay_seconds,
         random_seed=generation.seed,
         reasoning_effort=generation.reasoning_effort,
+        init_client=(
+            _build_bounded_openevolve_client if bounded_input else None
+        ),
     )
+
+
+class _BoundedOpenEvolveClient(OpenAILLM):
+    """Reject oversized prompts before the provider transport is entered."""
+
+    async def _call_api(self, params: dict[str, object]) -> str:
+        encoded = json.dumps(
+            params,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            allow_nan=False,
+        ).encode("utf-8")
+        if len(encoded) > OPENEVOLVE_60_INPUT_BYTES_PER_REQUEST:
+            raise ValueError(
+                "OpenEvolve provider request exceeds the approved input-byte "
+                f"ceiling ({len(encoded)} > "
+                f"{OPENEVOLVE_60_INPUT_BYTES_PER_REQUEST})"
+            )
+        return await super()._call_api(params)
+
+
+def _build_bounded_openevolve_client(model_config: LLMModelConfig) -> OpenAILLM:
+    """Picklable OpenEvolve client factory used by spawned workers."""
+
+    return _BoundedOpenEvolveClient(model_config)
 
 
 def _run_controller_impl(kind: str, argv: Sequence[str] | None = None) -> None:
@@ -322,12 +361,40 @@ def _run_controller_impl(kind: str, argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--evaluation-cases", type=_positive_int)
     parser.add_argument("--device", choices=("cuda", "mps", "cpu"))
     parser.add_argument("--resume-checkpoint")
+    parser.add_argument(
+        "--modal-openevolve-60",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--modal-evolution-run",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
     args = parser.parse_args(argv)
     if args.resume_checkpoint:
         raise SystemExit(
             "Safe native-controller resume is not implemented; omit "
             "--resume-checkpoint and use a fresh output directory."
         )
+    if args.modal_openevolve_60 and (
+        kind != "generic"
+        or not args.engineering_pilot
+        or args.iterations != OPENEVOLVE_60_ITERATIONS
+        or args.seed != 1
+    ):
+        raise SystemExit(
+            "--modal-openevolve-60 requires generic OpenEvolve, seed 1, "
+            f"--engineering-pilot, and exactly {OPENEVOLVE_60_ITERATIONS} iterations"
+        )
+    if args.modal_evolution_run and (
+        not args.engineering_pilot or args.seed != 1
+    ):
+        raise SystemExit(
+            "--modal-evolution-run requires seed 1 and --engineering-pilot"
+        )
+    if args.modal_evolution_run and args.modal_openevolve_60:
+        raise SystemExit("Modal evolution modes are mutually exclusive")
 
     agent_dir = ROOT / "agents" / f"openevolve_{kind}"
     if kind not in {"generic", "semantic"} or not agent_dir.is_dir():
@@ -522,7 +589,11 @@ def _run_controller_impl(kind: str, argv: Sequence[str] | None = None) -> None:
             default_timeout_seconds=int(config.llm.timeout),
             default_retries=int(config.llm.retries),
             default_retry_delay_seconds=int(config.llm.retry_delay),
-            allow_environment_overrides=not training_profile.scientific,
+            allow_environment_overrides=(
+                not training_profile.scientific
+                and not args.modal_openevolve_60
+                and not args.modal_evolution_run
+            ),
         )
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc
@@ -531,7 +602,13 @@ def _run_controller_impl(kind: str, argv: Sequence[str] | None = None) -> None:
             "provider attempts are single-shot; retries and retry delay must be zero"
         )
     attempt_action = (
-        "one_opportunity_engineering_canary"
+        "evolution_run"
+        if args.modal_evolution_run
+        else OPENEVOLVE_60_ACTION.replace("-", "_")
+        if args.modal_openevolve_60
+        else "one_opportunity_engineering_canary"
+        if args.engineering_pilot and args.iterations == 1
+        else "engineering_pilot"
         if args.engineering_pilot
         else "scientific_replication"
     )
@@ -572,6 +649,7 @@ def _run_controller_impl(kind: str, argv: Sequence[str] | None = None) -> None:
         generation,
         api_base=provider_endpoint.base_url,
         api_key=str(api_key),
+        bounded_input=(args.modal_openevolve_60 or args.modal_evolution_run),
     )
     config.llm.models = [model_config]
     config.llm.evaluator_models = [model_config]
@@ -596,6 +674,12 @@ def _run_controller_impl(kind: str, argv: Sequence[str] | None = None) -> None:
         "candidate_training_budget": args.iterations + 1,
         "initial_program_is_evaluated": True,
         "engineering_pilot": args.engineering_pilot,
+        "modal_openevolve_60": args.modal_openevolve_60,
+        "provider_input_bytes_per_request_ceiling": (
+            OPENEVOLVE_60_INPUT_BYTES_PER_REQUEST
+            if args.modal_openevolve_60 or args.modal_evolution_run
+            else None
+        ),
         "candidate_format": "architecture_ir_json",
         "proposal_format": "strict_full_document_json",
         "generated_python_execution": False,
@@ -668,6 +752,8 @@ def _run_controller_impl(kind: str, argv: Sequence[str] | None = None) -> None:
         },
     }
     if training_profile.version == "2":
+        if args.modal_evolution_run:
+            run_manifest["modal_evolution_run"] = True
         run_manifest.update(
             {"schema_name": "ControllerRunManifest", "schema_version": "2.0"}
         )

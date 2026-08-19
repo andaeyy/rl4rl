@@ -147,7 +147,7 @@ def _fixture(tmp_path: Path) -> dict[str, Path]:
                     "timestamp": f"2026-08-09T00:00:{step:02d}+00:00",
                     "checkpoint_decision": (
                         "best_development"
-                        if step == SMOKE_TRAIN_CUDA_V2.max_steps
+                        if step % SMOKE_TRAIN_CUDA_V2.validation_interval == 0
                         else "none"
                     ),
                     "elapsed_seconds": float(step),
@@ -159,10 +159,16 @@ def _fixture(tmp_path: Path) -> dict[str, Path]:
                     "gradient_norm": 1.0,
                     "optimizer_step": step,
                     "validation_loss": (
-                        1.0 if step == SMOKE_TRAIN_CUDA_V2.max_steps else None
+                        2.0
+                        if step == SMOKE_TRAIN_CUDA_V2.validation_interval
+                        else 1.0
+                        if step == SMOKE_TRAIN_CUDA_V2.max_steps
+                        else None
                     ),
                     "validation_exact_match_accuracy": (
-                        0.0 if step == SMOKE_TRAIN_CUDA_V2.max_steps else None
+                        0.0
+                        if step % SMOKE_TRAIN_CUDA_V2.validation_interval == 0
+                        else None
                     ),
                     "current_accelerator_allocated_bytes": 2048,
                     "reserved_accelerator_allocated_bytes": 4096,

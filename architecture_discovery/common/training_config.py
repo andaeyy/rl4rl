@@ -125,6 +125,14 @@ class TrainingProfile:
                 raise ValueError(
                     "deterministic CUDA requires a supported CUBLAS workspace config"
                 )
+        if (
+            self.version == "2"
+            and self.checkpoint_interval < self.max_steps
+            and self.checkpoint_interval % self.validation_interval != 0
+        ):
+            raise ValueError(
+                "version-2 nonterminal checkpoints must coincide with validation"
+            )
 
 
 @dataclass(frozen=True)
@@ -321,7 +329,7 @@ SMOKE_TRAIN_CUDA_V2 = TrainingProfile(
     warmup_steps=2,
     scheduler="cosine_decay_to_zero",
     gradient_clip_norm=1.0,
-    validation_interval=10,
+    validation_interval=5,
     validation_examples=24,
     # The bounded Modal resume smoke retains the first nonterminal checkpoint
     # and must prove that a resumed optimizer advances beyond it.

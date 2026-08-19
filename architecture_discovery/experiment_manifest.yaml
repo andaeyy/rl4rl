@@ -79,6 +79,14 @@ remote_execution:
   current_scope: engineering_validation_only
   full_profile_action: not_exposed_pending_scientific_approval
   future_full_profile_requires_separate_resource_contract: true
+  configurable_evolution_action: evolve
+  configurable_evolution_command: ./evolve
+  configurable_evolution_scope: non_scientific_smoke_only
+  configurable_evolution_minimum_iterations: 1
+  configurable_evolution_maximum_iterations: 345
+  configurable_evolution_approval_plan_schema: EvolutionProviderApprovalPlan/1.0
+  bounded_openevolve_60_action: openevolve-generic-60
+  bounded_openevolve_60_scope: non_scientific_generic_smoke_only
   deployed_app: false
   detached_calls: false
   python: "3.12"
@@ -110,6 +118,9 @@ remote_execution:
   min_containers: 0
   retries: 0
   function_timeout_seconds: 300
+  openevolve_60_function_timeout_seconds: 15300
+  openevolve_60_controller_subprocess_timeout_seconds: 15000
+  openevolve_60_outer_cli_timeout_seconds: 16200
   controller_subprocess_timeout_seconds: 240
   provider_request_timeout_seconds: 180
   provider_attempt_finalization_reserve_seconds: 60
@@ -117,6 +128,10 @@ remote_execution:
   provider_canaries_sequential: true
   engineering_canary_maximum_provider_attempts_per_harness: 1
   four_harness_engineering_canary_maximum_provider_attempts: 4
+  openevolve_60_maximum_provider_attempts: 60
+  openevolve_60_input_bytes_per_request_ceiling: 1048576
+  openevolve_60_completion_tokens_per_request_ceiling: 16384
+  openevolve_60_approval_plan_schema: OpenEvolve60ProviderApprovalPlan/1.0
   provider_attempt_ledger_schema: ProviderAttemptRecord/1.0
   provider_canary_approval_plan_schema: ProviderCanaryApprovalPlan/1.2
   provider_canary_aggregate_outcome_schema: ProviderCanaryAggregateOutcomeReceipt/1.1
@@ -295,7 +310,7 @@ training:
 engineering_smoke:
   profile: smoke_train_cuda_v2
   profile_version: "2"
-  profile_hash: 2cd6ae5caae6704095290d5c9fb41e481e6535e279fe78a0c9fdf5befedca49e
+  profile_hash: 98855e288974c1d1d67055d74c7d7f0fe6c540d5330bc3b1d5cf5d9a2412f724
   scientific: false
   device: cuda
   max_optimizer_steps: 10
@@ -320,6 +335,58 @@ exploratory_modal_pilot:
   maximum_wall_seconds: 240
   modal_cost_cap_usd: "0.25"
   provider_cost_cap_usd: "0.25"
+  final_ranking_allowed: false
+
+openevolve_60_engineering_run:
+  mode: bounded_non_scientific_generic_smoke
+  action: openevolve-generic-60
+  harness: openevolve_generic
+  scientific: false
+  iterations: 60
+  seed: 1
+  provider_attempts_maximum: 60
+  provider_retries: 0
+  modal_retries: 0
+  modal_max_containers: 1
+  training_profile: smoke_train_cuda_v2
+  evaluation_profile: smoke_eval_v1
+  evaluation_cases: 24
+  device: cuda
+  function_timeout_seconds: 15300
+  controller_subprocess_timeout_seconds: 15000
+  outer_cli_timeout_seconds: 16200
+  input_bytes_per_request_ceiling: 1048576
+  completion_tokens_per_request_ceiling: 16384
+  preemption_restart_possible: true
+  resume_after_interruption: false
+  final_ranking_allowed: false
+
+configurable_evolution_run:
+  mode: bounded_non_scientific_smoke
+  action: evolve
+  command: ./evolve
+  harnesses:
+    - greedy_autoresearch
+    - semantic_autoresearch
+    - openevolve_generic
+    - openevolve_semantic
+  minimum_iterations: 1
+  maximum_iterations: 345
+  provider_attempts_per_iteration: 1
+  seed: 1
+  provider_retries: 0
+  modal_retries: 0
+  modal_max_containers: 1
+  training_profile: smoke_train_cuda_v2
+  evaluation_profile: smoke_eval_v1
+  evaluation_cases: 24
+  device: cuda
+  input_bytes_per_request_ceiling: 1048576
+  completion_tokens_per_request_ceiling: 16384
+  function_timeout_dynamic: true
+  modal_function_timeout_limit_seconds: 86400
+  preemption_restart_possible: true
+  resume_after_interruption: false
   final_ranking_allowed: false
 
 artifacts_and_reconstruction:

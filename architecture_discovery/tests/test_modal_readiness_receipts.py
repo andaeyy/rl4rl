@@ -6415,6 +6415,8 @@ def test_readme_paid_launcher_examples_match_the_approval_contract() -> None:
         assert "--approved" in command
         if "--action canaries" in command:
             assert "--outer-cli-timeout-seconds 2100" in command
+        elif "--action openevolve-generic-60" in command:
+            assert "--outer-cli-timeout-seconds 16200" in command
         else:
             assert "--outer-cli-timeout-seconds 1200" in command
         if "--action download" in command:

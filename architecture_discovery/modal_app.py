@@ -22,6 +22,11 @@ from contextlib import suppress
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+from common.evolution_run import (
+    EVOLUTION_ACTION,
+    EVOLUTION_FUNCTION_NAME,
+    EvolutionRunSpec,
+)
 from common.gpt56_sol import OFFICIAL_OPENAI_API_BASE, TARGET_MODEL
 from common.process_control import (
     OUTER_PROCESS_DEADLINE_ENV,
@@ -40,6 +45,7 @@ from modal_boundary import (
     CANARY_ORDER,
     CONTROLLER_SUBPROCESS_TIMEOUT_SECONDS,
     FUNCTION_SPECS,
+    FUNCTION_TIMEOUT_SECONDS,
     IMAGE_BUILD_COMMAND_TIMEOUT_SECONDS,
     IMAGE_BUILD_CPU_REQUEST_CORES,
     IMAGE_BUILD_MEMORY_REQUEST_MIB,
@@ -51,6 +57,11 @@ from modal_boundary import (
     MODAL_ACTION_ATTEMPT_ID_ENV,
     MODAL_ACTION_INTENT_SHA256_ENV,
     MODAL_VERSION,
+    OPENEVOLVE_60_ACTION,
+    OPENEVOLVE_60_CONTROLLER_TIMEOUT_SECONDS,
+    OPENEVOLVE_60_FUNCTION_NAME,
+    OPENEVOLVE_60_FUNCTION_TIMEOUT_SECONDS,
+    OPENEVOLVE_60_ITERATIONS,
     PROVIDER_SECRET_NAME,
     PYTHON_VERSION,
     REMOTE_PROJECT_ROOT,
@@ -127,7 +138,15 @@ PROVIDER_FREE_NETWORK_PROBE_FUNCTIONS = frozenset(
         "checkpoint_resume",
     }
 )
-PROVIDER_ACTIONS = frozenset({"canary", "canaries", "exploratory_c0c3_pilot"})
+PROVIDER_ACTIONS = frozenset(
+    {
+        "canary",
+        "canaries",
+        "exploratory_c0c3_pilot",
+        EVOLUTION_ACTION,
+        OPENEVOLVE_60_ACTION,
+    }
+)
 # Cloudflare's public anycast HTTPS address is intentionally routable.  A
 # documentation-only TEST-NET address could time out even when egress worked
 # and would therefore be incapable of distinguishing Modal's network block.
@@ -572,8 +591,9 @@ def _run_command(
     provider: bool,
     requested_device: str,
     timeout_seconds: int = CONTROLLER_SUBPROCESS_TIMEOUT_SECONDS,
+    function_timeout_seconds: int = FUNCTION_TIMEOUT_SECONDS,
 ) -> dict[str, Any]:
-    if timeout_seconds <= 0 or timeout_seconds >= 300:
+    if timeout_seconds <= 0 or timeout_seconds >= function_timeout_seconds:
         raise ValueError("subprocess timeout must remain inside the function timeout")
     with tempfile.TemporaryDirectory(prefix="modal-command-") as temporary:
         temporary_path = Path(temporary)
@@ -1438,6 +1458,26 @@ def _execute_new_run(
                     action_directory / "exploratory",
                     run_id=run_id,
                 )
+            elif function_name == OPENEVOLVE_60_FUNCTION_NAME:
+                from scripts.validate_openevolve_60 import (
+                    validate_private_openevolve_60_staging,
+                )
+
+                validate_private_openevolve_60_staging(
+                    action_directory / "controller",
+                    execution_context=context,
+                )
+            elif function_name == EVOLUTION_FUNCTION_NAME:
+                from scripts.validate_evolution_run import (
+                    validate_private_evolution_staging,
+                )
+
+                spec = EvolutionRunSpec.parse(result["evolution_spec"])
+                validate_private_evolution_staging(
+                    action_directory / "controller",
+                    spec=spec,
+                    execution_context=context,
+                )
             else:
                 raise RemoteActionError("provider action has no staging validator")
         _publish_staged_artifacts(
@@ -2028,9 +2068,11 @@ def _execute_staged_resume_attempt(
     source_partial: Path,
     source_candidate: Path,
     source_events: Path,
+    source_image_manifest: Path,
     partial_entry: Any,
     candidate_entry: Any,
     events_entry: Any,
+    image_manifest_entry: Any,
     partial_identity: dict[str, Any],
     seed: int,
     deadline: float,
@@ -2042,6 +2084,14 @@ def _execute_staged_resume_attempt(
     latest_checkpoint = training_directory / "latest_resume_checkpoint.pt"
     candidate = training_directory / "candidate_graph.json"
     events = training_directory / "training_events.jsonl"
+    image_manifest = run_directory / "image_source_manifest.json"
+    _copy_manifest_artifact(
+        source_image_manifest,
+        image_manifest,
+        expected_sha256=image_manifest_entry.sha256,
+        expected_size=image_manifest_entry.size_bytes,
+    )
+    image_manifest.chmod(0o444)
     _copy_manifest_artifact(
         source_partial,
         partial_checkpoint,
@@ -2195,6 +2245,10 @@ def _execute_staged_resume_attempt(
         requested_device="cuda",
         timeout_seconds=progression_timeout,
     )
+    # The staged copy exists only so the provider-free verifier can reconstruct
+    # the image identity.  The destination run already owns the same provenance
+    # artifact from _prepare_run, so do not publish a colliding duplicate.
+    image_manifest.unlink()
     return probe_result, training_result, progression_result
 
 
@@ -2275,6 +2329,10 @@ def _resume_action(
         source_manifest,
         "training_events.jsonl",
     )
+    image_manifest_entry = _manifest_artifact_named(
+        source_manifest,
+        "image_source_manifest.json",
+    )
     source_parents = {
         PurePosixPath(entry.relative_path).parent
         for entry in (partial_entry, candidate_entry, events_entry)
@@ -2285,6 +2343,7 @@ def _resume_action(
     source_partial = source_directory / partial_entry.relative_path
     source_candidate = source_directory / candidate_entry.relative_path
     source_events = source_directory / events_entry.relative_path
+    source_image_manifest = source_directory / image_manifest_entry.relative_path
     partial_identity = _validate_source_partial_checkpoint(
         source_partial,
         candidate_sha256=candidate_entry.sha256,
@@ -2295,7 +2354,9 @@ def _resume_action(
         prefix=f"rl4rl-resume-{run_id}-",
         ignore_cleanup_errors=True,
     )
-    action_directory = Path(action_staging.name) / "run"
+    # The progression verifier binds the staged artifact-root basename to the
+    # logical ExecutionContext run ID before these bytes are published.
+    action_directory = Path(action_staging.name) / run_id
     action_directory.mkdir(mode=0o700)
     if action_directory.resolve().is_relative_to(Path(VOLUME_MOUNT_PATH).resolve()):
         action_staging.cleanup()
@@ -2316,9 +2377,11 @@ def _resume_action(
             source_partial=source_partial,
             source_candidate=source_candidate,
             source_events=source_events,
+            source_image_manifest=source_image_manifest,
             partial_entry=partial_entry,
             candidate_entry=candidate_entry,
             events_entry=events_entry,
+            image_manifest_entry=image_manifest_entry,
             partial_identity=partial_identity,
             seed=seed,
             deadline=deadline,
@@ -2656,6 +2719,93 @@ def _exploratory_c0c3_pilot_action(
             context=context,
             provider=True,
             requested_device="cuda",
+        ),
+    }
+
+
+def _openevolve_generic_60_action(
+    run_directory: Path,
+    context: ExecutionContextV1,
+):
+    command = [
+        sys.executable,
+        "-m",
+        _CANARY_MODULES["openevolve_generic"],
+        "--iterations",
+        str(OPENEVOLVE_60_ITERATIONS),
+        "--seed",
+        "1",
+        "--output-dir",
+        str(run_directory / "controller"),
+        "--engineering-pilot",
+        "--training-profile",
+        CUDA_SMOKE_PROFILE,
+        "--evaluation-profile",
+        "smoke_eval_v1",
+        "--evaluation-cases",
+        "24",
+        "--device",
+        "cuda",
+        "--modal-openevolve-60",
+    ]
+    return {
+        "mode": "bounded_non_scientific_openevolve_60",
+        "harness": "openevolve_generic",
+        "iterations": OPENEVOLVE_60_ITERATIONS,
+        "training_profile": CUDA_SMOKE_PROFILE,
+        "scientific": False,
+        **_run_command(
+            command,
+            context=context,
+            provider=True,
+            requested_device="cuda",
+            timeout_seconds=OPENEVOLVE_60_CONTROLLER_TIMEOUT_SECONDS,
+            function_timeout_seconds=OPENEVOLVE_60_FUNCTION_TIMEOUT_SECONDS,
+        ),
+    }
+
+
+def _evolution_action(
+    run_directory: Path,
+    context: ExecutionContextV1,
+    *,
+    spec: EvolutionRunSpec,
+):
+    command = [
+        sys.executable,
+        "-m",
+        _CANARY_MODULES[spec.harness],
+        "--iterations",
+        str(spec.iterations),
+        "--seed",
+        "1",
+        "--output-dir",
+        str(run_directory / "controller"),
+        "--engineering-pilot",
+        "--training-profile",
+        CUDA_SMOKE_PROFILE,
+        "--evaluation-profile",
+        "smoke_eval_v1",
+        "--evaluation-cases",
+        "24",
+        "--device",
+        "cuda",
+        "--modal-evolution-run",
+    ]
+    return {
+        "mode": "bounded_non_scientific_evolution",
+        "evolution_spec": spec.token,
+        "harness": spec.harness,
+        "iterations": spec.iterations,
+        "training_profile": CUDA_SMOKE_PROFILE,
+        "scientific": False,
+        **_run_command(
+            command,
+            context=context,
+            provider=True,
+            requested_device="cuda",
+            timeout_seconds=spec.controller_timeout_seconds,
+            function_timeout_seconds=spec.function_timeout_seconds,
         ),
     }
 
@@ -3101,7 +3251,7 @@ def _function_options(name: str) -> dict[str, Any]:
     return options
 
 
-def _provider_variant(function):
+def _provider_variant(function, *, timeout_seconds: int | None = None):
     """Attach the provider Secret only when an approved provider action runs.
 
     Modal loads every statically registered Function dependency when starting an
@@ -3112,7 +3262,12 @@ def _provider_variant(function):
 
     if PROVIDER_SECRET is None:
         raise RemoteActionError("Modal is unavailable; provider canary cannot run")
-    return function.with_options(secrets=[PROVIDER_SECRET])
+    if timeout_seconds is None:
+        return function.with_options(secrets=[PROVIDER_SECRET])
+    return function.with_options(
+        secrets=[PROVIDER_SECRET],
+        timeout=timeout_seconds,
+    )
 
 
 if not _MODAL_OBJECTS_ENABLED:
@@ -3162,6 +3317,29 @@ else:
             "exploratory_c0c3_pilot",
             run_id,
             _exploratory_c0c3_pilot_action,
+            scan_provider_credential=True,
+        )
+
+    @app.function(**_function_options(OPENEVOLVE_60_FUNCTION_NAME))
+    def openevolve_generic_60(run_id: str) -> dict[str, Any]:
+        return _execute_new_run(
+            OPENEVOLVE_60_FUNCTION_NAME,
+            run_id,
+            _openevolve_generic_60_action,
+            scan_provider_credential=True,
+        )
+
+    @app.function(**_function_options(EVOLUTION_FUNCTION_NAME))
+    def evolution_run(run_id: str, evolution_spec: str) -> dict[str, Any]:
+        spec = EvolutionRunSpec.parse(evolution_spec)
+        return _execute_new_run(
+            EVOLUTION_FUNCTION_NAME,
+            run_id,
+            lambda directory, context: _evolution_action(
+                directory,
+                context,
+                spec=spec,
+            ),
             scan_provider_credential=True,
         )
 
@@ -3370,6 +3548,21 @@ else:
             result = invoke_synchronously(
                 _provider_variant(exploratory_c0c3_pilot),
                 run_id=selected_run_id,
+            )
+        elif action == OPENEVOLVE_60_ACTION:
+            result = invoke_synchronously(
+                _provider_variant(openevolve_generic_60),
+                run_id=selected_run_id,
+            )
+        elif action == EVOLUTION_ACTION:
+            spec = EvolutionRunSpec.parse(harness)
+            result = invoke_synchronously(
+                _provider_variant(
+                    evolution_run,
+                    timeout_seconds=spec.function_timeout_seconds,
+                ),
+                run_id=selected_run_id,
+                evolution_spec=spec.token,
             )
         elif action in _PROVIDER_CANARY_ACTIONS:
             functions = {

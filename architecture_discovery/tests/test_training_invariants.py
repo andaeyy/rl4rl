@@ -1,6 +1,8 @@
 import json
+from dataclasses import replace
 from pathlib import Path
 
+import pytest
 import yaml
 from common.evaluation_profiles import EvaluationLayer, resolve_evaluation_plan
 from common.public_evaluation import (
@@ -74,6 +76,24 @@ def test_historical_mps_profile_hashes_are_stable_and_cuda_is_versioned():
     assert FULL_TRAIN_CUDA_V2.device_requirement == "cuda"
     assert FULL_TRAIN_CUDA_V2.profile_hash != FULL_TRAIN_V1.profile_hash
     assert SMOKE_TRAIN_CUDA_V2.profile_hash != SMOKE_TRAIN_V1.profile_hash
+
+
+def test_v2_nonterminal_checkpoints_coincide_with_validation():
+    assert (
+        SMOKE_TRAIN_CUDA_V2.checkpoint_interval
+        % SMOKE_TRAIN_CUDA_V2.validation_interval
+        == 0
+    )
+    invalid = replace(
+        SMOKE_TRAIN_CUDA_V2,
+        validation_interval=10,
+        checkpoint_interval=5,
+    )
+    with pytest.raises(
+        ValueError,
+        match="nonterminal checkpoints must coincide with validation",
+    ):
+        invalid.validate()
 
 
 def test_v2_preflight_serializes_only_portable_logical_paths(tmp_path):

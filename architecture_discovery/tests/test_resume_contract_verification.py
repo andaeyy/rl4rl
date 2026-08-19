@@ -169,6 +169,10 @@ def _source_candidate_run(tmp_path: Path, modal_app, *, seed: int = 1):
         encoding="utf-8",
     )
     (source / "execution_context.json").write_text("{}\n", encoding="utf-8")
+    (source / "image_source_manifest.json").write_text(
+        '{"schema_name":"test-image-source"}\n',
+        encoding="utf-8",
+    )
     manifest = build_artifact_manifest(
         source,
         run_id=source_run_id,
@@ -349,6 +353,11 @@ def test_modal_resume_uses_fresh_attempt_and_leaves_source_immutable(
             assert [item["optimizer_step"] for item in prefix] == [1, 2, 3, 4, 5]
             _complete_fake_resume(command)
         elif script == "verify_resume_progression.py":
+            artifact_root = Path(command[command.index("--artifact-root") + 1])
+            assert artifact_root.name == kwargs["context"].run_id
+            assert (
+                artifact_root / "image_source_manifest.json"
+            ).read_bytes() == (source / "image_source_manifest.json").read_bytes()
             Path(command[command.index("--output") + 1]).write_text(
                 '{"schema_name":"ResumeProgressionEvidence"}\n',
                 encoding="utf-8",
@@ -386,6 +395,7 @@ def test_modal_resume_uses_fresh_attempt_and_leaves_source_immutable(
     assert verify_artifact_manifest(attempt, manifest)["verified"] is True
     artifact_paths = {item.relative_path for item in manifest.files}
     assert {
+        "image_source_manifest.json",
         "resume_contract_verification.json",
         "resume_progression_verification.json",
         "resume_source_binding.json",

@@ -23,6 +23,11 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Literal
 
 from common.gpt56_sol import OFFICIAL_OPENAI_API_BASE, TARGET_MODEL
+from common.evolution_run import (
+    EVOLUTION_ACTION,
+    EVOLUTION_FUNCTION_NAME,
+    EvolutionRunSpec,
+)
 from common.modal_action_lock import (
     assert_modal_action_lock_identity,
     held_modal_action_lock_project_root,
@@ -33,8 +38,6 @@ from modal_boundary import (
     APP_NAME,
     ARTIFACT_MANIFEST_FILENAMES,
     CANARY_ORDER,
-    FUNCTION_SPECS,
-    FUNCTION_TIMEOUT_SECONDS,
     IMAGE_BUILD_COMMAND_TIMEOUT_SECONDS,
     IMAGE_BUILD_CPU_REQUEST_CORES,
     IMAGE_BUILD_MEMORY_REQUEST_MIB,
@@ -49,6 +52,7 @@ from modal_boundary import (
     MODAL_LOCAL_PROCESS_START_ROOT,
     MODAL_REMOTE_RUN_RESERVATION_ROOT,
     MODAL_VERSION,
+    OPENEVOLVE_60_ACTION,
     VOLUME_NAME,
     ArtifactIntegrityError,
     ArtifactVerificationV1,
@@ -76,6 +80,7 @@ from modal_boundary import (
     validate_provider_canary_aggregate_outcome_receipt,
     validate_run_id,
     volume_artifact_uri,
+    function_spec,
 )
 
 _ATTEMPT_ID = re.compile(r"\A[0-9a-f]{32}\Z")
@@ -679,7 +684,18 @@ _ORDINARY_ACTION_FUNCTIONS = {
     "offline-smoke": "offline_smoke",
     "candidate-smoke": "candidate_smoke",
     "checkpoint-resume": "checkpoint_resume",
+    OPENEVOLVE_60_ACTION: "openevolve_generic_60",
+    EVOLUTION_ACTION: EVOLUTION_FUNCTION_NAME,
 }
+_PROVIDER_ACTIONS = frozenset(
+    {
+        "canary",
+        "canaries",
+        "exploratory_c0c3_pilot",
+        OPENEVOLVE_60_ACTION,
+        EVOLUTION_ACTION,
+    }
+)
 _LINEAGE_PROVIDER_SPEND_FIELDS = frozenset(
     {
         "accounting_label",
@@ -1328,13 +1344,29 @@ def expected_modal_concrete_run_ids(
     return (selected,)
 
 
-def _expected_outer_cli_timeout_seconds(action: str) -> int:
+def _expected_outer_cli_timeout_seconds(
+    action: str, harness: str | None = None
+) -> int:
     if action not in MODAL_ACTIONS:
         raise ModalActionJournalIntegrityError("Modal action is unsupported")
-    remote_call_count = len(CANARY_ORDER) if action == "canaries" else 1
+    if action == EVOLUTION_ACTION:
+        return EvolutionRunSpec.parse(harness).outer_cli_timeout_seconds
+    if action == "canaries":
+        runtime_seconds = sum(
+            function_spec(f"canary_{harness}").timeout_seconds
+            for harness in CANARY_ORDER
+        )
+    elif action == "canary":
+        runtime_seconds = function_spec(
+            f"canary_{CANARY_ORDER[0]}"
+        ).timeout_seconds
+    elif action in {"download", "verify"}:
+        runtime_seconds = function_spec("artifact_verify").timeout_seconds
+    else:
+        runtime_seconds = function_spec(action.replace("-", "_")).timeout_seconds
     return (
         IMAGE_BUILD_COMMAND_TIMEOUT_SECONDS
-        + remote_call_count * FUNCTION_TIMEOUT_SECONDS
+        + runtime_seconds
         + _MODAL_CLI_ORCHESTRATION_RESERVE_SECONDS
     )
 
@@ -1343,7 +1375,12 @@ def _expected_modal_resource_profile(
     action: str,
     harness: str | None,
 ) -> dict[str, Any]:
-    if action == "canaries":
+    dynamic_timeout: int | None = None
+    if action == EVOLUTION_ACTION:
+        evolution = EvolutionRunSpec.parse(harness)
+        function_names = [EVOLUTION_FUNCTION_NAME]
+        dynamic_timeout = evolution.function_timeout_seconds
+    elif action == "canaries":
         function_names = [f"canary_{item}" for item in CANARY_ORDER]
     elif action == "canary":
         if harness not in CANARY_ORDER:
@@ -1357,7 +1394,7 @@ def _expected_modal_resource_profile(
         function_names = [action.replace("-", "_")]
     runtime_calls: list[dict[str, Any]] = []
     try:
-        specs = [FUNCTION_SPECS[name] for name in function_names]
+        specs = [function_spec(name) for name in function_names]
     except KeyError as error:  # pragma: no cover - frozen action/spec parity
         raise ModalActionJournalIntegrityError(
             "Modal resource profile function is unsupported"
@@ -1373,7 +1410,7 @@ def _expected_modal_resource_profile(
                 "memory_limit_mib": spec.memory_limit_mib,
                 "gpu": spec.gpu,
                 "region": spec.region,
-                "timeout_seconds": spec.timeout_seconds,
+                "timeout_seconds": dynamic_timeout or spec.timeout_seconds,
                 "max_containers": spec.max_containers,
                 "min_containers": spec.min_containers,
                 "retries": spec.retries,
@@ -1448,6 +1485,9 @@ def _expected_predecessor_gate_roster(
         "checkpoint-resume": ("modal_artifact_round_trip_validated",),
         "canary": ("candidate_resume_preflight_validated",),
         "canaries": ("candidate_resume_preflight_validated",),
+        "exploratory_c0c3_pilot": ("candidate_resume_preflight_validated",),
+        OPENEVOLVE_60_ACTION: ("candidate_resume_preflight_validated",),
+        EVOLUTION_ACTION: ("candidate_resume_preflight_validated",),
     }
     if action in {"download", "verify"}:
         source_gates = (
@@ -1473,7 +1513,7 @@ def _validate_approved_action_contract(
     field: str,
 ) -> None:
     if payload["outer_cli_timeout_seconds"] != _expected_outer_cli_timeout_seconds(
-        action
+        action, harness
     ):
         raise ModalActionJournalIntegrityError(
             f"{field} timeout differs from its action"
@@ -1502,7 +1542,7 @@ def _validate_approved_action_contract(
         raise ModalActionJournalIntegrityError(
             f"{field} lacks sufficient Modal cost approval"
         )
-    provider_action = action in {"canary", "canaries"}
+    provider_action = action in _PROVIDER_ACTIONS
     if payload["provider_cost_approved"] is not provider_action:
         raise ModalActionJournalIntegrityError(
             f"{field} provider approval differs from its action"
@@ -1793,7 +1833,7 @@ def _validate_action_intent_core(
         raise ModalActionJournalIntegrityError(
             "intent Modal price-basis path is invalid"
         ) from error
-    provider_action = action in {"canary", "canaries"}
+    provider_action = action in _PROVIDER_ACTIONS
     provider_fields = (
         "provider_cost_cap_usd",
         "provider_approval_plan_path",
@@ -2320,7 +2360,7 @@ def _validate_process_marker_core(
             "process marker Modal cost cap is invalid"
         )
     provider_cap = payload["provider_cost_cap_usd"]
-    if (payload["action"] in {"canary", "canaries"}) is not (
+    if (payload["action"] in _PROVIDER_ACTIONS) is not (
         isinstance(provider_cap, str)
     ):
         raise ModalActionJournalIntegrityError(
@@ -5706,7 +5746,7 @@ def _expected_recovery_provider_exposure(
     cache: dict[str, tuple[bytes, ModalJournalFileBinding]],
 ) -> dict[str, Any]:
     owner = _recovery_attempt_owner_payload(attempt)
-    provider_action = owner["action"] in {"canary", "canaries"}
+    provider_action = owner["action"] in _PROVIDER_ACTIONS
     approved_bound = owner.get("provider_cost_cap_usd") if provider_action else None
     if approved_bound is not None:
         _positive_decimal_text(
@@ -5761,16 +5801,43 @@ def _expected_recovery_provider_exposure(
             raw,
             field=f"recovery provider ledger {run_id}",
         )
-        harness = _recovery_harness_for_run(owner, run_id)
+        evolution = (
+            EvolutionRunSpec.parse(owner.get("harness"))
+            if owner["action"] == EVOLUTION_ACTION
+            else None
+        )
+        harness = (
+            evolution.harness
+            if evolution is not None
+            else (
+                "openevolve_generic"
+                if owner["action"] == OPENEVOLVE_60_ACTION
+                else _recovery_harness_for_run(owner, run_id)
+            )
+        )
+        maximum_attempts = (
+            evolution.iterations
+            if evolution is not None
+            else 60 if owner["action"] == OPENEVOLVE_60_ACTION else 1
+        )
+        expected_ledger_action = (
+            "evolution_run"
+            if evolution is not None
+            else (
+                OPENEVOLVE_60_ACTION.replace("-", "_")
+                if owner["action"] == OPENEVOLVE_60_ACTION
+                else "one_opportunity_engineering_canary"
+            )
+        )
         if (
-            len(records) > 1
+            len(records) > maximum_attempts
             or [record.attempt_ordinal for record in records]
             != list(range(1, len(records) + 1))
             or any(
                 record.execution_backend != "modal"
                 or record.action_run_id != run_id
                 or record.harness != harness
-                or record.action != "one_opportunity_engineering_canary"
+                or record.action != expected_ledger_action
                 for record in records
             )
         ):
@@ -5799,8 +5866,22 @@ def _expected_recovery_provider_exposure(
     output_tokens = sum(record.output_tokens or 0 for record in records)
     fully_bound = (
         set(records_by_run) == set(concrete_run_ids)
-        and all(len(records_by_run[run_id]) == 1 for run_id in concrete_run_ids)
-        and attempt_count == len(concrete_run_ids)
+        and all(
+            len(records_by_run[run_id])
+            == (
+                EvolutionRunSpec.parse(owner.get("harness")).iterations
+                if owner["action"] == EVOLUTION_ACTION
+                else 60 if owner["action"] == OPENEVOLVE_60_ACTION else 1
+            )
+            for run_id in concrete_run_ids
+        )
+        and attempt_count
+        == len(concrete_run_ids)
+        * (
+            EvolutionRunSpec.parse(owner.get("harness")).iterations
+            if owner["action"] == EVOLUTION_ACTION
+            else 60 if owner["action"] == OPENEVOLVE_60_ACTION else 1
+        )
         and success_count == attempt_count
         and usage_known_count == attempt_count
     )

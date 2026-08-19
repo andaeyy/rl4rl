@@ -51,6 +51,132 @@ do not expose `full_train_cuda_v2`. A future full-profile entrypoint requires
 resolved scientific gates, a separate resource/timeout contract, and separate
 operator approval.
 
+### Convenient autoresearch and OpenEvolve runs
+
+Use the top-level `evolve` command for configurable engineering runs. Planning
+is cost-free and is the default:
+
+```bash
+./evolve openevolve -n 60
+./evolve autoresearch -n 12
+./evolve semantic-openevolve -n 40
+./evolve semantic-autoresearch -n 8
+```
+
+The command accepts 1–345 iterations. The upper bound is the largest single
+run whose dynamically calculated Function timeout fits Modal's 24-hour limit.
+It fixes seed 1, `smoke_train_cuda_v2`, `smoke_eval_v1`, 24 cases, one T4,
+zero retries, one provider request per iteration, and non-scientific status.
+The printed plan includes the exact request and timeout ceilings and starts no
+paid work.
+
+To launch, repeat the command with explicit Modal and provider dollar caps:
+
+```bash
+./evolve openevolve -n 60 \
+  --modal-cost-cap-usd "$APPROVED_MODAL_ACTION_CAP_USD" \
+  --provider-cost-cap-usd "$APPROVED_PROVIDER_ACTION_CAP_USD" \
+  --execute
+```
+
+To approve the exact source-bound estimates automatically instead of entering
+the two values manually:
+
+```bash
+./evolve openevolve -n 60 --execute --accept-estimated-cost
+```
+
+On macOS, use `caffeinate` for an attached paid run so the machine does not
+sleep while the local Modal client is supervising the remote Function:
+
+```bash
+LANG=en_US.UTF-8 LC_ALL=C \
+  caffeinate -dimsu ./evolve openevolve -n 60 \
+  --execute --accept-estimated-cost
+```
+
+Keep that Terminal open and maintain a stable network connection until the
+command finishes. `caffeinate` prevents macOS sleep; it cannot prevent a Wi-Fi,
+VPN, or DNS interruption. This command starts a fresh run and does not resume a
+previous OpenEvolve checkpoint.
+
+This is still a local approval bound, not a platform-enforced billing limit.
+The command prints both approved estimates before delegating to the launcher.
+
+`evolve` automatically uses `.venv`, selects the sole ready cohort for the
+current frozen source, validates the current preflight and price bases, creates
+or reuses the immutable source-bound approval plan, and delegates to the paid
+launcher. Pass `--cohort-id` when more than one current cohort is ready and
+`--run-id` when a specific run identity is desired. Direct `modal run` remains
+unsupported because it bypasses these approval and journal checks.
+
+The command works on teammate Macs after each teammate completes the bootstrap
+above, authenticates a Modal profile that can use the `scalingintelligence`
+workspace and `main` environment, and creates the current local engineering
+freeze and live-cohort readiness evidence described below. Those receipts are
+bound to the source, executable environment, and local machine; do not copy
+another teammate's `outputs/readiness` directory. The shared provider Secret
+must also exist in the authorized Modal workspace before a provider-backed run.
+
+### Legacy bounded 60-iteration OpenEvolve run
+
+The dedicated `openevolve-generic-60` compatibility action runs exactly 60
+generic OpenEvolve iterations at seed 1 on one T4 container. It uses
+`smoke_train_cuda_v2`, `smoke_eval_v1`, 24 evaluation cases, zero provider and
+Modal retries, and at most 60 provider requests. It is an engineering smoke run,
+not scientific evidence or a final ranking. It does not resume after an
+interruption; a platform preemption can still restart the one logical Modal
+call, so the committed run lease prevents silently repeating the run ID.
+
+The action has a separate 15,300-second Function timeout, a 15,000-second
+controller timeout, and a 16,200-second local launcher timeout. Every provider
+request is rejected before transport if its canonical JSON encoding exceeds
+1,048,576 UTF-8 bytes. Each request retains the existing 16,384 completion-token
+limit. These are conservative approval ceilings, not expected usage.
+
+After creating the current source/image freeze and accepted candidate-resume
+preflight receipt, create the source-bound, create-only provider plan without
+reading the provider secret:
+
+```bash
+.venv/bin/python scripts/openevolve_60_plan.py \
+  --source-tree-sha256 "$SOURCE_TREE_SHA256" \
+  --cohort-id "$COHORT_ID" \
+  --candidate-resume-preflight-receipt-path "$PREFLIGHT_PATH" \
+  --candidate-resume-preflight-receipt-sha256 "$PREFLIGHT_SHA256" \
+  --output outputs/readiness/openevolve_60_provider_approval_plan.json
+```
+
+Review that plan and current Modal/provider price bases before obtaining explicit
+cost approval. The only accepted launch shape is:
+
+```bash
+.venv/bin/python scripts/launch_modal.py \
+  --action openevolve-generic-60 \
+  --run-id "$RUN_ID" \
+  --cohort-id "$COHORT_ID" \
+  --expected-image-source-sha256 "$APPROVED_IMAGE_SOURCE_SHA256" \
+  --outer-cli-timeout-seconds 16200 \
+  --modal-cost-cap-usd "$APPROVED_MODAL_ACTION_CAP_USD" \
+  --modal-price-basis-path "$MODAL_PRICE_BASIS_PATH" \
+  --modal-price-basis-sha256 "$MODAL_PRICE_BASIS_SHA256" \
+  --provider-approved \
+  --provider-cost-cap-usd "$APPROVED_PROVIDER_ACTION_CAP_USD" \
+  --provider-approval-plan-path outputs/readiness/openevolve_60_provider_approval_plan.json \
+  --approval-plan-sha256 "$OPENEVOLVE_60_PLAN_SHA256" \
+  --provider-price-basis-path "$PROVIDER_PRICE_BASIS_PATH" \
+  --provider-price-basis-sha256 "$PROVIDER_PRICE_BASIS_SHA256" \
+  --candidate-resume-preflight-receipt-path "$PREFLIGHT_PATH" \
+  --candidate-resume-preflight-receipt-sha256 "$PREFLIGHT_SHA256" \
+  --approved
+```
+
+Do not replace this with a direct `modal run`. The launcher validates the frozen
+source, image, predecessor receipt, request ceilings, prices, cost caps, and
+global action journal before it exposes the provider secret. Successful output
+is privately validated for all 60 terminal iterations before publication to the
+artifact Volume.
+
 ### What to run next: bounded exploratory Modal pilot
 
 The repository now includes a separate `exploratory_non_scientific` lane. It
@@ -643,12 +769,14 @@ the client is interrupted, remote execution is treated as possibly started;
 inspect and stop only the exact migration App, preserve the terminal receipt,
 and obtain a new approval before another attempt.
 
-All runtime actions use `max_containers=1`, `min_containers=0`, `retries=0`, and
-a 300-second Function timeout. The aggregate runs four logical calls
-sequentially. Neither logical call counts nor local deadlines cap the number of
-container attempts that platform preemption may cause. JSON resource/billing
-snapshots and local receipt recorders start no Function, although ongoing
-Volume storage can still accrue.
+All runtime actions use `max_containers=1`, `min_containers=0`, and `retries=0`.
+The readiness actions retain their 300-second Function timeout; the separate
+`openevolve-generic-60` action uses the explicitly disclosed 15,300-second
+timeout above. The canary aggregate runs four logical calls sequentially.
+Neither logical call counts nor local deadlines cap the number of container
+attempts that platform preemption may cause. JSON resource/billing snapshots
+and local receipt recorders start no Function, although ongoing Volume storage
+can still accrue.
 
 Create the Modal rate snapshot locally after reviewing the official pricing
 page and within 48 hours of the paid launch. This command performs no lookup and

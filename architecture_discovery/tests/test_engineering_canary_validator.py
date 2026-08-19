@@ -473,15 +473,21 @@ def _synthetic_cuda_smoke(project: Path, tmp_path: Path) -> Path:
                     "loss": 1.0 / step,
                     "learning_rate": 0.001,
                     "gradient_norm": 1.0,
-                    "validation_loss": 1.0 if step == 10 else None,
-                    "validation_exact_match_accuracy": 0.0 if step == 10 else None,
+                    "validation_loss": (
+                        2.0 if step == 5 else 1.0 if step == 10 else None
+                    ),
+                    "validation_exact_match_accuracy": (
+                        0.0 if step in {5, 10} else None
+                    ),
                     "elapsed_seconds": float(step),
                     "current_accelerator_allocated_bytes": 1024,
                     "reserved_accelerator_allocated_bytes": 2048,
                     "peak_accelerator_allocated_bytes": 1536,
                     "accelerator_total_memory_bytes": 16_000_000_000,
                     "checkpoint_decision": (
-                        "best_development" if step == 10 else "none"
+                        "best_development"
+                        if step in {5, 10}
+                        else "none"
                     ),
                 },
                 sort_keys=True,

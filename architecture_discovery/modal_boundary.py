@@ -23,6 +23,11 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path, PurePosixPath
 from typing import Any, ClassVar, Protocol
 
+from common.evolution_run import (
+    EVOLUTION_ACTION,
+    EVOLUTION_FUNCTION_NAME,
+    EvolutionRunSpec,
+)
 from common.runtime_context import ExecutionContextV1
 
 APP_NAME = "rl4rl-architecture-discovery"
@@ -54,6 +59,20 @@ MAX_CONTAINERS = 1
 MIN_CONTAINERS = 0
 FUNCTION_RETRIES = 0
 GPU_TYPE = "T4"
+OPENEVOLVE_60_ACTION = "openevolve-generic-60"
+OPENEVOLVE_60_FUNCTION_NAME = "openevolve_generic_60"
+OPENEVOLVE_60_ITERATIONS = 60
+# Sixty sequential opportunities each reserve one 180-second provider request
+# and one 60-second smoke evaluation.  The initial seed consumes one additional
+# smoke evaluation.  The controller gets nine minutes beyond that 14,460-second
+# mechanical ceiling; the Modal Function retains a separate five-minute
+# publication/finalization reserve.
+OPENEVOLVE_60_CONTROLLER_TIMEOUT_SECONDS = 15_000
+OPENEVOLVE_60_FUNCTION_TIMEOUT_SECONDS = 15_300
+# The guarded client rejects a request before provider I/O when the canonical
+# UTF-8 request body exceeds this size.  At most one tokenizer token can be
+# charged per input byte, so the same value is a conservative token ceiling.
+OPENEVOLVE_60_INPUT_BYTES_PER_REQUEST = 1_048_576
 CANARY_ORDER = (
     "greedy_autoresearch",
     "semantic_autoresearch",
@@ -68,6 +87,8 @@ MODAL_ACTIONS = frozenset(
         "checkpoint-resume",
         "cuda-environment",
         "exploratory_c0c3_pilot",
+        EVOLUTION_ACTION,
+        OPENEVOLVE_60_ACTION,
         "download",
         "offline-smoke",
         "verify",
@@ -287,8 +308,13 @@ class FunctionSpec:
             )
         if self.region is not None:
             raise ValueError("Modal Functions must retain base-rate region selection")
-        if self.timeout_seconds != 300:
-            raise ValueError("Modal functions must retain the five-minute timeout")
+        expected_timeout = (
+            OPENEVOLVE_60_FUNCTION_TIMEOUT_SECONDS
+            if self.name == OPENEVOLVE_60_FUNCTION_NAME
+            else FUNCTION_TIMEOUT_SECONDS
+        )
+        if self.timeout_seconds != expected_timeout:
+            raise ValueError("Modal function timeout differs from its frozen action")
         if (self.max_containers, self.min_containers, self.retries) != (1, 0, 0):
             raise ValueError("Modal concurrency and retry ceilings are frozen")
         if self.volume_mount_path != str(VOLUME_MOUNT_PATH):
@@ -321,11 +347,26 @@ FUNCTION_SPECS: Mapping[str, FunctionSpec] = {
 EXPLORATORY_FUNCTION_SPEC = FunctionSpec(
     "exploratory_c0c3_pilot", GPU_TYPE, True
 )
+OPENEVOLVE_60_FUNCTION_SPEC = FunctionSpec(
+    OPENEVOLVE_60_FUNCTION_NAME,
+    GPU_TYPE,
+    True,
+    timeout_seconds=OPENEVOLVE_60_FUNCTION_TIMEOUT_SECONDS,
+)
+EVOLUTION_FUNCTION_SPEC = FunctionSpec(
+    EVOLUTION_FUNCTION_NAME,
+    GPU_TYPE,
+    True,
+)
 
 
 def function_spec(name: str) -> FunctionSpec:
     if name == EXPLORATORY_FUNCTION_SPEC.name:
         return EXPLORATORY_FUNCTION_SPEC
+    if name == OPENEVOLVE_60_FUNCTION_SPEC.name:
+        return OPENEVOLVE_60_FUNCTION_SPEC
+    if name == EVOLUTION_FUNCTION_SPEC.name:
+        return EVOLUTION_FUNCTION_SPEC
     return FUNCTION_SPECS[name]
 
 
@@ -609,10 +650,13 @@ def validate_modal_action_identity(
     selected_verifier = (
         validate_run_id(verifier_run_id) if verifier_run_id is not None else None
     )
-    if harness is not None and (
-        not isinstance(harness, str) or harness not in CANARY_ORDER
-    ):
-        raise ValueError("Modal CLI harness is unsupported")
+    if harness is not None:
+        if not isinstance(harness, str):
+            raise ValueError("Modal CLI harness is unsupported")
+        if action == EVOLUTION_ACTION:
+            EvolutionRunSpec.parse(harness)
+        elif harness not in CANARY_ORDER:
+            raise ValueError("Modal CLI harness is unsupported")
     selected_harness = harness
 
     if action == "checkpoint-resume":
@@ -649,6 +693,13 @@ def validate_modal_action_identity(
             raise ValueError(
                 "single-canary run ID lacks its exact harness-specific suffix"
             )
+    elif action == EVOLUTION_ACTION:
+        if (
+            selected_harness is None
+            or selected_source is not None
+            or selected_verifier is not None
+        ):
+            raise ValueError("evolution Modal CLI identity is incomplete")
     elif any(
         value is not None
         for value in (selected_source, selected_verifier, selected_harness)
@@ -708,7 +759,14 @@ def build_modal_cli_command(
     if type(provider_approved) is not bool:
         raise TypeError("Modal CLI provider approval must be boolean")
     if provider_approved is not (
-        action in {"canary", "canaries", "exploratory_c0c3_pilot"}
+        action
+        in {
+            "canary",
+            "canaries",
+            "exploratory_c0c3_pilot",
+            EVOLUTION_ACTION,
+            OPENEVOLVE_60_ACTION,
+        }
     ):
         raise ValueError("Modal CLI provider approval differs from its action")
 

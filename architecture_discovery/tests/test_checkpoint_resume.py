@@ -258,14 +258,15 @@ def test_v2_training_retains_one_nonterminal_resume_checkpoint(tmp_path) -> None
     profile = replace(
         SMOKE_TRAIN_CUDA_V2,
         max_steps=2,
-        validation_interval=2,
+        validation_interval=1,
         checkpoint_interval=1,
     )
+    seeds = TrainingSeedBundle.from_run_seed(73)
     result = train_candidate_in_process(
         candidate_path=ROOT / "common" / "initial_candidate.ir.json",
         output_dir=tmp_path,
         profile=profile,
-        seeds=TrainingSeedBundle.from_run_seed(73),
+        seeds=seeds,
         requested_device="cpu",
         allow_cpu_for_tests=True,
     )
@@ -284,6 +285,13 @@ def test_v2_training_retains_one_nonterminal_resume_checkpoint(tmp_path) -> None
     assert partial["global_step"] == 1
     assert latest["global_step"] == 2
     assert partial["examples_processed"] < latest["examples_processed"]
+    _validate_resume(
+        partial,
+        candidate_hash=result.candidate_source_hash,
+        profile=profile,
+        task=DEFAULT_TASK,
+        seeds=seeds,
+    )
 
 
 def test_rng_state_digest_normalizes_tuples_and_hashes_tensor_bytes() -> None:

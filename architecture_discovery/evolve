@@ -1,0 +1,411 @@
+#!/usr/bin/env python3
+"""Plan or launch one bounded autoresearch/OpenEvolve run on Modal."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import sys
+from datetime import UTC, datetime
+from decimal import Decimal
+from pathlib import Path
+from typing import Any
+
+ROOT = Path(__file__).resolve().parent
+VENV_PYTHON = ROOT / ".venv" / "bin" / "python"
+if (
+    VENV_PYTHON.is_file()
+    and Path(sys.executable).resolve() != VENV_PYTHON.resolve()
+):
+    os.execv(
+        VENV_PYTHON,
+        [str(VENV_PYTHON), str(Path(__file__).resolve()), *sys.argv[1:]],
+    )
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from common.evolution_run import (  # noqa: E402
+    EVOLUTION_ACTION,
+    EVOLUTION_COMPLETION_TOKENS_PER_REQUEST,
+    EVOLUTION_ENGINE_ALIASES,
+    EVOLUTION_INPUT_BYTES_PER_REQUEST,
+    EVOLUTION_MAX_ITERATIONS,
+    EvolutionRunSpec,
+)
+from modal_boundary import (  # noqa: E402
+    ModalLiveCohortIdentity,
+    modal_live_cohort_root,
+    validate_run_id,
+)
+from scripts import launch_modal  # noqa: E402
+from scripts import record_modal_readiness as readiness  # noqa: E402
+from scripts.evolution_plan import (  # noqa: E402
+    build_evolution_approval_plan,
+    verify_evolution_approval_plan,
+)
+from scripts.record_local_engineering_evidence import (  # noqa: E402
+    validate_local_engineering_freeze_receipt,
+)
+from study.serialization import create_json_exclusive  # noqa: E402
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Plan or launch a source-bound engineering evolution run on Modal. "
+            "Planning is the default; --execute starts paid work."
+        )
+    )
+    parser.add_argument(
+        "engine",
+        choices=tuple(EVOLUTION_ENGINE_ALIASES),
+        help="evolution controller to run",
+    )
+    parser.add_argument(
+        "-n",
+        "--iterations",
+        required=True,
+        type=int,
+        help=f"number of evolution opportunities (1-{EVOLUTION_MAX_ITERATIONS})",
+    )
+    parser.add_argument("--run-id", default="")
+    parser.add_argument(
+        "--cohort-id",
+        default="",
+        help="live Modal cohort; auto-selected when exactly one is ready",
+    )
+    parser.add_argument("--modal-cost-cap-usd", default="")
+    parser.add_argument("--provider-cost-cap-usd", default="")
+    parser.add_argument(
+        "--accept-estimated-cost",
+        action="store_true",
+        help=(
+            "approve the exact source-bound Modal and provider estimates "
+            "instead of supplying caps manually"
+        ),
+    )
+    parser.add_argument(
+        "--execute",
+        action="store_true",
+        help="create the immutable approval plan and start the paid Modal run",
+    )
+    return parser
+
+
+def _sha256_file(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _default_run_id(spec: EvolutionRunSpec) -> str:
+    stamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
+    engine = next(
+        alias
+        for alias, harness in EVOLUTION_ENGINE_ALIASES.items()
+        if harness == spec.harness
+    )
+    return validate_run_id(f"{engine}-n{spec.iterations}-{stamp}")
+
+
+def _plan_summary(spec: EvolutionRunSpec, run_id: str) -> dict[str, Any]:
+    return {
+        "action": EVOLUTION_ACTION,
+        "engine": spec.harness,
+        "evolution_spec": spec.token,
+        "iterations": spec.iterations,
+        "run_id": run_id,
+        "paid_work_started": False,
+        "provider_request_ceiling": spec.iterations,
+        "provider_input_bytes_per_request_ceiling": (
+            EVOLUTION_INPUT_BYTES_PER_REQUEST
+        ),
+        "provider_completion_token_ceiling": (
+            spec.iterations * EVOLUTION_COMPLETION_TOKENS_PER_REQUEST
+        ),
+        "controller_timeout_seconds": spec.controller_timeout_seconds,
+        "modal_function_timeout_seconds": spec.function_timeout_seconds,
+        "outer_cli_timeout_seconds": spec.outer_cli_timeout_seconds,
+        "execute_hint": (
+            "repeat with --execute plus --modal-cost-cap-usd and "
+            "--provider-cost-cap-usd"
+        ),
+    }
+
+
+def _candidate_preflight(root: Path, identity: ModalLiveCohortIdentity) -> Path:
+    logical_parent = (
+        modal_live_cohort_root(identity)
+        / "components"
+        / "candidate_resume_preflight_receipts"
+        / "v2.0"
+    )
+    parent = root.joinpath(*logical_parent.parts)
+    candidates = sorted(parent.glob("*.json")) if parent.is_dir() else []
+    valid: list[Path] = []
+    for candidate in candidates:
+        try:
+            readiness.validate_candidate_resume_preflight_receipt(
+                candidate, root=root
+            )
+        except (OSError, TypeError, ValueError):
+            continue
+        valid.append(candidate)
+    if len(valid) != 1:
+        raise ValueError(
+            f"cohort {identity.cohort_id} must have exactly one current "
+            f"candidate-resume preflight receipt; found {len(valid)}"
+        )
+    return valid[0]
+
+
+def _select_identity(
+    root: Path,
+    *,
+    source_tree_sha256: str,
+    image_source_sha256: str,
+    cohort_id: str,
+) -> tuple[ModalLiveCohortIdentity, Path]:
+    prefix = (
+        root
+        / "outputs"
+        / "readiness"
+        / "modal_only_final"
+        / "modal_live_cohorts"
+        / source_tree_sha256
+        / image_source_sha256
+    )
+    cohort_ids = [cohort_id] if cohort_id else (
+        sorted(path.name for path in prefix.iterdir() if path.is_dir())
+        if prefix.is_dir()
+        else []
+    )
+    ready: list[tuple[ModalLiveCohortIdentity, Path]] = []
+    for selected in cohort_ids:
+        try:
+            identity = ModalLiveCohortIdentity(
+                source_tree_sha256=source_tree_sha256,
+                image_source_sha256=image_source_sha256,
+                cohort_id=validate_run_id(selected),
+            )
+            preflight = _candidate_preflight(root, identity)
+            provider_basis = root.joinpath(
+                *readiness.modal_provider_price_basis_path(identity).parts
+            )
+            if not provider_basis.is_file():
+                continue
+        except (OSError, TypeError, ValueError):
+            continue
+        ready.append((identity, preflight))
+    if len(ready) != 1:
+        suffix = "" if cohort_id else " (or pass --cohort-id)"
+        raise ValueError(
+            "expected exactly one ready live cohort for the current source; "
+            f"found {len(ready)}{suffix}"
+        )
+    return ready[0]
+
+
+def _modal_price_basis(root: Path, image_source_sha256: str) -> Path:
+    parent = (
+        root
+        / "outputs"
+        / "readiness"
+        / "modal_only_final"
+        / "modal_price_bases"
+        / image_source_sha256
+    )
+    for candidate in sorted(parent.glob("*.json"), reverse=True):
+        logical = candidate.relative_to(root).as_posix()
+        try:
+            readiness.load_modal_price_basis(
+                root,
+                logical,
+                expected_raw_sha256=_sha256_file(candidate),
+                expected_image_source_sha256=image_source_sha256,
+                require_freshness=True,
+            )
+        except (OSError, TypeError, ValueError):
+            continue
+        return candidate
+    raise ValueError("no current Modal price basis exists for this image source")
+
+
+def _persist_plan(
+    root: Path,
+    *,
+    identity: ModalLiveCohortIdentity,
+    preflight: Path,
+    spec: EvolutionRunSpec,
+) -> tuple[Path, dict[str, Any]]:
+    preflight_logical = preflight.relative_to(root).as_posix()
+    plan = build_evolution_approval_plan(
+        root,
+        source_tree_sha256=identity.source_tree_sha256,
+        cohort_id=identity.cohort_id,
+        candidate_resume_preflight_receipt_path=preflight_logical,
+        candidate_resume_preflight_receipt_sha256=_sha256_file(preflight),
+        evolution_spec=spec.token,
+    )
+    digest = verify_evolution_approval_plan(plan)
+    logical = (
+        modal_live_cohort_root(identity)
+        / "components"
+        / "evolution_approval_plans"
+        / "v1.0"
+        / f"{digest}.json"
+    )
+    output = root.joinpath(*logical.parts)
+    if output.exists():
+        persisted = json.loads(output.read_text(encoding="utf-8"))
+        if persisted != plan:
+            raise ValueError("existing evolution approval plan has changed")
+    else:
+        create_json_exclusive(output, plan)
+    return output, plan
+
+
+def _estimated_cost_approvals(
+    *,
+    spec: EvolutionRunSpec,
+    modal_basis: Path,
+    provider_basis: Path,
+    plan: dict[str, Any],
+) -> tuple[str, str]:
+    modal_price = json.loads(modal_basis.read_text(encoding="utf-8"))
+    provider_price = json.loads(provider_basis.read_text(encoding="utf-8"))
+    resource_profile = launch_modal.modal_resource_profile(
+        EVOLUTION_ACTION, spec.token
+    )
+    modal_estimate = readiness.derive_modal_action_cost_estimate(
+        action=EVOLUTION_ACTION,
+        harness=spec.token,
+        resource_profile=resource_profile,
+        price_basis=modal_price,
+    )
+    modal_approval = modal_estimate["action_estimate_usd"]
+    cost = plan["cost_ceiling"]
+    provider_approval = (
+        Decimal(cost["conservative_input_token_ceiling"])
+        * Decimal(provider_price["uncached_input_usd_per_million_tokens"])
+        / Decimal(1_000_000)
+        + Decimal(cost["requested_completion_token_ceiling"])
+        * Decimal(provider_price["output_usd_per_million_tokens"])
+        / Decimal(1_000_000)
+        + Decimal(cost["maximum_requests"])
+        * Decimal(provider_price["per_request_fee_usd"])
+    )
+    return str(modal_approval), format(provider_approval, "f")
+
+
+def _execute(args: argparse.Namespace, spec: EvolutionRunSpec, run_id: str) -> int:
+    explicit_caps = bool(
+        args.modal_cost_cap_usd or args.provider_cost_cap_usd
+    )
+    if args.accept_estimated_cost and explicit_caps:
+        raise ValueError(
+            "--accept-estimated-cost cannot be combined with explicit cost caps"
+        )
+    if not args.accept_estimated_cost and (
+        not args.modal_cost_cap_usd or not args.provider_cost_cap_usd
+    ):
+        raise ValueError(
+            "--execute requires --accept-estimated-cost or explicit "
+            "--modal-cost-cap-usd and --provider-cost-cap-usd approvals"
+        )
+    freeze = validate_local_engineering_freeze_receipt(root=ROOT)
+    identity, preflight = _select_identity(
+        ROOT,
+        source_tree_sha256=freeze["source_tree_sha256"],
+        image_source_sha256=freeze["image_source_sha256"],
+        cohort_id=args.cohort_id,
+    )
+    modal_basis = _modal_price_basis(ROOT, identity.image_source_sha256)
+    provider_basis = ROOT.joinpath(
+        *readiness.modal_provider_price_basis_path(identity).parts
+    )
+    plan_path, plan = _persist_plan(
+        ROOT,
+        identity=identity,
+        preflight=preflight,
+        spec=spec,
+    )
+    if args.accept_estimated_cost:
+        modal_cap, provider_cap = _estimated_cost_approvals(
+            spec=spec,
+            modal_basis=modal_basis,
+            provider_basis=provider_basis,
+            plan=plan,
+        )
+        print(
+            json.dumps(
+                {
+                    "approval": "source_bound_estimated_cost",
+                    "modal_cost_approval_usd": modal_cap,
+                    "provider_cost_approval_usd": provider_cap,
+                },
+                sort_keys=True,
+            ),
+            file=sys.stderr,
+        )
+    else:
+        modal_cap = args.modal_cost_cap_usd
+        provider_cap = args.provider_cost_cap_usd
+    launch_arguments = [
+        "--action",
+        EVOLUTION_ACTION,
+        "--run-id",
+        run_id,
+        "--cohort-id",
+        identity.cohort_id,
+        "--harness",
+        spec.token,
+        "--expected-image-source-sha256",
+        identity.image_source_sha256,
+        "--outer-cli-timeout-seconds",
+        str(spec.outer_cli_timeout_seconds),
+        "--modal-cost-cap-usd",
+        modal_cap,
+        "--modal-price-basis-path",
+        modal_basis.relative_to(ROOT).as_posix(),
+        "--modal-price-basis-sha256",
+        _sha256_file(modal_basis),
+        "--approved",
+        "--provider-approved",
+        "--provider-cost-cap-usd",
+        provider_cap,
+        "--provider-approval-plan-path",
+        plan_path.relative_to(ROOT).as_posix(),
+        "--approval-plan-sha256",
+        plan["approval_plan_sha256"],
+        "--provider-price-basis-path",
+        provider_basis.relative_to(ROOT).as_posix(),
+        "--provider-price-basis-sha256",
+        _sha256_file(provider_basis),
+        "--candidate-resume-preflight-receipt-path",
+        preflight.relative_to(ROOT).as_posix(),
+        "--candidate-resume-preflight-receipt-sha256",
+        _sha256_file(preflight),
+    ]
+    return launch_modal.main(launch_arguments)
+
+
+def main() -> int:
+    parser = _parser()
+    args = parser.parse_args()
+    try:
+        spec = EvolutionRunSpec.from_cli(args.engine, args.iterations)
+        run_id = validate_run_id(args.run_id) if args.run_id else _default_run_id(spec)
+        if args.accept_estimated_cost and not args.execute:
+            raise ValueError("--accept-estimated-cost requires --execute")
+        if not args.execute:
+            print(json.dumps(_plan_summary(spec, run_id), indent=2, sort_keys=True))
+            return 0
+        return _execute(args, spec, run_id)
+    except (FileNotFoundError, OSError, TypeError, ValueError) as error:
+        parser.error(str(error))
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

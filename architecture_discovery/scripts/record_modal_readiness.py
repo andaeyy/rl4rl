@@ -53,6 +53,11 @@ from common.public_evaluation import (
 )
 from common.runtime_context import ExecutionContextV1
 from common.training_config import SMOKE_TRAIN_CUDA_V2
+from common.evolution_run import (
+    EVOLUTION_ACTION,
+    EVOLUTION_FUNCTION_NAME,
+    EvolutionRunSpec,
+)
 from evaluation.records import search_evaluation_from_dict
 from modal_action_journal import (
     ModalActionJournalIntegrityError,
@@ -65,8 +70,6 @@ from modal_boundary import (
     APP_NAME,
     ARTIFACT_MANIFEST_FILENAMES,
     CANARY_ORDER,
-    FUNCTION_SPECS,
-    FUNCTION_TIMEOUT_SECONDS,
     GPU_TYPE,
     IMAGE_BUILD_COMMAND_TIMEOUT_SECONDS,
     IMAGE_BUILD_CPU_REQUEST_CORES,
@@ -78,6 +81,7 @@ from modal_boundary import (
     MAX_MODAL_BILLING_WINDOW,
     MODAL_LIVE_COHORT_ROOT,
     MODAL_VERSION,
+    OPENEVOLVE_60_ACTION,
     PYTHON_VERSION,
     UV_VERSION,
     VOLUME_NAME,
@@ -107,6 +111,7 @@ from modal_boundary import (
     validate_run_id,
     verify_artifact_manifest,
     volume_artifact_uri,
+    function_spec,
 )
 from modal_boundary import (
     MODAL_ENVIRONMENT_NAME as MODAL_ENVIRONMENT,
@@ -137,6 +142,14 @@ from scripts.capture_modal_cleanup_snapshots import (
 from scripts.provider_canary_plan import (
     build_provider_canary_approval_plan,
     verify_provider_canary_approval_plan,
+)
+from scripts.openevolve_60_plan import (
+    build_openevolve_60_approval_plan,
+    verify_openevolve_60_approval_plan,
+)
+from scripts.evolution_plan import (
+    build_evolution_approval_plan,
+    verify_evolution_approval_plan,
 )
 from scripts.record_local_engineering_evidence import (
     LOCAL_ENGINEERING_FREEZE_GATES,
@@ -615,7 +628,18 @@ _ORDINARY_ACTION_FUNCTIONS = {
     "offline-smoke": "offline_smoke",
     "candidate-smoke": "candidate_smoke",
     "checkpoint-resume": "checkpoint_resume",
+    OPENEVOLVE_60_ACTION: "openevolve_generic_60",
+    EVOLUTION_ACTION: EVOLUTION_FUNCTION_NAME,
 }
+_PROVIDER_LAUNCH_ACTIONS = frozenset(
+    {
+        "canary",
+        "canaries",
+        "exploratory_c0c3_pilot",
+        OPENEVOLVE_60_ACTION,
+        EVOLUTION_ACTION,
+    }
+)
 _COHORT_ROSTER_FIELDS = frozenset(
     {
         "schema_name",
@@ -896,6 +920,9 @@ _ACTIONS = frozenset(
         "candidate-smoke",
         "checkpoint-resume",
         "cuda-environment",
+        "exploratory_c0c3_pilot",
+        OPENEVOLVE_60_ACTION,
+        EVOLUTION_ACTION,
         "download",
         "offline-smoke",
         "verify",
@@ -2232,9 +2259,23 @@ def load_modal_price_basis(
     return payload, rates, path
 
 
-def _expected_attempt_timeout(action: str) -> int:
-    calls = len(CANARY_ORDER) if action == "canaries" else 1
-    return IMAGE_BUILD_COMMAND_TIMEOUT_SECONDS + calls * FUNCTION_TIMEOUT_SECONDS + 300
+def _expected_attempt_timeout(action: str, harness: str | None = None) -> int:
+    if action == EVOLUTION_ACTION:
+        return EvolutionRunSpec.parse(harness).outer_cli_timeout_seconds
+    if action == "canaries":
+        runtime_seconds = sum(
+            function_spec(f"canary_{harness}").timeout_seconds
+            for harness in CANARY_ORDER
+        )
+    elif action == "canary":
+        runtime_seconds = function_spec(
+            f"canary_{CANARY_ORDER[0]}"
+        ).timeout_seconds
+    elif action in {"download", "verify"}:
+        runtime_seconds = function_spec("artifact_verify").timeout_seconds
+    else:
+        runtime_seconds = function_spec(action.replace("-", "_")).timeout_seconds
+    return IMAGE_BUILD_COMMAND_TIMEOUT_SECONDS + runtime_seconds + 300
 
 
 def _reconstructed_modal_command_sha256(
@@ -2271,7 +2312,12 @@ def _expected_modal_resource_profile(
 ) -> dict[str, Any]:
     """Recompute the exact request/limit disclosure emitted by the launcher."""
 
-    if action == "canaries":
+    dynamic_timeout: int | None = None
+    if action == EVOLUTION_ACTION:
+        evolution = EvolutionRunSpec.parse(harness)
+        function_names = [EVOLUTION_FUNCTION_NAME]
+        dynamic_timeout = evolution.function_timeout_seconds
+    elif action == "canaries":
         function_names = [f"canary_{item}" for item in CANARY_ORDER]
     elif action == "canary":
         if harness not in CANARY_ORDER:
@@ -2283,7 +2329,7 @@ def _expected_modal_resource_profile(
         function_names = [action.replace("-", "_")]
     runtime_calls = []
     for function_name in function_names:
-        spec = FUNCTION_SPECS[function_name]
+        spec = function_spec(function_name)
         runtime_calls.append(
             {
                 "function_name": function_name,
@@ -2294,7 +2340,7 @@ def _expected_modal_resource_profile(
                 "memory_limit_mib": spec.memory_limit_mib,
                 "gpu": spec.gpu,
                 "region": spec.region,
-                "timeout_seconds": spec.timeout_seconds,
+                "timeout_seconds": dynamic_timeout or spec.timeout_seconds,
                 "max_containers": spec.max_containers,
                 "min_containers": spec.min_containers,
                 "retries": spec.retries,
@@ -2745,7 +2791,7 @@ def _expected_predecessor_gates(
         if not exact_json_equal(pairs, expected_pairs):
             raise ValueError("verifier predecessor paths are not source-attempt bound")
         return [record["gate"] for record in bindings]
-    if action in {"canary", "canaries"}:
+    if action in _PROVIDER_LAUNCH_ACTIONS:
         if len(action_bindings) != 1:
             raise ValueError("provider action requires one preflight predecessor")
         gate, logical = action_bindings[0]["gate"], action_bindings[0]["path"]
@@ -2861,7 +2907,9 @@ def _validate_action_intent_receipt(
         raise ValueError("Modal action intent used the wrong profile")
     if payload["modal_environment"] != MODAL_ENVIRONMENT:
         raise ValueError("Modal action intent used the wrong environment")
-    if payload["outer_cli_timeout_seconds"] != _expected_attempt_timeout(action):
+    if payload["outer_cli_timeout_seconds"] != _expected_attempt_timeout(
+        action, harness
+    ):
         raise ValueError("Modal action intent timeout differs from its action")
     if not exact_json_equal(
         payload["modal_resource_profile"],
@@ -2899,7 +2947,7 @@ def _validate_action_intent_receipt(
         raise ValueError("Modal action intent cap is below its exact estimate")
     if type(payload["provider_cost_approved"]) is not bool:
         raise ValueError("intent.provider_cost_approved must be boolean")
-    provider_action = action in {"canary", "canaries"}
+    provider_action = action in _PROVIDER_LAUNCH_ACTIONS
     provider_fields = (
         "provider_cost_cap_usd",
         "provider_approval_plan_path",
@@ -2925,6 +2973,9 @@ def _validate_action_intent_receipt(
             ],
             expected_identity=identity,
             expected_preflight_binding=_candidate_preflight_binding(bindings),
+            expected_evolution_spec=(
+                harness if action == EVOLUTION_ACTION else None
+            ),
         )
         _price, _price_path, price_digest = _load_price_basis(
             root, payload["provider_price_basis_path"]
@@ -3106,8 +3157,11 @@ def _validate_action_attempt_receipt(
         if value is not None:
             validate_run_id(value)
     harness = payload["harness"]
-    if harness is not None and harness not in CANARY_ORDER:
-        raise ValueError("Modal action attempt harness is unsupported")
+    if harness is not None:
+        if action == EVOLUTION_ACTION:
+            EvolutionRunSpec.parse(harness)
+        elif harness not in CANARY_ORDER:
+            raise ValueError("Modal action attempt harness is unsupported")
     if action is not None and payload["run_id"] is not None:
         validate_modal_action_identity(
             action=action,
@@ -3191,7 +3245,7 @@ def _validate_action_attempt_receipt(
     timeout = payload["outer_cli_timeout_seconds"]
     if timeout is not None:
         timeout = _exact_int(timeout, "attempt.outer_cli_timeout_seconds", minimum=1)
-        if action is None or timeout != _expected_attempt_timeout(action):
+        if action is None or timeout != _expected_attempt_timeout(action, harness):
             raise ValueError("Modal action attempt timeout differs from its action")
     resource_profile = payload["modal_resource_profile"]
     if resource_profile is not None and (
@@ -3326,7 +3380,7 @@ def _validate_action_attempt_receipt(
         "provider_price_basis_path",
         "provider_price_basis_sha256",
     )
-    if action in {"canary", "canaries"}:
+    if action in _PROVIDER_LAUNCH_ACTIONS:
         if payload["provider_cost_cap_usd"] is not None:
             _decimal_text(
                 payload["provider_cost_cap_usd"],
@@ -3357,6 +3411,9 @@ def _validate_action_attempt_receipt(
                 ],
                 expected_identity=selected_identity,
                 expected_preflight_binding=_candidate_preflight_binding(bindings),
+                expected_evolution_spec=(
+                    harness if action == EVOLUTION_ACTION else None
+                ),
             )
             _price, _price_path, price_digest = _load_price_basis(
                 root, payload["provider_price_basis_path"]
@@ -3408,7 +3465,7 @@ def _validate_action_attempt_receipt(
             or _decimal_text(modal_cap, "attempt.modal_cost_cap_usd") <= 0
             or payload["modal_cost_approved"] is not True
             or payload["provider_cost_approved"]
-            is not (action in {"canary", "canaries"})
+            is not (action in _PROVIDER_LAUNCH_ACTIONS)
         ):
             raise ValueError("started Modal attempt lacks its approved launch contract")
     elif returncode is not None or closed is not None:
@@ -3427,7 +3484,9 @@ def _validate_action_attempt_receipt(
             or process_started is not True
         ):
             raise ValueError("successful Modal attempt fields do not reconcile")
-        if payload["provider_cost_approved"] is not (action in {"canary", "canaries"}):
+        if payload["provider_cost_approved"] is not (
+            action in _PROVIDER_LAUNCH_ACTIONS
+        ):
             raise ValueError("successful Modal attempt provider approval is invalid")
     elif status == "failed":
         if (
@@ -3536,6 +3595,12 @@ def _validate_action_attempt_receipt(
             raise ValueError("resume attempt lacks source or attempt run ID")
         if payload["verifier_run_id"] is not None or harness is not None:
             raise ValueError("resume attempt contains unrelated identity fields")
+    elif action == EVOLUTION_ACTION:
+        if payload["run_id"] is None or harness is None:
+            raise ValueError("evolution attempt lacks its run identity")
+        EvolutionRunSpec.parse(harness)
+        if payload["source_run_id"] is not None or payload["verifier_run_id"] is not None:
+            raise ValueError("evolution attempt contains unrelated run IDs")
     elif action == "canary":
         if payload["run_id"] is None or harness is None:
             raise ValueError("single-canary attempt lacks its harness identity")
@@ -4460,7 +4525,7 @@ def _validate_prior_remote_run_dispositions(
             raw["volume_disposition"],
             f"prior.remote_run_dispositions[{index}].volume_disposition",
         )
-        provider_action = attempt["action"] in {"canary", "canaries"}
+        provider_action = attempt["action"] in _PROVIDER_LAUNCH_ACTIONS
         if not attempt["modal_cli_process_started"]:
             disposition_valid = (execution, provider, snapshot) == (
                 "definitely_not_started",
@@ -4705,6 +4770,11 @@ def _derive_journal_provider_spend_estimate(
                 expected_identity=identity,
                 expected_preflight_binding=_candidate_preflight_binding(
                     attempt["predecessor_receipts"]
+                ),
+                expected_evolution_spec=(
+                    attempt["harness"]
+                    if attempt["action"] == EVOLUTION_ACTION
+                    else None
                 ),
             )
             price, price_path, price_sha256 = _load_price_basis(
@@ -9163,9 +9233,104 @@ def _load_provider_approval_plan(
     expected_image_source_sha256: object,
     expected_identity: ModalLiveCohortIdentity,
     expected_preflight_binding: Mapping[str, str],
+    expected_evolution_spec: str | None = None,
 ) -> tuple[dict[str, Any], Path]:
     path = _contained_path(root, logical, "provider_approval_plan_path", kind="file")
     plan = _load_object(path)
+    if plan.get("schema_name") == "EvolutionProviderApprovalPlan":
+        approval_sha256 = verify_evolution_approval_plan(plan)
+        if approval_sha256 != _sha256(
+            expected_approval_sha256, "approval_plan_sha256"
+        ):
+            raise ValueError("evolution approval digest differs from the intent")
+        if expected_evolution_spec is None:
+            raise ValueError("evolution approval lacks its intent specification")
+        spec = EvolutionRunSpec.parse(expected_evolution_spec)
+        if (
+            plan.get("schema_version") != "1.0"
+            or plan.get("action") != EVOLUTION_ACTION
+            or plan.get("evolution_spec") != spec.token
+            or plan.get("source_tree_sha256")
+            != expected_identity.source_tree_sha256
+            or plan.get("image_source_sha256")
+            != _sha256(
+                expected_image_source_sha256,
+                "provider_plan.image_source_sha256",
+            )
+            or plan.get("cohort_id") != expected_identity.cohort_id
+            or plan.get("candidate_resume_preflight_receipt")
+            != {
+                "path": expected_preflight_binding["path"],
+                "sha256": expected_preflight_binding["sha256"],
+            }
+            or plan.get("provider_calls_started") != 0
+            or plan.get("modal_calls_started") != 0
+            or plan.get("openai_clients_initialized") != 0
+        ):
+            raise ValueError("evolution approval identity is invalid")
+        try:
+            expected = build_evolution_approval_plan(
+                root,
+                source_tree_sha256=expected_identity.source_tree_sha256,
+                cohort_id=expected_identity.cohort_id,
+                candidate_resume_preflight_receipt_path=(
+                    expected_preflight_binding["path"]
+                ),
+                candidate_resume_preflight_receipt_sha256=(
+                    expected_preflight_binding["sha256"]
+                ),
+                evolution_spec=spec.token,
+            )
+        except ValueError:
+            expected = None
+        if expected is not None and not exact_json_equal(plan, expected):
+            raise ValueError("evolution approval differs from current source")
+        return plan, path
+    if plan.get("schema_name") == "OpenEvolve60ProviderApprovalPlan":
+        approval_sha256 = verify_openevolve_60_approval_plan(plan)
+        if approval_sha256 != _sha256(
+            expected_approval_sha256,
+            "approval_plan_sha256",
+        ):
+            raise ValueError("OpenEvolve 60 approval digest differs from the intent")
+        if (
+            plan.get("schema_version") != "1.0"
+            or plan.get("action") != OPENEVOLVE_60_ACTION
+            or plan.get("source_tree_sha256")
+            != expected_identity.source_tree_sha256
+            or plan.get("image_source_sha256")
+            != _sha256(
+                expected_image_source_sha256,
+                "provider_plan.image_source_sha256",
+            )
+            or plan.get("cohort_id") != expected_identity.cohort_id
+            or plan.get("candidate_resume_preflight_receipt")
+            != {
+                "path": expected_preflight_binding["path"],
+                "sha256": expected_preflight_binding["sha256"],
+            }
+            or plan.get("provider_calls_started") != 0
+            or plan.get("modal_calls_started") != 0
+            or plan.get("openai_clients_initialized") != 0
+        ):
+            raise ValueError("OpenEvolve 60 approval identity is invalid")
+        try:
+            expected = build_openevolve_60_approval_plan(
+                root,
+                source_tree_sha256=expected_identity.source_tree_sha256,
+                cohort_id=expected_identity.cohort_id,
+                candidate_resume_preflight_receipt_path=(
+                    expected_preflight_binding["path"]
+                ),
+                candidate_resume_preflight_receipt_sha256=(
+                    expected_preflight_binding["sha256"]
+                ),
+            )
+        except ValueError:
+            expected = None
+        if expected is not None and not exact_json_equal(plan, expected):
+            raise ValueError("OpenEvolve 60 approval differs from current source")
+        return plan, path
     approval_sha256 = verify_provider_canary_approval_plan(plan)
     if approval_sha256 != _sha256(
         expected_approval_sha256,

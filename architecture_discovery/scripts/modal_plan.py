@@ -11,6 +11,13 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from common.evolution_run import (  # noqa: E402
+    EVOLUTION_COMPLETION_TOKENS_PER_REQUEST,
+    EVOLUTION_HARNESSES,
+    EVOLUTION_INPUT_BYTES_PER_REQUEST,
+    EVOLUTION_MAX_ITERATIONS,
+    EvolutionRunSpec,
+)
 from modal_boundary import (  # noqa: E402
     APP_NAME,
     FUNCTION_SPECS,
@@ -20,6 +27,9 @@ from modal_boundary import (  # noqa: E402
     IMAGE_BUILD_SUBPROCESS_THREAD_LIMIT,
     IMAGE_RECIPE_VERSION,
     MODAL_VERSION,
+    OPENEVOLVE_60_FUNCTION_NAME,
+    OPENEVOLVE_60_INPUT_BYTES_PER_REQUEST,
+    OPENEVOLVE_60_ITERATIONS,
     PYTHON_VERSION,
     UV_VERSION,
     VOLUME_MOUNT_PATH,
@@ -106,6 +116,51 @@ def build_plan(project_root: str | Path = ROOT) -> dict[str, Any]:
             "timeout_seconds": function_spec("exploratory_c0c3_pilot").timeout_seconds,
             "max_containers": function_spec("exploratory_c0c3_pilot").max_containers,
             "mode": "exploratory_non_scientific",
+        },
+        "openevolve_60_function": {
+            "name": function_spec(OPENEVOLVE_60_FUNCTION_NAME).name,
+            "gpu": function_spec(OPENEVOLVE_60_FUNCTION_NAME).gpu,
+            "provider_secret": function_spec(
+                OPENEVOLVE_60_FUNCTION_NAME
+            ).provider_secret,
+            "runtime_network_blocked": False,
+            "retries": function_spec(OPENEVOLVE_60_FUNCTION_NAME).retries,
+            "timeout_seconds": function_spec(
+                OPENEVOLVE_60_FUNCTION_NAME
+            ).timeout_seconds,
+            "max_containers": function_spec(
+                OPENEVOLVE_60_FUNCTION_NAME
+            ).max_containers,
+            "iterations": OPENEVOLVE_60_ITERATIONS,
+            "input_bytes_per_request_ceiling": (
+                OPENEVOLVE_60_INPUT_BYTES_PER_REQUEST
+            ),
+            "training_profile": "smoke_train_cuda_v2",
+            "scientific": False,
+            "mode": "bounded_non_scientific_openevolve_60",
+        },
+        "configurable_evolution_function": {
+            "name": function_spec("evolution_run").name,
+            "gpu": function_spec("evolution_run").gpu,
+            "provider_secret": function_spec("evolution_run").provider_secret,
+            "runtime_network_blocked": False,
+            "retries": function_spec("evolution_run").retries,
+            "max_containers": function_spec("evolution_run").max_containers,
+            "harnesses": list(EVOLUTION_HARNESSES),
+            "minimum_iterations": 1,
+            "maximum_iterations": EVOLUTION_MAX_ITERATIONS,
+            "maximum_function_timeout_seconds": EvolutionRunSpec(
+                EVOLUTION_HARNESSES[0], EVOLUTION_MAX_ITERATIONS
+            ).function_timeout_seconds,
+            "input_bytes_per_request_ceiling": (
+                EVOLUTION_INPUT_BYTES_PER_REQUEST
+            ),
+            "completion_tokens_per_request_ceiling": (
+                EVOLUTION_COMPLETION_TOKENS_PER_REQUEST
+            ),
+            "training_profile": "smoke_train_cuda_v2",
+            "scientific": False,
+            "mode": "bounded_non_scientific_evolution",
         },
         "remote_calls_started": 0,
     }
