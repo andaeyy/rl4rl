@@ -10,7 +10,7 @@ from scripts import openevolve_patch_bundle as patch_bundle
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def _copy_unpatched_project(tmp_path: Path) -> Path:
+def _copy_integrated_project(tmp_path: Path) -> Path:
     project = tmp_path / "project"
     vendor_parent = project / "vendor"
     patch_parent = project / "vendor_patches"
@@ -57,17 +57,11 @@ def test_checked_in_patch_bundle_and_materialized_files_are_exact() -> None:
     assert status.applied is True
 
 
-def test_apply_is_explicit_and_idempotent_in_temporary_clone(tmp_path: Path) -> None:
-    project = _copy_unpatched_project(tmp_path)
+def test_validation_is_idempotent_in_temporary_clone(tmp_path: Path) -> None:
+    project = _copy_integrated_project(tmp_path)
     vendor = project / patch_bundle.OPENEVOLVE_VENDOR_RELATIVE_PATH
 
-    with pytest.raises(
-        patch_bundle.OpenEvolvePatchBundleError,
-        match="not applied",
-    ):
-        patch_bundle.ensure_openevolve_patch_bundle(project)
-
-    first = patch_bundle.ensure_openevolve_patch_bundle(project, apply=True)
+    first = patch_bundle.ensure_openevolve_patch_bundle(project)
     before = {
         relative: (vendor / relative).read_bytes()
         for relative in patch_bundle.OPENEVOLVE_PATCHED_FILE_SHA256
@@ -89,7 +83,7 @@ def test_apply_is_explicit_and_idempotent_in_temporary_clone(tmp_path: Path) -> 
 def test_apply_rejects_partial_or_unreviewed_worktree_without_mutating_it(
     tmp_path: Path,
 ) -> None:
-    project = _copy_unpatched_project(tmp_path)
+    project = _copy_integrated_project(tmp_path)
     target = (
         project
         / patch_bundle.OPENEVOLVE_VENDOR_RELATIVE_PATH
@@ -100,7 +94,7 @@ def test_apply_rejects_partial_or_unreviewed_worktree_without_mutating_it(
 
     with pytest.raises(
         patch_bundle.OpenEvolvePatchBundleError,
-        match="neither exact base nor exact reviewed patched state",
+        match="differ from the exact reviewed integrated state",
     ):
         patch_bundle.ensure_openevolve_patch_bundle(project, apply=True)
 
@@ -110,7 +104,7 @@ def test_apply_rejects_partial_or_unreviewed_worktree_without_mutating_it(
 def test_apply_rejects_patch_digest_drift_before_vendor_mutation(
     tmp_path: Path,
 ) -> None:
-    project = _copy_unpatched_project(tmp_path)
+    project = _copy_integrated_project(tmp_path)
     patch = project / patch_bundle.OPENEVOLVE_PATCH_RELATIVE_PATH
     patch.write_bytes(patch.read_bytes() + b"\n")
     vendor = project / patch_bundle.OPENEVOLVE_VENDOR_RELATIVE_PATH
@@ -132,7 +126,7 @@ def test_apply_rejects_patch_digest_drift_before_vendor_mutation(
 
 
 def test_validation_rejects_symlinked_vendor_ancestor(tmp_path: Path) -> None:
-    project = _copy_unpatched_project(tmp_path)
+    project = _copy_integrated_project(tmp_path)
     vendor_parent = project / "vendor"
     outside_vendor_parent = tmp_path / "outside-vendor"
     vendor_parent.rename(outside_vendor_parent)

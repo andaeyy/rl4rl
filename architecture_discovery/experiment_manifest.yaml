@@ -197,7 +197,7 @@ sources:
     role: conventional_validated_starting_architecture
   openevolve:
     url: https://github.com/andaeyy/openevolve.git
-    commit: 258c29b56fbff42da26bdf64cb42ba5b142e2903
+    commit: 5ecb48b5ca453d3f2b9c316a4ffe45d45725bf0c
     upstream_url: https://github.com/algorithmicsuperintelligence/openevolve.git
     upstream_commit: 411fb59c886c18704caaffb611e17cf9e7d824d2
     patches:

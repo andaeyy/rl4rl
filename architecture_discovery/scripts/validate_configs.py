@@ -84,7 +84,7 @@ def _require(condition: bool, message: str) -> None:
 
 
 def _validate_openevolve_source_provenance(manifest: dict) -> None:
-    """Bind every local OpenEvolve patch to its exact implementation bytes."""
+    """Bind every reviewed OpenEvolve change to its implementation bytes."""
 
     expected = {
         "provider_transport_single_shot_and_attempt_ledger": {
@@ -105,7 +105,7 @@ def _validate_openevolve_source_provenance(manifest: dict) -> None:
     source = manifest.get("sources", {}).get("openevolve", {})
     _require(
         isinstance(source, dict) and source.get("commit") == OPENEVOLVE_BASE_COMMIT,
-        "OpenEvolve base commit differs from the patch bundle",
+        "OpenEvolve integrated base commit differs from the patch provenance",
     )
     try:
         validate_applied_patch_bundle(ROOT)

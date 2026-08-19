@@ -815,6 +815,24 @@ def _canonical_venv_site_packages() -> Path:
     return purelib
 
 
+def _canonical_python_home() -> Path:
+    """Return the interpreter home required by the private executable copy."""
+
+    try:
+        base = Path(sys.base_prefix).resolve(strict=True)
+        stdlib = Path(sysconfig.get_path("stdlib")).resolve(strict=True)
+        stdlib.relative_to(base)
+        encodings = (stdlib / "encodings" / "__init__.py").resolve(strict=True)
+        encodings.relative_to(stdlib)
+    except (OSError, RuntimeError, ValueError) as error:
+        raise ValueError("Python standard-library home cannot be resolved") from error
+    descriptor = _open_nofollow_directory(base)
+    os.close(descriptor)
+    if not encodings.is_file() or encodings.is_symlink():
+        raise ValueError("Python standard-library encodings package is unsafe")
+    return base
+
+
 def _require_modal_executable_descriptor_binding(
     binding: _ModalExecutableBinding,
 ) -> None:
@@ -1923,6 +1941,7 @@ def capture_modal_cleanup_snapshots(
         python_binding = _open_python_executable_binding()
         config_binding = _open_modal_config_binding()
         child_environment["MODAL_CONFIG_PATH"] = config_binding.execution_path
+        child_environment["PYTHONHOME"] = os.fspath(_canonical_python_home())
         child_environment["PYTHONPATH"] = os.pathsep.join(
             (str(root), str(_canonical_venv_site_packages()))
         )

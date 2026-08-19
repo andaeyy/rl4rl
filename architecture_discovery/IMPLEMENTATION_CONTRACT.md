@@ -296,14 +296,13 @@ approved request, and blocks aggregate acceptance. Multiple or context-
 mismatched records fail closed as impossible for the one-opportunity,
 zero-retry canary contract.
 
-The vendored OpenEvolve base commit and every local patch are named in
+The vendored OpenEvolve commit and every reviewed patch input are named in
 `experiment_manifest.yaml`; configuration validation rehashes the retry patch,
 the process-pool credential-isolation implementation, and its adversarial test.
-After initializing a fresh clone, the operator must explicitly materialize the
-reviewed patch bundle with
-`.venv/bin/python scripts/openevolve_patch_bundle.py --apply`. The paid launcher
-must never apply or repair it implicitly and must fail closed before invoking
-Modal unless the frozen base, patch inputs, and materialized-file hashes match.
+After initializing a fresh clone, the operator validates the integrated reviewed
+state with `.venv/bin/python scripts/openevolve_patch_bundle.py`. The paid
+launcher must never repair it implicitly and must fail closed before invoking
+Modal unless the frozen commit, patch inputs, and integrated-file hashes match.
 The Modal image source manifest independently binds the patched runtime bytes.
 
 `full_train_cuda_v2` and `smoke_train_cuda_v2` are distinct deterministic

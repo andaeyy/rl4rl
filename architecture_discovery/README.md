@@ -18,9 +18,10 @@ cd rl4rl/architecture_discovery
 sh scripts/bootstrap_teammate.sh
 ```
 
-The bootstrap installs the locked Python 3.12 Modal environment, applies and
-verifies the two reviewed OpenEvolve patches, and runs the local environment and
-configuration checks. It never asks for, reads, or stores a credential.
+The bootstrap installs the locked Python 3.12 Modal environment, verifies the
+OpenEvolve commit containing the two reviewed changes, and runs the local
+environment and configuration checks. It never asks for, reads, or stores a
+credential.
 
 After it succeeds, use Modal's interactive credential prompt. Enter the shared
 Modal token ID and token secret only when that prompt requests them:
@@ -396,7 +397,7 @@ choices are intentionally not invented by the code.
 git submodule update --init --recursive
 cd architecture_discovery
 uv sync --python 3.12 --group modal
-.venv/bin/python scripts/openevolve_patch_bundle.py --apply
+.venv/bin/python scripts/openevolve_patch_bundle.py
 source .venv/bin/activate
 ```
 
@@ -405,12 +406,12 @@ cache-hydration phase, before the immutable cost-free freeze. The final freeze
 uses `uv lock --check` and the already-created environment; it does not require
 an offline sync whose cached build requirements may be incomplete.
 
-The submodule checkout in a fresh clone contains the frozen OpenEvolve base,
-not this repository's reviewed local patch bundle. The explicit `--apply`
-command materializes that bundle and verifies the resulting files. Paid
+The submodule checkout in a fresh clone contains the frozen OpenEvolve commit
+with this repository's reviewed changes integrated. The validation command
+verifies that commit, the historical patch inputs, and the resulting files. Paid
 launches never apply or repair patches implicitly: `scripts/launch_modal.py`
-must fail closed before invoking Modal unless the frozen base, patch inputs,
-and materialized OpenEvolve file hashes all match the manifest.
+must fail closed before invoking Modal unless the frozen commit, patch inputs,
+and integrated OpenEvolve file hashes all match the manifest.
 
 Offline checks do not need an API key.
 

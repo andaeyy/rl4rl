@@ -17,13 +17,13 @@ fi
 git -C "$workspace_root" submodule update --init --recursive
 cd "$project_root"
 uv sync --python 3.12 --group modal
-.venv/bin/python scripts/openevolve_patch_bundle.py --apply
+.venv/bin/python scripts/openevolve_patch_bundle.py
 .venv/bin/python scripts/check_environment.py
 .venv/bin/python scripts/validate_configs.py
 
 cat <<'EOF'
 
-Local dependencies and the reviewed OpenEvolve patches are ready.
+Local dependencies and the reviewed OpenEvolve commit are ready.
 
 Configure the shared Modal credentials using Modal's private interactive prompt:
 

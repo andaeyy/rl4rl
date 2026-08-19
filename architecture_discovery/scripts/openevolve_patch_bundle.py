@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
-"""Validate or explicitly apply the frozen local OpenEvolve patch bundle.
+"""Validate the frozen OpenEvolve commit and reviewed patch provenance.
 
-Validation is intentionally stricter than ``git apply --check``: the vendored
-repository must be at the exact base commit, both reviewed patch files must
-match their frozen digests, and the worktree must be either pristine base state
-or the exact three-file applied state.  No command in this module contacts a
-network service.
+The vendored repository must be at the exact reviewed commit, both historical
+patch files must match their frozen digests, the three integrated implementation
+files must match their reviewed hashes, and the worktree must be pristine.  No
+command in this module contacts a network service.
 """
 
 from __future__ import annotations
@@ -21,7 +20,7 @@ from typing import ClassVar
 
 ROOT = Path(__file__).resolve().parents[1]
 OPENEVOLVE_VENDOR_RELATIVE_PATH = "vendor/openevolve"
-OPENEVOLVE_BASE_COMMIT = "258c29b56fbff42da26bdf64cb42ba5b142e2903"
+OPENEVOLVE_BASE_COMMIT = "5ecb48b5ca453d3f2b9c316a4ffe45d45725bf0c"
 OPENEVOLVE_PATCH_RELATIVE_PATH = (
     "vendor_patches/openevolve_process_isolation.patch"
 )
@@ -36,13 +35,13 @@ OPENEVOLVE_PROVIDER_PATCH_SHA256 = (
 )
 OPENEVOLVE_BASE_FILE_SHA256: Mapping[str, str] = {
     "openevolve/llm/openai.py": (
-        "4d775758e83b21678becf1759dd58bfe2b13976559caeae165a4b223de7446d7"
+        "c01228a2a47b7d22096206e9f9da999dfb031fed728568583da6fbc667fec1d1"
     ),
     "openevolve/process_parallel.py": (
-        "7480624dd4ec67404cbbc2e3464660dea6058d8a61d122bbbdf654365087a276"
+        "d740466efc43d6f70f341bcf6d33701188edf215e2347f66febaa7d45ad10971"
     ),
     "tests/test_process_parallel.py": (
-        "e9666bb18bc1a66719325b0d796882ed7f2de8575f0c92f9abb157e2b7a65281"
+        "65f7402c8caec92254eec677bccd709569e221dc43f4e81f48648e98137b3afe"
     ),
 }
 OPENEVOLVE_ISOLATION_PATCHED_FILE_SHA256: Mapping[str, str] = {
@@ -62,9 +61,6 @@ OPENEVOLVE_PATCHED_FILE_SHA256: Mapping[str, str] = {
     **OPENEVOLVE_PROVIDER_PATCHED_FILE_SHA256,
     **OPENEVOLVE_ISOLATION_PATCHED_FILE_SHA256,
 }
-_APPLIED_STATUS_RECORDS = frozenset(
-    f" M {path}".encode() for path in OPENEVOLVE_PATCHED_FILE_SHA256
-)
 _GIT_TIMEOUT_SECONDS = 15
 
 
@@ -244,21 +240,15 @@ def _worktree_hashes(vendor_root: Path) -> dict[str, str]:
 def _state(vendor_root: Path) -> str:
     observed = _worktree_hashes(vendor_root)
     status = _worktree_status(vendor_root)
-    if observed == dict(OPENEVOLVE_PATCHED_FILE_SHA256):
-        if status != _APPLIED_STATUS_RECORDS:
-            raise OpenEvolvePatchBundleError(
-                "patched OpenEvolve files coexist with unexpected worktree changes"
-            )
-        return "applied"
-    if observed == dict(OPENEVOLVE_BASE_FILE_SHA256):
-        if status:
-            raise OpenEvolvePatchBundleError(
-                "base OpenEvolve files coexist with unexpected worktree changes"
-            )
-        return "base"
-    raise OpenEvolvePatchBundleError(
-        "OpenEvolve files are neither exact base nor exact reviewed patched state"
-    )
+    if observed != dict(OPENEVOLVE_PATCHED_FILE_SHA256):
+        raise OpenEvolvePatchBundleError(
+            "OpenEvolve files differ from the exact reviewed integrated state"
+        )
+    if status:
+        raise OpenEvolvePatchBundleError(
+            "integrated OpenEvolve files coexist with unexpected worktree changes"
+        )
+    return "integrated"
 
 
 def ensure_openevolve_patch_bundle(
@@ -266,7 +256,11 @@ def ensure_openevolve_patch_bundle(
     *,
     apply: bool = False,
 ) -> OpenEvolvePatchBundleStatus:
-    """Validate the bundle, applying it only when explicitly requested."""
+    """Validate the integrated commit and frozen patch provenance.
+
+    ``apply`` is retained as a backwards-compatible no-op for bootstrap
+    callers that predate integration of the reviewed patches into the commit.
+    """
 
     _project, vendor, patches = _resolved_inputs(project_root)
     expected_patches = (
@@ -279,21 +273,7 @@ def ensure_openevolve_patch_bundle(
                 "reviewed OpenEvolve patch SHA-256 differs"
             )
     _verify_repository_identity(vendor)
-    state = _state(vendor)
-    if state == "base":
-        if not apply:
-            raise OpenEvolvePatchBundleError(
-                "reviewed OpenEvolve patch is not applied; rerun explicitly "
-                "with --apply"
-            )
-        for patch, _expected_sha256 in expected_patches:
-            _git(vendor, "apply", "--check", "--whitespace=error-all", str(patch))
-        for patch, _expected_sha256 in expected_patches:
-            _git(vendor, "apply", "--whitespace=error-all", str(patch))
-        if _state(vendor) != "applied":
-            raise OpenEvolvePatchBundleError(
-                "OpenEvolve patch application did not reach the reviewed state"
-            )
+    _state(vendor)
     return OpenEvolvePatchBundleStatus(
         base_commit=OPENEVOLVE_BASE_COMMIT,
         patch_relative_path=OPENEVOLVE_PATCH_RELATIVE_PATH,
@@ -315,12 +295,12 @@ def validate_applied_patch_bundle(
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Validate or explicitly apply the frozen OpenEvolve patch bundle"
+        description="Validate the frozen integrated OpenEvolve commit"
     )
     parser.add_argument(
         "--apply",
         action="store_true",
-        help="apply the reviewed patch only from exact pristine base state",
+        help="compatibility no-op; validate the integrated reviewed state",
     )
     return parser
 
